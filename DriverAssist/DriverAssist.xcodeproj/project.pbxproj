@@ -7,14 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A9EC1A0E300ED1490037CCF6 /* yolo26n.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A0D300ED1490037CCF6 /* yolo26n.mlpackage */; };
-		A9EC1A0F300ED1490037CCF6 /* yolo26n.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A0D300ED1490037CCF6 /* yolo26n.mlpackage */; };
-		A9EC1A10300ED1490037CCF6 /* yolo26n.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A0D300ED1490037CCF6 /* yolo26n.mlpackage */; };
-		A9EC1A12300ED1630037CCF6 /* yolo26s.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A11300ED1630037CCF6 /* yolo26s.mlpackage */; };
-		A9EC1A13300ED1630037CCF6 /* yolo26s.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A11300ED1630037CCF6 /* yolo26s.mlpackage */; };
-		A9EC1A14300ED1630037CCF6 /* yolo26s.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A11300ED1630037CCF6 /* yolo26s.mlpackage */; };
-		A9EC1A15300ED2240037CCF6 /* yolo26s.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A9EC1A11300ED1630037CCF6 /* yolo26s.mlpackage */; };
-		A9EC1A16300ED22E0037CCF6 /* yolo26n.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A9EC1A0D300ED1490037CCF6 /* yolo26n.mlpackage */; };
+		A9EC1A393010098E0037CCF6 /* yolo26n.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */; };
+		A9EC1A3B3010099C0037CCF6 /* yolo26s.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -38,8 +32,8 @@
 		A9EC19C8300EC6900037CCF6 /* DriverAssist.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DriverAssist.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A9EC19D8300EC6910037CCF6 /* DriverAssistTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DriverAssistTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A9EC19E2300EC6910037CCF6 /* DriverAssistUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DriverAssistUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		A9EC1A0D300ED1490037CCF6 /* yolo26n.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26n.mlpackage; sourceTree = "<group>"; };
-		A9EC1A11300ED1630037CCF6 /* yolo26s.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26s.mlpackage; sourceTree = "<group>"; };
+		A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26n.mlpackage; sourceTree = "<group>"; };
+		A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26s.mlpackage; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -88,12 +82,12 @@
 		A9EC19BF300EC6900037CCF6 = {
 			isa = PBXGroup;
 			children = (
-				A9EC1A11300ED1630037CCF6 /* yolo26s.mlpackage */,
-				A9EC1A0D300ED1490037CCF6 /* yolo26n.mlpackage */,
 				A9EC19CA300EC6900037CCF6 /* DriverAssist */,
 				A9EC19DB300EC6910037CCF6 /* DriverAssistTests */,
 				A9EC19E5300EC6910037CCF6 /* DriverAssistUITests */,
 				A9EC19C9300EC6900037CCF6 /* Products */,
+				A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */,
+				A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */,
 			);
 			sourceTree = "<group>";
 		};
@@ -227,8 +221,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A9EC1A16300ED22E0037CCF6 /* yolo26n.mlpackage in Resources */,
-				A9EC1A15300ED2240037CCF6 /* yolo26s.mlpackage in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -253,8 +245,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A9EC1A14300ED1630037CCF6 /* yolo26s.mlpackage in Sources */,
-				A9EC1A0E300ED1490037CCF6 /* yolo26n.mlpackage in Sources */,
+				A9EC1A3B3010099C0037CCF6 /* yolo26s.mlpackage in Sources */,
+				A9EC1A393010098E0037CCF6 /* yolo26n.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -262,8 +254,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A9EC1A13300ED1630037CCF6 /* yolo26s.mlpackage in Sources */,
-				A9EC1A0F300ED1490037CCF6 /* yolo26n.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -271,8 +261,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A9EC1A10300ED1490037CCF6 /* yolo26n.mlpackage in Sources */,
-				A9EC1A12300ED1630037CCF6 /* yolo26s.mlpackage in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
