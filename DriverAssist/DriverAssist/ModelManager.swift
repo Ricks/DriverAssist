@@ -1,15 +1,3 @@
-//
-//  ModelManager.swift
-//  DriverAssist
-//
-//  Created by Rick Clark on 7/20/26.
-//
-//  The ModelManager is the app’s single source of truth for model lifecycle and selection: it knows
-//  which YOLO model is currently active, loads the chosen Core ML package from the app bundle using
-//  a configured MLModel, exposes whether the model is ready or failed to load, and gives the rest of
-//  the app—especially the InferenceEngine—a clean way to switch between bundled detectors like
-//  yolo26s and yolo26n without scattering model-loading logic across the UI or camera pipeline.
-
 import Foundation
 import CoreML
 
@@ -20,12 +8,13 @@ enum DetectorModel: String, CaseIterable, Codable {
 
 @MainActor
 final class ModelManager: ObservableObject {
-    @Published private(set) var selectedModel: DetectorModel = .small
-    @Published private(set) var isLoaded: Bool = false
+    @Published private(set) var selectedModel: DetectorModel
+    @Published private(set) var isLoaded = false
     @Published private(set) var lastError: String?
 
     private(set) var model: MLModel?
     private let configuration: MLModelConfiguration
+    private var loadTask: Task<Void, Never>?
 
     init(defaultModel: DetectorModel = .small) {
         let config = MLModelConfiguration()
@@ -35,38 +24,50 @@ final class ModelManager: ObservableObject {
     }
 
     func loadInitialModel() {
-        do {
-            try load(model: selectedModel)
-        } catch {
-            lastError = error.localizedDescription
-            isLoaded = false
-        }
+        guard model == nil else { return }
+        startLoading(model: selectedModel)
     }
 
     func switchModel(to newModel: DetectorModel) {
         guard newModel != selectedModel else { return }
-
-        do {
-            try load(model: newModel)
-        } catch {
-            lastError = error.localizedDescription
-            isLoaded = false
-        }
+        startLoading(model: newModel)
     }
 
-    private func load(model newModel: DetectorModel) throws {
+    private func startLoading(model newModel: DetectorModel) {
+        loadTask?.cancel()
+        lastError = nil
+        loadTask = Task {
+            await loadAsync(model: newModel)
+        }
+    }
+    
+    private func loadAsync(model newModel: DetectorModel) async {
         lastError = nil
         isLoaded = false
 
-        guard let url = Bundle.main.url(forResource: newModel.rawValue, withExtension: "mlpackage") else {
-            throw ModelManagerError.modelNotFound(newModel.rawValue)
+        guard let url = Bundle.main.url(forResource: newModel.rawValue, withExtension: "mlmodelc") else {
+            lastError = ModelManagerError.modelNotFound(newModel.rawValue).localizedDescription
+            isLoaded = model != nil   // keep any previously loaded model working
+            return
         }
 
-        let loadedModel = try MLModel(contentsOf: url, configuration: configuration)
+        do {
+            let loadedModel = try await MLModel.load(contentsOf: url, configuration: configuration)
+            guard !Task.isCancelled else { return }
 
-        self.model = loadedModel
-        self.selectedModel = newModel
-        self.isLoaded = true
+            model = loadedModel
+            selectedModel = newModel
+            isLoaded = true
+        } catch {
+            guard !Task.isCancelled else { return }
+
+            lastError = error.localizedDescription
+            isLoaded = model != nil   // keep any previously loaded model working
+        }
+    }
+
+    deinit {
+        loadTask?.cancel()
     }
 }
 
@@ -76,7 +77,7 @@ enum ModelManagerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .modelNotFound(let name):
-            return "Could not find \(name).mlpackage in app bundle."
+            return "Could not find \(name).mlmodelc in app bundle."
         }
     }
 }

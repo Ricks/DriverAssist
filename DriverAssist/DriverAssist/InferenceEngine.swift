@@ -4,117 +4,110 @@
 //
 //  Created by Rick Clark on 7/20/26.
 //
-//  The InferenceEngine is the app’s real-time bridge between raw camera frames and usable detections:
-//  it receives CVPixelBuffers from the camera, runs them through the active Core ML YOLO model off the
-//  main thread, decodes the model’s outputs into a clean list of normalized bounding boxes with labels
-//  and confidences, and publishes those detections back on the main thread for SwiftUI to render overlays —
-//  all while preventing overlapping inferences to keep latency and UI responsiveness under control.
-//
-//  This engine:
-//   - Keeps a reference to ModelManager.
-//   - Tracks whether an inference is in-flight (isBusy) to avoid piling up frames.
-//   - Publishes the latest detections.
-//   - Runs model prediction on a background queue and publishes on main.
-//   - Is pinned to @MainActor for its published state; the actual Core ML work runs in
-//     a non-isolated `Sendable` decoder (`YOLODecoder`) so it can execute synchronously
-//     off-main without crossing actor boundaries.
 
-import Foundation
-import CoreML
 import Combine
-import CoreVideo
 import CoreGraphics
+import CoreML
+import CoreVideo
+import Foundation
 
-struct Detection: Identifiable {
-    let id = UUID()
-    let label: String
-    let confidence: Float
-    let boundingBox: CGRect   // normalized: origin + size in [0, 1]
+// MARK: - Errors
+
+enum InferenceError: LocalizedError {
+    case missingOutput(String)
+    case unexpectedShape([Int])
+
+    var errorDescription: String? {
+        switch self {
+        case .missingOutput(let detail):
+            return "Model output not found: \(detail)"
+        case .unexpectedShape(let shape):
+            return "Unexpected output shape: \(shape)"
+        }
+    }
 }
 
-/// Wraps a non-Sendable value so it can cross a `@Sendable` closure boundary.
-///
-/// `CVPixelBuffer` is a Core Foundation type that is not marked `Sendable`,
-/// but its retain/release and read access are safe across threads as long as
-/// nobody mutates it concurrently. Here the buffer is handed off once to the
-/// background queue and not touched afterwards on the calling side, so
-/// asserting `@unchecked Sendable` is safe.
-private struct UncheckedSendableBox<Value>: @unchecked Sendable {
-    let value: Value
-}
+// MARK: - Decoder
 
-/// Performs the actual Core ML inference and output decoding.
-///
-/// This type is intentionally *not* `@MainActor` so it can run synchronously
-/// on a background `DispatchQueue` without needing to hop actors. It holds
-/// no mutable state, so it's safely `Sendable`.
 struct YOLODecoder: Sendable {
-    func makeInput(from pixelBuffer: CVPixelBuffer) throws -> MLFeatureProvider {
-        // For a real Core ML model, you either:
-        // - use the auto-generated input class, or
-        // - wrap the pixel buffer in an `MLDictionaryFeatureProvider`.
-        //
-        // Replace "image" with the actual input name from your .mlpackage.
-        let imageValue = MLFeatureValue(pixelBuffer: pixelBuffer)
-        let dict = ["image": imageValue]
-        return try MLDictionaryFeatureProvider(dictionary: dict)
-    }
+    private let cocoTargets: [Int: String] = [
+        0: "person",
+        1: "bicycle",
+        2: "car",
+        3: "motorcycle",
+        5: "bus",
+        7: "truck"
+    ]
 
-    func decodeDetections(from output: MLFeatureProvider) throws -> [Detection] {
-        // This is intentionally generic; you will adapt it to your YOLO26 export.
-        // Many exported detectors provide an `MLMultiArray` with rows [x, y, w, h, confidence, classIndex].
-        guard let raw = output.featureValue(for: "output") else {
-            throw InferenceError.missingOutput("output")
-        }
+    private let modelInputSize: Float = 640
+    private let confidenceThreshold: Float = 0.25
 
-        guard let array = raw.multiArrayValue else {
-            throw InferenceError.invalidOutput("output is not a multiArray")
-        }
-
-        let labels = ["person", "bicycle", "car", "motorcycle", "bus", "truck"] // from COCO / your mapping
-        var results: [Detection] = []
-
-        // Example: assume shape (N, 6) where N rows of [x, y, w, h, conf, classIndex].
-        let rows = array.shape[0].intValue
-        let cols = array.shape[1].intValue
-        guard cols >= 6 else {
-            throw InferenceError.invalidOutput("expected 6 columns per detection, found \(cols)")
-        }
-
-        for row in 0..<rows {
-            let base = row * cols
-            let x = array[base + 0].floatValue
-            let y = array[base + 1].floatValue
-            let w = array[base + 2].floatValue
-            let h = array[base + 3].floatValue
-            let conf = array[base + 4].floatValue
-            let cls = Int(array[base + 5].floatValue)
-
-            // Basic confidence and class filter; tune later.
-            guard conf >= 0.4 else { continue }
-            guard cls >= 0 && cls < labels.count else { continue }
-
-            let label = labels[cls]
-
-            // center (x, y) + size (w, h) in normalized coordinates → CGRect
-            let origin = CGPoint(x: CGFloat(x - w / 2), y: CGFloat(y - h / 2))
-            let size = CGSize(width: CGFloat(w), height: CGFloat(h))
-            let bbox = CGRect(origin: origin, size: size)
-
-            results.append(Detection(label: label, confidence: conf, boundingBox: bbox))
-        }
-
-        return results
-    }
-
-    /// Runs the full pipeline: build input, predict, decode. Synchronous and
-    /// safe to call from any thread/queue.
     func run(model: MLModel, pixelBuffer: CVPixelBuffer) throws -> [Detection] {
-        let input = try makeInput(from: pixelBuffer)
+        let input = try MLDictionaryFeatureProvider(
+            dictionary: ["image": MLFeatureValue(pixelBuffer: pixelBuffer)]
+        )
         let output = try model.prediction(from: input)
         return try decodeDetections(from: output)
     }
+
+    private func decodeDetections(from output: MLFeatureProvider) throws -> [Detection] {
+        guard let raw = output.featureNames.lazy
+            .compactMap({ output.featureValue(for: $0) })
+            .first(where: { $0.multiArrayValue != nil })
+        else {
+            throw InferenceError.missingOutput("no multiArray output in model response")
+        }
+
+        guard let array = raw.multiArrayValue else {
+            throw InferenceError.missingOutput("multiArray output was nil")
+        }
+
+        let shape = array.shape.map(\.intValue)
+        guard shape.count == 3, shape[0] == 1, shape[2] >= 6 else {
+            throw InferenceError.unexpectedShape(shape)
+        }
+
+        let numDetections = shape[1]
+        var results: [Detection] = []
+
+        for i in 0..<numDetections {
+            let conf = value(in: array, at: [0, i, 4])
+            guard conf >= confidenceThreshold else { continue }
+
+            let cls = Int(value(in: array, at: [0, i, 5]).rounded())
+            guard let label = cocoTargets[cls] else { continue }
+
+            let x1 = value(in: array, at: [0, i, 0]) / modelInputSize
+            let y1 = value(in: array, at: [0, i, 1]) / modelInputSize
+            let x2 = value(in: array, at: [0, i, 2]) / modelInputSize
+            let y2 = value(in: array, at: [0, i, 3]) / modelInputSize
+
+            let box = CGRect(
+                x: CGFloat(x1),
+                y: CGFloat(y1),
+                width: CGFloat(max(0, x2 - x1)),
+                height: CGFloat(max(0, y2 - y1))
+            )
+
+            results.append(
+                Detection(
+                    label: label,
+                    confidence: conf,
+                    boundingBox: box
+                )
+            )
+        }
+
+        return DetectionFilter.nonMaxSuppression(results)
+    }
+
+    private func value(in array: MLMultiArray, at index: [Int]) -> Float {
+        let key = index.map(NSNumber.init(value:))
+        return array[key].floatValue
+    }
 }
+
+// MARK: - Engine
 
 @MainActor
 final class InferenceEngine: ObservableObject {
@@ -132,43 +125,40 @@ final class InferenceEngine: ObservableObject {
 
     func process(pixelBuffer: CVPixelBuffer) {
         guard !isBusy else { return }
-        guard let model = modelManager.model else {
-            lastError = "Model not loaded"
-            return
-        }
+        guard let model = modelManager.model else { return }
 
         isBusy = true
-        let box = UncheckedSendableBox(value: pixelBuffer)
+
+        let pixelBufferBox = UncheckedSendableBox(value: pixelBuffer)
+        let modelBox = UncheckedSendableBox(value: model)
         let decoder = self.decoder
 
-        queue.async {
+        queue.async { [weak self] in
             do {
-                let detections = try decoder.run(model: model, pixelBuffer: box.value)
+                let detections = try decoder.run(
+                    model: modelBox.value,
+                    pixelBuffer: pixelBufferBox.value
+                )
 
-                Task { @MainActor in
-                    self.detections = detections
-                    self.isBusy = false
+                Task { @MainActor [weak self] in
+                    self?.finishSuccess(detections)
                 }
             } catch {
-                Task { @MainActor in
-                    self.lastError = error.localizedDescription
-                    self.isBusy = false
+                Task { @MainActor [weak self] in
+                    self?.finishFailure(error)
                 }
             }
         }
     }
-}
 
-enum InferenceError: LocalizedError {
-    case missingOutput(String)
-    case invalidOutput(String)
+    private func finishSuccess(_ detections: [Detection]) {
+        self.detections = detections
+        self.lastError = nil
+        self.isBusy = false
+    }
 
-    var errorDescription: String? {
-        switch self {
-        case .missingOutput(let name):
-            return "Missing output feature '\(name)'"
-        case .invalidOutput(let message):
-            return "Invalid output: \(message)"
-        }
+    private func finishFailure(_ error: Error) {
+        self.lastError = error.localizedDescription
+        self.isBusy = false
     }
 }
