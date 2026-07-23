@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.dSYM
+*.dSYM.zip
+*.hmap
+*.ipa
+.swiftpm/
+
+# CocoaPods / SPM (uncomment if used)
+# Pods/
+# .build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Training/validation run outputs (regenerable via ultralytics val/predict)
+runs/
+
+# YOLO label caches (regenerated automatically)
+*.cache
