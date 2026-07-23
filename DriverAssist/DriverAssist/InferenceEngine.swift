@@ -50,7 +50,7 @@ struct YOLODecoder: Sendable {
         return try decodeDetections(from: output)
     }
 
-    private func decodeDetections(from output: MLFeatureProvider) throws -> [Detection] {
+    func decodeDetections(from output: MLFeatureProvider) throws -> [Detection] {
         guard let raw = output.featureNames.lazy
             .compactMap({ output.featureValue(for: $0) })
             .first(where: { $0.multiArrayValue != nil })

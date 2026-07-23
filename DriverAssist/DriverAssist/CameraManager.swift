@@ -40,8 +40,9 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     func stop() {
-        sessionQueue.async { [session] in
-            session.stopRunning()
+        let box = UncheckedSendableBox(value: session)
+        sessionQueue.async {
+            box.value.stopRunning()
         }
     }
 

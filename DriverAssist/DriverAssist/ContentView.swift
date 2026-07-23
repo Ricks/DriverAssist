@@ -23,7 +23,9 @@ struct ContentView: View {
 // MARK: — Inference view
 
 /// Wires ModelManager → InferenceEngine → CameraManager into a full-screen
-/// live-detection UI.
+/// live-detection UI: camera feed, detection overlay, and a small model-name
+/// label in the lower-left corner. Swipe anywhere (any direction) to toggle
+/// between the small and nano models.
 @MainActor
 struct InferenceView: View {
     @ObservedObject var modelManager: ModelManager
@@ -43,13 +45,25 @@ struct InferenceView: View {
             OverlayView(detections: inferenceEngine.detections)
                 .ignoresSafeArea()
 
-            VStack(spacing: 6) {
-                modelPicker
-                statusBanner
+            VStack {
                 Spacer()
+                HStack {
+                    Text(modelLabel)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .shadow(color: .black.opacity(0.6), radius: 2)
+                    Spacer()
+                }
             }
-            .padding(.top, 8)
+            .padding(.leading, 12)
+            .padding(.bottom, 12)
+            .ignoresSafeArea(edges: .bottom)
         }
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 24)
+                .onEnded { _ in cycleModel() }
+        )
         .onAppear {
             modelManager.loadInitialModel()
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
@@ -62,42 +76,20 @@ struct InferenceView: View {
         }
     }
 
-    // MARK: Sub-views
+    // MARK: Helpers
 
-    private var modelPicker: some View {
-        Picker("Model", selection: Binding(
-            get: { modelManager.selectedModel },
-            set: { modelManager.switchModel(to: $0) }
-        )) {
-            ForEach(DetectorModel.allCases, id: \.self) { model in
-                Text(model.rawValue).tag(model)
-            }
+    private var modelLabel: String {
+        switch modelManager.selectedModel {
+        case .small: return "small"
+        case .nano: return "nano"
         }
-        .pickerStyle(.segmented)
-        .padding(.horizontal)
-        .tint(.white)
     }
 
-    @ViewBuilder
-    private var statusBanner: some View {
-        if !modelManager.isLoaded && modelManager.lastError == nil {
-            Label("Loading model…", systemImage: "arrow.triangle.2.circlepath")
-                .font(.caption)
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(.black.opacity(0.55))
-                .clipShape(Capsule())
-        }
-        if let error = modelManager.lastError ?? inferenceEngine.lastError {
-            Text(error)
-                .font(.caption)
-                .foregroundStyle(.red)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(.black.opacity(0.55))
-                .clipShape(Capsule())
-        }
+    private func cycleModel() {
+        let models = DetectorModel.allCases
+        guard let index = models.firstIndex(of: modelManager.selectedModel) else { return }
+        let next = models[(index + 1) % models.count]
+        modelManager.switchModel(to: next)
     }
 }
 
