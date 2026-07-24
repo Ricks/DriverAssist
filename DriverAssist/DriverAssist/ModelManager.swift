@@ -21,7 +21,9 @@ final class ModelManager: ObservableObject {
 
     init(defaultModel: DetectorModel = .small) {
         let config = MLModelConfiguration()
-        config.computeUnits = .all
+        // .all routes through the GPU/MPSGraph backend, which crashes compiling this
+        // model ("MLIR pass manager failed"). CPU + Neural Engine works.
+        config.computeUnits = .cpuAndNeuralEngine
         self.configuration = config
         self.selectedModel = defaultModel
     }
@@ -47,6 +49,7 @@ final class ModelManager: ObservableObject {
 
     private func loadAsync(_ newModel: DetectorModel) async {
         guard let url = Bundle.main.url(forResource: newModel.rawValue, withExtension: "mlmodelc") else {
+            print("[ModelManager] \(newModel.rawValue): .mlmodelc not found in bundle")
             if newModel == selectedModel {
                 lastError = ModelManagerError.modelNotFound(newModel.rawValue).localizedDescription
             }
@@ -57,12 +60,14 @@ final class ModelManager: ObservableObject {
             let loaded = try await MLModel.load(contentsOf: url, configuration: configuration)
             guard !Task.isCancelled else { return }
             models[newModel] = loaded
+            print("[ModelManager] \(newModel.rawValue): loaded")
             if newModel == selectedModel {
                 isLoaded = true
                 lastError = nil
             }
         } catch {
             guard !Task.isCancelled else { return }
+            print("[ModelManager] \(newModel.rawValue): load failed: \(error)")
             if newModel == selectedModel {
                 lastError = error.localizedDescription
             }

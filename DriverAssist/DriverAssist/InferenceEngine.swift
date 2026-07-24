@@ -7,9 +7,13 @@
 
 import Combine
 import CoreGraphics
+import CoreImage
 import CoreML
 import CoreVideo
 import Foundation
+import Vision
+
+private let ciContext = CIContext()
 
 // MARK: - Errors
 
@@ -43,9 +47,22 @@ struct YOLODecoder: Sendable {
     private let confidenceThreshold: Float = 0.25
 
     func run(model: MLModel, pixelBuffer: CVPixelBuffer) throws -> [Detection] {
-        let input = try MLDictionaryFeatureProvider(
-            dictionary: ["image": MLFeatureValue(pixelBuffer: pixelBuffer)]
+        guard let constraint = model.modelDescription.inputDescriptionsByName["image"]?.imageConstraint else {
+            throw InferenceError.missingOutput("no image input constraint on model")
+        }
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            throw InferenceError.missingOutput("failed to create CGImage from pixel buffer")
+        }
+
+        // The camera delivers 1280x720 frames but the model requires an exact 640x640
+        // match (MLFeatureValue(pixelBuffer:) alone doesn't resize) — scale to fit here.
+        let imageFeature = try MLFeatureValue(
+            cgImage: cgImage,
+            constraint: constraint,
+            options: [.cropAndScale: VNImageCropAndScaleOption.scaleFill.rawValue]
         )
+        let input = try MLDictionaryFeatureProvider(dictionary: ["image": imageFeature])
         let output = try model.prediction(from: input)
         return try decodeDetections(from: output)
     }
@@ -114,6 +131,7 @@ final class InferenceEngine: ObservableObject {
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
     private var isBusy = false
+    private var frameCount = 0
 
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
@@ -121,7 +139,11 @@ final class InferenceEngine: ObservableObject {
 
     func process(pixelBuffer: CVPixelBuffer) {
         guard !isBusy else { return }
-        guard let model = modelManager.model else { return }
+        guard let model = modelManager.model else {
+            frameCount += 1
+            if frameCount % 60 == 1 { print("[InferenceEngine] no model loaded yet, dropping frame") }
+            return
+        }
 
         isBusy = true
 
@@ -151,10 +173,15 @@ final class InferenceEngine: ObservableObject {
         self.detections = detections
         self.lastError = nil
         self.isBusy = false
+        frameCount += 1
+        if frameCount % 60 == 1 || !detections.isEmpty {
+            print("[InferenceEngine] frame \(frameCount): \(detections.count) detection(s)")
+        }
     }
 
     private func finishFailure(_ error: Error) {
         self.lastError = error.localizedDescription
         self.isBusy = false
+        print("[InferenceEngine] inference failed: \(error)")
     }
 }
