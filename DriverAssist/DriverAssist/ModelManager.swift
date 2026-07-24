@@ -3,7 +3,7 @@ import CoreML
 
 enum DetectorModel: String, CaseIterable, Codable {
     case small = "yolo26s"
-    case nano = "yolo26n"
+    case nano  = "yolo26n"
 }
 
 @MainActor
@@ -12,9 +12,12 @@ final class ModelManager: ObservableObject {
     @Published private(set) var isLoaded = false
     @Published private(set) var lastError: String?
 
-    private(set) var model: MLModel?
+    // Both models are kept resident so switching is O(1).
+    private var models: [DetectorModel: MLModel] = [:]
     private let configuration: MLModelConfiguration
-    private var loadTask: Task<Void, Never>?
+    private var loadTasks: [DetectorModel: Task<Void, Never>] = [:]
+
+    var model: MLModel? { models[selectedModel] }
 
     init(defaultModel: DetectorModel = .small) {
         let config = MLModelConfiguration()
@@ -24,50 +27,50 @@ final class ModelManager: ObservableObject {
     }
 
     func loadInitialModel() {
-        guard model == nil else { return }
-        startLoading(model: selectedModel)
+        guard models.isEmpty, loadTasks.isEmpty else { return }
+        for detectorModel in DetectorModel.allCases {
+            startLoading(detectorModel)
+        }
     }
 
     func switchModel(to newModel: DetectorModel) {
         guard newModel != selectedModel else { return }
-        startLoading(model: newModel)
+        selectedModel = newModel
+        isLoaded = models[newModel] != nil
+        lastError = nil
     }
 
-    private func startLoading(model newModel: DetectorModel) {
-        loadTask?.cancel()
-        lastError = nil
-        loadTask = Task {
-            await loadAsync(model: newModel)
-        }
+    private func startLoading(_ newModel: DetectorModel) {
+        guard loadTasks[newModel] == nil else { return }
+        loadTasks[newModel] = Task { await loadAsync(newModel) }
     }
-    
-    private func loadAsync(model newModel: DetectorModel) async {
-        lastError = nil
-        isLoaded = false
 
+    private func loadAsync(_ newModel: DetectorModel) async {
         guard let url = Bundle.main.url(forResource: newModel.rawValue, withExtension: "mlmodelc") else {
-            lastError = ModelManagerError.modelNotFound(newModel.rawValue).localizedDescription
-            isLoaded = model != nil   // keep any previously loaded model working
+            if newModel == selectedModel {
+                lastError = ModelManagerError.modelNotFound(newModel.rawValue).localizedDescription
+            }
             return
         }
 
         do {
-            let loadedModel = try await MLModel.load(contentsOf: url, configuration: configuration)
+            let loaded = try await MLModel.load(contentsOf: url, configuration: configuration)
             guard !Task.isCancelled else { return }
-
-            model = loadedModel
-            selectedModel = newModel
-            isLoaded = true
+            models[newModel] = loaded
+            if newModel == selectedModel {
+                isLoaded = true
+                lastError = nil
+            }
         } catch {
             guard !Task.isCancelled else { return }
-
-            lastError = error.localizedDescription
-            isLoaded = model != nil   // keep any previously loaded model working
+            if newModel == selectedModel {
+                lastError = error.localizedDescription
+            }
         }
     }
 
     deinit {
-        loadTask?.cancel()
+        loadTasks.values.forEach { $0.cancel() }
     }
 }
 

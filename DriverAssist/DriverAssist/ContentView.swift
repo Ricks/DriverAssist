@@ -9,8 +9,6 @@ import SwiftUI
 
 // MARK: — Root view
 
-/// Creates the shared ModelManager and hands it to InferenceView, which owns
-/// the InferenceEngine (requires ModelManager at init time) and CameraManager.
 @MainActor
 struct ContentView: View {
     @StateObject private var modelManager = ModelManager()
@@ -22,10 +20,6 @@ struct ContentView: View {
 
 // MARK: — Inference view
 
-/// Wires ModelManager → InferenceEngine → CameraManager into a full-screen
-/// live-detection UI: camera feed, detection overlay, and a small model-name
-/// label in the lower-left corner. Swipe anywhere (any direction) to toggle
-/// between the small and nano models.
 @MainActor
 struct InferenceView: View {
     @ObservedObject var modelManager: ModelManager
@@ -49,7 +43,7 @@ struct InferenceView: View {
                 Spacer()
                 HStack {
                     Text(modelLabel)
-                        .font(.caption.weight(.medium))
+                        .font(.system(size: 24, weight: .medium))
                         .foregroundStyle(.white.opacity(0.75))
                         .shadow(color: .black.opacity(0.6), radius: 2)
                     Spacer()
@@ -81,7 +75,7 @@ struct InferenceView: View {
     private var modelLabel: String {
         switch modelManager.selectedModel {
         case .small: return "small"
-        case .nano: return "nano"
+        case .nano:  return "nano"
         }
     }
 

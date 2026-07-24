@@ -51,15 +51,11 @@ struct YOLODecoder: Sendable {
     }
 
     func decodeDetections(from output: MLFeatureProvider) throws -> [Detection] {
-        guard let raw = output.featureNames.lazy
-            .compactMap({ output.featureValue(for: $0) })
-            .first(where: { $0.multiArrayValue != nil })
+        guard let array = output.featureNames.lazy
+            .compactMap({ output.featureValue(for: $0)?.multiArrayValue })
+            .first
         else {
             throw InferenceError.missingOutput("no multiArray output in model response")
-        }
-
-        guard let array = raw.multiArrayValue else {
-            throw InferenceError.missingOutput("multiArray output was nil")
         }
 
         let shape = array.shape.map(\.intValue)
