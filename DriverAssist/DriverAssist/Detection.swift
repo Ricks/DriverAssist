@@ -8,7 +8,7 @@
 import Foundation
 import CoreGraphics
 
-struct Detection: Identifiable {
+struct Detection: Identifiable, Equatable {
     let id = UUID()
     let label: String
     let confidence: Float

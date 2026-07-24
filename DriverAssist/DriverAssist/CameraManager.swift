@@ -17,15 +17,31 @@ final class CameraManager: NSObject, ObservableObject {
     /// Called on the main actor for every captured frame.
     var onFrame: ((CVPixelBuffer) -> Void)?
 
+    /// Latest detections to bake into recorded frames. Written from the main actor
+    /// (as inference results arrive) and read from `sessionQueue` (as frames are
+    /// appended to the recording), so access is guarded by `detectionsLock`.
+    nonisolated var currentDetections: [Detection] {
+        get { detectionsLock.lock(); defer { detectionsLock.unlock() }; return _currentDetections }
+        set { detectionsLock.lock(); _currentDetections = newValue; detectionsLock.unlock() }
+    }
+
+    private let detectionsLock = NSLock()
+    private nonisolated(unsafe) var _currentDetections: [Detection] = []
+
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
     nonisolated(unsafe) let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "CameraManager.session", qos: .userInitiated)
     private nonisolated(unsafe) let videoOutput = AVCaptureVideoDataOutput()
-    private nonisolated(unsafe) let movieOutput = AVCaptureMovieFileOutput()
     private nonisolated(unsafe) var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
+
+    // Recording state. Only ever touched on sessionQueue (configure/startNewRecording
+    // run there, and the video data output delegate is dispatched to sessionQueue too).
+    private nonisolated(unsafe) var assetWriter: AVAssetWriter?
+    private nonisolated(unsafe) var assetWriterInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
 
     func start() {
         Task {
@@ -44,9 +60,8 @@ final class CameraManager: NSObject, ObservableObject {
 
     func stop() {
         let sessionBox = UncheckedSendableBox(value: session)
-        let movieBox   = UncheckedSendableBox(value: movieOutput)
-        sessionQueue.async {
-            if movieBox.value.isRecording { movieBox.value.stopRecording() }
+        sessionQueue.async { [weak self] in
+            self?.finishRecording()
             sessionBox.value.stopRunning()
         }
     }
@@ -84,10 +99,6 @@ final class CameraManager: NSObject, ObservableObject {
             session.addOutput(videoOutput)
         }
 
-        if session.canAddOutput(movieOutput) {
-            session.addOutput(movieOutput)
-        }
-
         configureRotationCoordinator(for: device)
 
         session.commitConfiguration()
@@ -110,25 +121,146 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private nonisolated func applyCaptureRotation(_ angle: CGFloat) {
-        for output in [videoOutput as AVCaptureOutput, movieOutput as AVCaptureOutput] {
-            guard
-                let connection = output.connection(with: .video),
-                connection.isVideoRotationAngleSupported(angle)
-            else { continue }
-            connection.videoRotationAngle = angle
-        }
+        guard
+            let connection = videoOutput.connection(with: .video),
+            connection.isVideoRotationAngleSupported(angle)
+        else { return }
+        connection.videoRotationAngle = angle
     }
 
+    /// Creates the asset writer for a new recording. The writer's video input/adaptor
+    /// are added lazily once the first frame arrives, since only then do we know the
+    /// actual (post-rotation) pixel buffer dimensions.
     private nonisolated func startNewRecording() {
         guard
-            !movieOutput.isRecording,
+            assetWriter == nil,
             let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         else { return }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let url = documents.appendingPathComponent("recording-\(formatter.string(from: Date())).mov")
-        movieOutput.startRecording(to: url, recordingDelegate: self)
+        let writer = try? AVAssetWriter(outputURL: url, fileType: .mov)
+        // This app has no reliable stop point in normal use (the root view never
+        // disappears), so the process is typically killed rather than cleanly
+        // stopped. Periodic fragments keep the file's moov atom written incrementally
+        // so a recording stays playable even if finishWriting() never runs.
+        writer?.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
+        assetWriter = writer
+    }
+
+    private nonisolated func finishRecording() {
+        guard let writer = assetWriter, let input = assetWriterInput else {
+            assetWriter = nil
+            assetWriterInput = nil
+            pixelBufferAdaptor = nil
+            return
+        }
+        input.markAsFinished()
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting { semaphore.signal() }
+        semaphore.wait()
+        assetWriter = nil
+        assetWriterInput = nil
+        pixelBufferAdaptor = nil
+    }
+
+    /// Composites the current detections onto `pixelBuffer` and appends the result
+    /// to the in-progress recording, so the saved file matches what's on screen.
+    private nonisolated func appendRecordingFrame(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        guard let writer = assetWriter else { return }
+
+        if assetWriterInput == nil {
+            let width  = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            let outputSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height
+            ]
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
+            input.expectsMediaDataInRealTime = true
+
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: input,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: width,
+                    kCVPixelBufferHeightKey as String: height
+                ]
+            )
+
+            guard writer.canAdd(input) else { return }
+            writer.add(input)
+            assetWriterInput = input
+            pixelBufferAdaptor = adaptor
+
+            writer.startWriting()
+            writer.startSession(atSourceTime: presentationTime)
+        }
+
+        guard
+            let input = assetWriterInput,
+            let adaptor = pixelBufferAdaptor,
+            input.isReadyForMoreMediaData,
+            let pool = adaptor.pixelBufferPool
+        else { return }
+
+        var outputBuffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outputBuffer)
+        guard let outputBuffer else { return }
+
+        compositeOverlay(from: pixelBuffer, into: outputBuffer, detections: currentDetections)
+        adaptor.append(outputBuffer, withPresentationTime: presentationTime)
+    }
+
+    private nonisolated func compositeOverlay(
+        from source: CVPixelBuffer,
+        into destination: CVPixelBuffer,
+        detections: [Detection]
+    ) {
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+            CVPixelBufferUnlockBaseAddress(destination, [])
+        }
+
+        guard
+            let srcBase = CVPixelBufferGetBaseAddress(source),
+            let dstBase = CVPixelBufferGetBaseAddress(destination)
+        else { return }
+
+        let width          = CVPixelBufferGetWidth(destination)
+        let height         = CVPixelBufferGetHeight(destination)
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)
+
+        if srcBytesPerRow == dstBytesPerRow {
+            memcpy(dstBase, srcBase, srcBytesPerRow * height)
+        } else {
+            let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
+            for row in 0..<height {
+                memcpy(dstBase.advanced(by: row * dstBytesPerRow), srcBase.advanced(by: row * srcBytesPerRow), rowBytes)
+            }
+        }
+
+        guard let context = CGContext(
+            data: dstBase,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: dstBytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return }
+
+        // Flip to a top-left origin so it matches Detection.boundingBox's convention
+        // (and matches UIKit's coordinate space for the label text drawn below).
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+
+        OverlayRenderer.draw(detections, in: context, size: CGSize(width: width, height: height))
     }
 }
 
@@ -141,28 +273,14 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         from connection: AVCaptureConnection
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        appendRecordingFrame(pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+
         let box = UncheckedSendableBox(value: pixelBuffer)
         Task { @MainActor [weak self] in
             self?.onFrame?(box.value)
         }
     }
-}
-
-// MARK: — Recording delegate
-
-extension CameraManager: AVCaptureFileOutputRecordingDelegate {
-    nonisolated func fileOutput(
-        _ output: AVCaptureFileOutput,
-        didStartRecordingTo fileURL: URL,
-        from connections: [AVCaptureConnection]
-    ) {}
-
-    nonisolated func fileOutput(
-        _ output: AVCaptureFileOutput,
-        didFinishRecordingTo outputFileURL: URL,
-        from connections: [AVCaptureConnection],
-        error: Error?
-    ) {}
 }
 
 // MARK: — SwiftUI camera preview

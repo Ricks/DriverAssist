@@ -58,6 +58,9 @@ struct InferenceView: View {
             DragGesture(minimumDistance: 24)
                 .onEnded { _ in cycleModel() }
         )
+        .onChange(of: inferenceEngine.detections) { _, newDetections in
+            cameraManager.currentDetections = newDetections
+        }
         .onAppear {
             modelManager.loadInitialModel()
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in

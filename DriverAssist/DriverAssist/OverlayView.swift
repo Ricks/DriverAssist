@@ -27,7 +27,7 @@ struct OverlayView: View {
             width:  detection.boundingBox.width  * size.width,
             height: detection.boundingBox.height * size.height
         )
-        let color = labelColor(detection.label)
+        let color = Color(cgColor: OverlayStyle.color(for: detection.label))
 
         var path = Path()
         path.addRect(box)
@@ -38,15 +38,5 @@ struct OverlayView: View {
             .font(.caption2).bold()
             .foregroundStyle(color)
         context.draw(label, at: CGPoint(x: box.minX + 4, y: box.minY + 2), anchor: .topLeading)
-    }
-
-    private func labelColor(_ label: String) -> Color {
-        switch label {
-        case "person":                  return .yellow
-        case "bicycle", "motorcycle":   return .cyan
-        case "car":                     return .green
-        case "bus", "truck":            return .red
-        default:                        return .white
-        }
     }
 }
