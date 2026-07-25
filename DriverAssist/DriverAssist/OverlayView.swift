@@ -8,25 +8,32 @@
 import SwiftUI
 
 /// Draws bounding boxes and labels for all current detections over a full-screen canvas.
+///
+/// `Detection.boundingBox` is normalized against the camera buffer's own pixel
+/// dimensions (`sourceSize`), not against the screen. The camera preview underneath
+/// renders that buffer with `.resizeAspectFill` — a centered, uniform scale-and-crop —
+/// so a naive `fraction * screenSize` stretch would drift from the true on-screen
+/// position whenever the buffer and screen aspect ratios differ. `AspectFillTransform`
+/// reproduces that same scale-and-crop for the boxes.
 struct OverlayView: View {
     let detections: [Detection]
+    let sourceSize: CGSize
 
     var body: some View {
-        Canvas { context, size in
+        DebugFileLogger.log("body evaluated: sourceSize=\(sourceSize) detections=\(detections.count)")
+        return Canvas { context, size in
+            DebugFileLogger.log("CANVAS DRAW: canvas=\(size) sourceSize=\(sourceSize) detections=\(detections.count)")
+            guard sourceSize.width > 0, sourceSize.height > 0 else { return }
+            let transform = AspectFillTransform(source: sourceSize, destination: size)
             for detection in detections {
-                draw(detection, in: &context, size: size)
+                draw(detection, in: &context, transform: transform)
             }
         }
         .allowsHitTesting(false)
     }
 
-    private func draw(_ detection: Detection, in context: inout GraphicsContext, size: CGSize) {
-        let box = CGRect(
-            x:      detection.boundingBox.minX * size.width,
-            y:      detection.boundingBox.minY * size.height,
-            width:  detection.boundingBox.width  * size.width,
-            height: detection.boundingBox.height * size.height
-        )
+    private func draw(_ detection: Detection, in context: inout GraphicsContext, transform: AspectFillTransform) {
+        let box = transform.rect(for: detection.boundingBox)
         let color = Color(cgColor: OverlayStyle.color(for: detection.label))
 
         var path = Path()
@@ -38,5 +45,30 @@ struct OverlayView: View {
             .font(.caption2).bold()
             .foregroundStyle(color)
         context.draw(label, at: CGPoint(x: box.minX + 4, y: box.minY + 2), anchor: .topLeading)
+    }
+}
+
+/// Maps normalized (0,1) coordinates in a `source`-sized buffer onto a `destination`
+/// view using the same centered scale-and-crop as `AVLayerVideoGravity.resizeAspectFill`.
+struct AspectFillTransform {
+    let source: CGSize
+    let scale: CGFloat
+    let offsetX: CGFloat
+    let offsetY: CGFloat
+
+    init(source: CGSize, destination: CGSize) {
+        self.source = source
+        scale = max(destination.width / source.width, destination.height / source.height)
+        offsetX = (destination.width  - source.width  * scale) / 2
+        offsetY = (destination.height - source.height * scale) / 2
+    }
+
+    func rect(for normalized: CGRect) -> CGRect {
+        CGRect(
+            x:      offsetX + normalized.minX * source.width  * scale,
+            y:      offsetY + normalized.minY * source.height * scale,
+            width:  normalized.width  * source.width  * scale,
+            height: normalized.height * source.height * scale
+        )
     }
 }

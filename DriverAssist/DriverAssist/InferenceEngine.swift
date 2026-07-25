@@ -126,6 +126,11 @@ struct YOLODecoder: Sendable {
 final class InferenceEngine: ObservableObject {
     @Published private(set) var detections: [Detection] = []
     @Published private(set) var lastError: String?
+    /// True pixel dimensions of the most recent camera frame. `Detection.boundingBox`
+    /// is normalized against this size, not against the screen — the overlay needs it
+    /// to reproduce the preview's aspect-fill crop instead of naively stretching boxes
+    /// across the screen bounds.
+    @Published private(set) var sourceSize: CGSize = .zero
 
     private let modelManager: ModelManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
@@ -138,6 +143,8 @@ final class InferenceEngine: ObservableObject {
     }
 
     func process(pixelBuffer: CVPixelBuffer) {
+        sourceSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        DebugFileLogger.log("process() called, sourceSize set to \(sourceSize)")
         guard !isBusy else { return }
         guard let model = modelManager.model else {
             frameCount += 1

@@ -36,7 +36,7 @@ struct InferenceView: View {
             CameraPreviewView(session: cameraManager.session)
                 .ignoresSafeArea()
 
-            OverlayView(detections: inferenceEngine.detections)
+            OverlayView(detections: inferenceEngine.detections, sourceSize: inferenceEngine.sourceSize)
                 .ignoresSafeArea()
 
             VStack {
@@ -62,6 +62,7 @@ struct InferenceView: View {
             cameraManager.currentDetections = newDetections
         }
         .onAppear {
+            DebugFileLogger.reset()
             modelManager.loadInitialModel()
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
                 inferenceEngine?.process(pixelBuffer: pixelBuffer)
