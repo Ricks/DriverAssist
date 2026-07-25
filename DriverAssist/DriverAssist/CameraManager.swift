@@ -17,16 +17,36 @@ final class CameraManager: NSObject, ObservableObject {
     /// Called on the main actor for every captured frame.
     var onFrame: ((CVPixelBuffer) -> Void)?
 
+    /// Whether the low-light exposure boost is active. Published for the HUD text;
+    /// toggling also updates `currentLowLightEnabled` below for the recording bake.
+    @Published private(set) var isLowLightBoostEnabled = false
+
     /// Latest detections to bake into recorded frames. Written from the main actor
     /// (as inference results arrive) and read from `sessionQueue` (as frames are
-    /// appended to the recording), so access is guarded by `detectionsLock`.
+    /// appended to the recording), so access is guarded by `overlayLock`.
     nonisolated var currentDetections: [Detection] {
-        get { detectionsLock.lock(); defer { detectionsLock.unlock() }; return _currentDetections }
-        set { detectionsLock.lock(); _currentDetections = newValue; detectionsLock.unlock() }
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentDetections }
+        set { overlayLock.lock(); _currentDetections = newValue; overlayLock.unlock() }
     }
 
-    private let detectionsLock = NSLock()
+    /// Current model label ("small"/"nano") to bake into recorded frames, mirroring
+    /// `ModelManager.selectedModel` (owned there, synced in from the main actor).
+    nonisolated var currentModelLabel: String {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentModelLabel }
+        set { overlayLock.lock(); _currentModelLabel = newValue; overlayLock.unlock() }
+    }
+
+    /// Nonisolated mirror of `isLowLightBoostEnabled`, readable from `sessionQueue`
+    /// while baking the recording overlay.
+    private nonisolated var currentLowLightEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentLowLightEnabled }
+        set { overlayLock.lock(); _currentLowLightEnabled = newValue; overlayLock.unlock() }
+    }
+
+    private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
+    private nonisolated(unsafe) var _currentModelLabel: String = ""
+    private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -36,6 +56,7 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) let videoOutput = AVCaptureVideoDataOutput()
     private nonisolated(unsafe) var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
+    private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
 
     // Recording state. Only ever touched on sessionQueue (configure/startNewRecording
     // run there, and the video data output delegate is dispatched to sessionQueue too).
@@ -66,6 +87,27 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    /// Toggles the low-light exposure boost, biasing auto-exposure brighter to help
+    /// detection in dark scenes (at the cost of more sensor noise).
+    func toggleLowLightBoost() {
+        let enabled = !isLowLightBoostEnabled
+        isLowLightBoostEnabled = enabled
+        currentLowLightEnabled = enabled
+        sessionQueue.async { [weak self] in self?.applyExposureBias(enabled: enabled) }
+    }
+
+    private nonisolated func applyExposureBias(enabled: Bool) {
+        guard let device = captureDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            let bias = enabled ? min(3.0, device.maxExposureTargetBias) : 0
+            device.setExposureTargetBias(bias, completionHandler: nil)
+        } catch {
+            // Device may be mid-reconfiguration; the bias just won't apply this time.
+        }
+    }
+
     private nonisolated func configure() {
         guard !session.isRunning else { return }
 
@@ -88,6 +130,7 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
         session.addInput(input)
+        captureDevice = device
 
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -210,14 +253,22 @@ final class CameraManager: NSObject, ObservableObject {
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outputBuffer)
         guard let outputBuffer else { return }
 
-        compositeOverlay(from: pixelBuffer, into: outputBuffer, detections: currentDetections)
+        compositeOverlay(
+            from: pixelBuffer,
+            into: outputBuffer,
+            detections: currentDetections,
+            modelLabel: currentModelLabel,
+            lowLightEnabled: currentLowLightEnabled
+        )
         adaptor.append(outputBuffer, withPresentationTime: presentationTime)
     }
 
     private nonisolated func compositeOverlay(
         from source: CVPixelBuffer,
         into destination: CVPixelBuffer,
-        detections: [Detection]
+        detections: [Detection],
+        modelLabel: String,
+        lowLightEnabled: Bool
     ) {
         CVPixelBufferLockBaseAddress(source, .readOnly)
         CVPixelBufferLockBaseAddress(destination, [])
@@ -260,7 +311,9 @@ final class CameraManager: NSObject, ObservableObject {
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
 
-        OverlayRenderer.draw(detections, in: context, size: CGSize(width: width, height: height))
+        let size = CGSize(width: width, height: height)
+        OverlayRenderer.draw(detections, in: context, size: size)
+        OverlayRenderer.drawHUD(modelLabel: modelLabel, lowLightEnabled: lowLightEnabled, in: context, size: size)
     }
 }
 

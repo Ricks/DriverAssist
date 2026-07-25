@@ -47,23 +47,37 @@ struct InferenceView: View {
                         .foregroundStyle(.white.opacity(0.75))
                         .shadow(color: .black.opacity(0.6), radius: 2)
                     Spacer()
+                    Text(lowLightLabel)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .shadow(color: .black.opacity(0.6), radius: 2)
                 }
             }
-            .padding(.leading, 12)
+            .padding(.horizontal, 12)
             .padding(.bottom, 12)
             .ignoresSafeArea(edges: .bottom)
         }
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: 24)
-                .onEnded { _ in cycleModel() }
+                .onEnded { value in
+                    if abs(value.translation.width) > abs(value.translation.height) {
+                        cycleModel()
+                    } else {
+                        cameraManager.toggleLowLightBoost()
+                    }
+                }
         )
         .onChange(of: inferenceEngine.detections) { _, newDetections in
             cameraManager.currentDetections = newDetections
         }
+        .onChange(of: modelManager.selectedModel) { _, _ in
+            cameraManager.currentModelLabel = modelLabel
+        }
         .onAppear {
             DebugFileLogger.reset()
             modelManager.loadInitialModel()
+            cameraManager.currentModelLabel = modelLabel
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
                 inferenceEngine?.process(pixelBuffer: pixelBuffer)
             }
@@ -81,6 +95,10 @@ struct InferenceView: View {
         case .small: return "small"
         case .nano:  return "nano"
         }
+    }
+
+    private var lowLightLabel: String {
+        "low-light: \(cameraManager.isLowLightBoostEnabled ? "on" : "off")"
     }
 
     private func cycleModel() {
