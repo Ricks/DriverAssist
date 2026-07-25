@@ -25,6 +25,7 @@ struct InferenceView: View {
     @ObservedObject var modelManager: ModelManager
     @StateObject private var inferenceEngine: InferenceEngine
     @StateObject private var cameraManager = CameraManager()
+    @StateObject private var voiceCommandManager = VoiceCommandManager()
 
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
@@ -82,9 +83,19 @@ struct InferenceView: View {
                 inferenceEngine?.process(pixelBuffer: pixelBuffer)
             }
             cameraManager.start()
+            voiceCommandManager.onCommand = { [weak modelManager, weak cameraManager] command in
+                switch command {
+                case .selectModel(let model):
+                    modelManager?.switchModel(to: model)
+                case .lowLight(let enabled):
+                    cameraManager?.setLowLightBoost(enabled)
+                }
+            }
+            voiceCommandManager.start()
         }
         .onDisappear {
             cameraManager.stop()
+            voiceCommandManager.stop()
         }
     }
 

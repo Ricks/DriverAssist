@@ -90,7 +90,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// Toggles the low-light exposure boost, biasing auto-exposure brighter to help
     /// detection in dark scenes (at the cost of more sensor noise).
     func toggleLowLightBoost() {
-        let enabled = !isLowLightBoostEnabled
+        setLowLightBoost(!isLowLightBoostEnabled)
+    }
+
+    /// Sets the low-light exposure boost to an explicit state (used by voice commands,
+    /// which say "on"/"off" rather than toggle).
+    func setLowLightBoost(_ enabled: Bool) {
         isLowLightBoostEnabled = enabled
         currentLowLightEnabled = enabled
         sessionQueue.async { [weak self] in self?.applyExposureBias(enabled: enabled) }
