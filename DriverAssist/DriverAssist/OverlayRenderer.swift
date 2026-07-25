@@ -56,15 +56,28 @@ enum OverlayRenderer {
         UIGraphicsPopContext()
     }
 
-    /// Draws the model-name and low-light-state labels in the bottom corners, mirroring
-    /// the live HUD text in `ContentView` so recordings match what's on screen.
-    static func drawHUD(modelLabel: String, lowLightEnabled: Bool, in context: CGContext, size: CGSize) {
-        let lowLightText = "low-light: \(lowLightEnabled ? "on" : "off")"
-        drawCornerLabel(modelLabel, in: context, size: size, leading: true)
-        drawCornerLabel(lowLightText, in: context, size: size, leading: false)
+    private enum Corner {
+        case bottomLeading, bottomTrailing, topTrailing
     }
 
-    private static func drawCornerLabel(_ string: String, in context: CGContext, size: CGSize, leading: Bool) {
+    /// Draws the model-name, low-light-state, and smoothing-state labels in the
+    /// screen corners, mirroring the live HUD text in `ContentView` so recordings
+    /// match what's on screen.
+    static func drawHUD(
+        modelLabel: String,
+        lowLightEnabled: Bool,
+        smoothingEnabled: Bool,
+        in context: CGContext,
+        size: CGSize
+    ) {
+        let lowLightText = "low-light: \(lowLightEnabled ? "on" : "off")"
+        let smoothingText = "smoothing: \(smoothingEnabled ? "on" : "off")"
+        drawCornerLabel(modelLabel, in: context, size: size, corner: .bottomLeading)
+        drawCornerLabel(lowLightText, in: context, size: size, corner: .bottomTrailing)
+        drawCornerLabel(smoothingText, in: context, size: size, corner: .topTrailing)
+    }
+
+    private static func drawCornerLabel(_ string: String, in context: CGContext, size: CGSize, corner: Corner) {
         let text = string as NSString
         let attributes: [NSAttributedString.Key: Any] = [
             .font: UIFont.systemFont(ofSize: 24, weight: .medium),
@@ -72,8 +85,20 @@ enum OverlayRenderer {
         ]
         let textSize = text.size(withAttributes: attributes)
         let margin: CGFloat = 12
-        let x = leading ? margin : size.width - textSize.width - margin
-        let y = size.height - textSize.height - margin
+
+        let x: CGFloat
+        let y: CGFloat
+        switch corner {
+        case .bottomLeading:
+            x = margin
+            y = size.height - textSize.height - margin
+        case .bottomTrailing:
+            x = size.width - textSize.width - margin
+            y = size.height - textSize.height - margin
+        case .topTrailing:
+            x = size.width - textSize.width - margin
+            y = margin
+        }
 
         UIGraphicsPushContext(context)
         context.saveGState()

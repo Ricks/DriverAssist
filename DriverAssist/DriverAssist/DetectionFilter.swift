@@ -46,7 +46,7 @@ enum DetectionFilter {
         return kept
     }
 
-    private static func iou(_ a: CGRect, _ b: CGRect) -> Float {
+    static func iou(_ a: CGRect, _ b: CGRect) -> Float {
         let intersection = a.intersection(b)
         guard !intersection.isNull, !intersection.isEmpty else { return 0 }
         let inter = Float(intersection.width * intersection.height)

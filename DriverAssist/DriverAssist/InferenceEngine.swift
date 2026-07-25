@@ -131,15 +131,25 @@ final class InferenceEngine: ObservableObject {
     /// to reproduce the preview's aspect-fill crop instead of naively stretching boxes
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
+    @Published private(set) var isSmoothingEnabled = true
 
     private let modelManager: ModelManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
+    private let smoother = DetectionSmoother()
     private var isBusy = false
     private var frameCount = 0
 
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
+    }
+
+    /// Resets tracking state on change so a stale pre-toggle position can't get
+    /// blended into the first frame after re-enabling.
+    func setSmoothingEnabled(_ enabled: Bool) {
+        guard enabled != isSmoothingEnabled else { return }
+        isSmoothingEnabled = enabled
+        smoother.reset()
     }
 
     func process(pixelBuffer: CVPixelBuffer) {
@@ -177,7 +187,7 @@ final class InferenceEngine: ObservableObject {
     }
 
     private func finishSuccess(_ detections: [Detection]) {
-        self.detections = detections
+        self.detections = isSmoothingEnabled ? smoother.smooth(detections) : detections
         self.lastError = nil
         self.isBusy = false
         frameCount += 1

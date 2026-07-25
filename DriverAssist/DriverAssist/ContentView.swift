@@ -41,6 +41,13 @@ struct InferenceView: View {
                 .ignoresSafeArea()
 
             VStack {
+                HStack {
+                    Spacer()
+                    Text(smoothingLabel)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .shadow(color: .black.opacity(0.6), radius: 2)
+                }
                 Spacer()
                 HStack {
                     Text(modelLabel)
@@ -55,8 +62,8 @@ struct InferenceView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, 12)
-            .ignoresSafeArea(edges: .bottom)
+            .padding(.vertical, 12)
+            .ignoresSafeArea(edges: [.top, .bottom])
         }
         .contentShape(Rectangle())
         .gesture(
@@ -75,20 +82,26 @@ struct InferenceView: View {
         .onChange(of: modelManager.selectedModel) { _, _ in
             cameraManager.currentModelLabel = modelLabel
         }
+        .onChange(of: inferenceEngine.isSmoothingEnabled) { _, newValue in
+            cameraManager.currentSmoothingEnabled = newValue
+        }
         .onAppear {
             DebugFileLogger.reset()
             modelManager.loadInitialModel()
             cameraManager.currentModelLabel = modelLabel
+            cameraManager.currentSmoothingEnabled = inferenceEngine.isSmoothingEnabled
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
                 inferenceEngine?.process(pixelBuffer: pixelBuffer)
             }
             cameraManager.start()
-            voiceCommandManager.onCommand = { [weak modelManager, weak cameraManager] command in
+            voiceCommandManager.onCommand = { [weak modelManager, weak cameraManager, weak inferenceEngine] command in
                 switch command {
                 case .selectModel(let model):
                     modelManager?.switchModel(to: model)
                 case .lowLight(let enabled):
                     cameraManager?.setLowLightBoost(enabled)
+                case .smoothing(let enabled):
+                    inferenceEngine?.setSmoothingEnabled(enabled)
                 }
             }
             voiceCommandManager.start()
@@ -110,6 +123,10 @@ struct InferenceView: View {
 
     private var lowLightLabel: String {
         "low-light: \(cameraManager.isLowLightBoostEnabled ? "on" : "off")"
+    }
+
+    private var smoothingLabel: String {
+        "smoothing: \(inferenceEngine.isSmoothingEnabled ? "on" : "off")"
     }
 
     private func cycleModel() {

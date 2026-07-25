@@ -43,10 +43,19 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentLowLightEnabled = newValue; overlayLock.unlock() }
     }
 
+    /// Current detection-smoothing state ("smoothing on/off") to bake into recorded
+    /// frames, mirroring `InferenceEngine.isSmoothingEnabled` (owned there, synced in
+    /// from the main actor).
+    nonisolated var currentSmoothingEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentSmoothingEnabled }
+        set { overlayLock.lock(); _currentSmoothingEnabled = newValue; overlayLock.unlock() }
+    }
+
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
     private nonisolated(unsafe) var _currentModelLabel: String = ""
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
+    private nonisolated(unsafe) var _currentSmoothingEnabled: Bool = true
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -263,7 +272,8 @@ final class CameraManager: NSObject, ObservableObject {
             into: outputBuffer,
             detections: currentDetections,
             modelLabel: currentModelLabel,
-            lowLightEnabled: currentLowLightEnabled
+            lowLightEnabled: currentLowLightEnabled,
+            smoothingEnabled: currentSmoothingEnabled
         )
         adaptor.append(outputBuffer, withPresentationTime: presentationTime)
     }
@@ -273,7 +283,8 @@ final class CameraManager: NSObject, ObservableObject {
         into destination: CVPixelBuffer,
         detections: [Detection],
         modelLabel: String,
-        lowLightEnabled: Bool
+        lowLightEnabled: Bool,
+        smoothingEnabled: Bool
     ) {
         CVPixelBufferLockBaseAddress(source, .readOnly)
         CVPixelBufferLockBaseAddress(destination, [])
@@ -318,7 +329,13 @@ final class CameraManager: NSObject, ObservableObject {
 
         let size = CGSize(width: width, height: height)
         OverlayRenderer.draw(detections, in: context, size: size)
-        OverlayRenderer.drawHUD(modelLabel: modelLabel, lowLightEnabled: lowLightEnabled, in: context, size: size)
+        OverlayRenderer.drawHUD(
+            modelLabel: modelLabel,
+            lowLightEnabled: lowLightEnabled,
+            smoothingEnabled: smoothingEnabled,
+            in: context,
+            size: size
+        )
     }
 }
 
@@ -389,7 +406,7 @@ struct CameraPreviewView: UIViewRepresentable {
             }
 
             sessionStartObserver = NotificationCenter.default.addObserver(
-                forName: .AVCaptureSessionDidStartRunning,
+                forName: AVCaptureSession.didStartRunningNotification,
                 object: session,
                 queue: .main
             ) { [weak self] _ in
