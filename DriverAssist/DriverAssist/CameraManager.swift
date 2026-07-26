@@ -7,6 +7,7 @@
 
 import AVFoundation
 import CoreVideo
+import os
 import Photos
 import SwiftUI
 import UIKit
@@ -105,8 +106,8 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var isProbingLowLight = false
     private nonisolated(unsafe) var probeStartedAt: CFAbsoluteTime = 0
     private nonisolated(unsafe) var lastProbeTime: CFAbsoluteTime = 0
-    private static let probeInterval: CFAbsoluteTime = 2
-    private static let probeSettleDuration: CFAbsoluteTime = 0.3
+    private nonisolated static let probeInterval: CFAbsoluteTime = 2
+    private nonisolated static let probeSettleDuration: CFAbsoluteTime = 0.3
 
     /// 0-255 brightness thresholds (see `sampleAutoLowLightIfDue`). The gap between
     /// them is hysteresis to avoid flicker at the boundary. Starting points — may
@@ -121,8 +122,7 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private nonisolated(unsafe) var currentSegmentURL: URL?
     private nonisolated(unsafe) var observersRegistered = false
-    private let backgroundTaskLock = NSLock()
-    private nonisolated(unsafe) var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private let backgroundTaskState = OSAllocatedUnfairLock<UIBackgroundTaskIdentifier>(initialState: .invalid)
 
     /// Below this, the HUD warns so the user can free up space before recording
     /// actually starts failing, instead of only finding out after the fact.
@@ -397,41 +397,40 @@ final class CameraManager: NSObject, ObservableObject {
     /// before the app is suspended, then immediately starts a fresh segment so
     /// recording resumes seamlessly if/when the app returns to the foreground.
     private nonisolated func beginBackgroundFlush() {
-        backgroundTaskLock.lock()
-        guard backgroundTaskID == .invalid else {
-            backgroundTaskLock.unlock()
-            return // a flush is already in flight
-        }
-        backgroundTaskLock.unlock()
+        let alreadyFlushing = backgroundTaskState.withLock { $0 != .invalid }
+        guard !alreadyFlushing else { return }
 
-        let taskID = UIApplication.shared.beginBackgroundTask(withName: "DriverAssist.flushRecording") { [weak self] in
-            // Expiration handler: out of extra time. End the task so the OS doesn't
-            // kill the whole process for overrunning it — the fragmented file on
-            // disk is still valid either way and will be picked up by
-            // recoverOrphanedRecordings on next launch.
-            self?.endBackgroundTaskIfNeeded()
-        }
-        guard taskID != .invalid else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let taskID = UIApplication.shared.beginBackgroundTask(withName: "DriverAssist.flushRecording") { [weak self] in
+                // Expiration handler: out of extra time. End the task so the OS doesn't
+                // kill the whole process for overrunning it — the fragmented file on
+                // disk is still valid either way and will be picked up by
+                // recoverOrphanedRecordings on next launch.
+                self?.endBackgroundTaskIfNeeded()
+            }
+            guard taskID != .invalid else { return }
 
-        backgroundTaskLock.lock()
-        backgroundTaskID = taskID
-        backgroundTaskLock.unlock()
+            backgroundTaskState.withLock { $0 = taskID }
 
-        sessionQueue.async { [weak self] in
-            self?.finishRecording()
-            self?.startNewRecording()
-            self?.endBackgroundTaskIfNeeded()
+            sessionQueue.async { [weak self] in
+                self?.finishRecording()
+                self?.startNewRecording()
+                self?.endBackgroundTaskIfNeeded()
+            }
         }
     }
 
     private nonisolated func endBackgroundTaskIfNeeded() {
-        backgroundTaskLock.lock()
-        let taskID = backgroundTaskID
-        backgroundTaskID = .invalid
-        backgroundTaskLock.unlock()
+        let taskID = backgroundTaskState.withLock { id -> UIBackgroundTaskIdentifier in
+            defer { id = .invalid }
+            return id
+        }
 
         guard taskID != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(taskID)
+        DispatchQueue.main.async {
+            UIApplication.shared.endBackgroundTask(taskID)
+        }
     }
 
     /// Sweeps any `recording-*.mov` left behind by a previous run (e.g. the process
