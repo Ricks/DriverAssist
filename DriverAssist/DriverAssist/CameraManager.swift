@@ -81,7 +81,7 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
     private nonisolated(unsafe) var _currentModelLabel: String = ""
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
-    private nonisolated(unsafe) var _currentSmoothingEnabled: Bool = true
+    private nonisolated(unsafe) var _currentSmoothingEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
@@ -120,18 +120,9 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var assetWriterInput: AVAssetWriterInput?
     private nonisolated(unsafe) var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private nonisolated(unsafe) var currentSegmentURL: URL?
-    private nonisolated(unsafe) var segmentStartedAt: Date?
     private nonisolated(unsafe) var observersRegistered = false
     private let backgroundTaskLock = NSLock()
     private nonisolated(unsafe) var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
-
-    /// Segments are rotated out to the Photos library at this interval so a long
-    /// session's footage is durably saved well before the app might get killed,
-    /// rather than living only as one giant file in the app's own sandbox. Kept
-    /// short (rather than, say, 10+ minutes) specifically to shrink the one gap that
-    /// can't be closed outright: if the app is deleted or the device wiped before its
-    /// next launch, whatever segment hasn't yet rotated out is lost for good.
-    private let segmentDuration: TimeInterval = 120
 
     /// Below this, the HUD warns so the user can free up space before recording
     /// actually starts failing, instead of only finding out after the fact.
@@ -481,9 +472,11 @@ final class CameraManager: NSObject, ObservableObject {
         connection.videoRotationAngle = angle
     }
 
-    /// Creates the asset writer for a new recording segment. The writer's video
-    /// input/adaptor are added lazily once the first frame arrives, since only then
-    /// do we know the actual (post-rotation) pixel buffer dimensions.
+    /// Creates the asset writer for a new recording. The writer's video input/adaptor
+    /// are added lazily once the first frame arrives, since only then do we know the
+    /// actual (post-rotation) pixel buffer dimensions. One writer covers the whole
+    /// session — from launch until the app backgrounds, stops, or a write fails —
+    /// rather than splitting into periodic segments.
     ///
     /// If creation fails (e.g. transient low storage), the failure is not silent:
     /// it's logged and a retry is scheduled, rather than leaving this run's
@@ -502,14 +495,13 @@ final class CameraManager: NSObject, ObservableObject {
 
         do {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-            // Segments are capped at `segmentDuration` and rotated out to Photos, so
-            // this fragment interval only needs to protect against the process being
-            // killed mid-segment (fragmented .mov files stay playable without a
-            // clean finishWriting()).
+            // Protects against the process being killed mid-recording — fragmented
+            // .mov files stay structurally valid and playable without ever calling
+            // finishWriting(), which is what lets `recoverOrphanedRecordings` import
+            // them on the next launch.
             writer.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
             assetWriter = writer
             currentSegmentURL = url
-            segmentStartedAt = Date()
         } catch {
             print("[CameraManager] failed to create asset writer: \(error.localizedDescription)")
             setRecordingActive(false)
@@ -517,8 +509,9 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Checked once per segment (roughly every 2 minutes) rather than per-frame,
-    /// since it's just an early warning and doesn't need finer granularity.
+    /// Checked whenever a new recording starts (app launch, retry after failure, or
+    /// resuming after backgrounding) rather than per-frame, since it's just an early
+    /// warning and doesn't need finer granularity.
     private nonisolated func updateStorageStatus(documentsDirectory: URL) {
         let values = try? documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         let available = values?.volumeAvailableCapacityForImportantUsage
@@ -541,7 +534,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Tears down a segment that failed mid-write (e.g. the writer transitioned to
+    /// Tears down a recording that failed mid-write (e.g. the writer transitioned to
     /// `.failed`, commonly from disk space running out) and schedules a retry so the
     /// rest of the drive still gets recorded once/if the underlying issue clears.
     private nonisolated func failCurrentRecording() {
@@ -549,7 +542,6 @@ final class CameraManager: NSObject, ObservableObject {
         assetWriterInput = nil
         pixelBufferAdaptor = nil
         currentSegmentURL = nil
-        segmentStartedAt = nil
         setRecordingActive(false)
         scheduleRecordingRetry()
     }
@@ -560,51 +552,17 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Ends the current segment and starts a fresh one, keeping recording continuous
-    /// across the rotation (see `appendRecordingFrame`, which calls this then falls
-    /// straight through into setting up the new segment with the same frame).
-    private nonisolated func rotateSegment() {
-        finishCurrentSegmentAndSave()
-        startNewRecording()
-    }
-
-    /// Finishes the current segment without blocking `sessionQueue` (frames keep
-    /// arriving on this same queue during a routine rotation) and saves it to Photos
-    /// once finalized.
-    private nonisolated func finishCurrentSegmentAndSave() {
-        guard let writer = assetWriter, let input = assetWriterInput else {
-            assetWriter = nil
-            assetWriterInput = nil
-            pixelBufferAdaptor = nil
-            currentSegmentURL = nil
-            segmentStartedAt = nil
-            return
-        }
-        let url = currentSegmentURL
-        input.markAsFinished()
-        writer.finishWriting { [weak self] in
-            guard writer.status == .completed else {
-                print("[CameraManager] segment finish failed: \(writer.error?.localizedDescription ?? "unknown")")
-                return
-            }
-            if let url { self?.saveToPhotoLibrary(url) }
-        }
-        assetWriter = nil
-        assetWriterInput = nil
-        pixelBufferAdaptor = nil
-        currentSegmentURL = nil
-        segmentStartedAt = nil
-    }
-
-    /// Finishes the final segment on a clean stop, blocking until both the write and
-    /// the Photos save complete — safe here since no more frames are coming.
+    /// Finishes the current recording, blocking until both the write and the Photos
+    /// save complete. Used on a clean stop() and on backgrounding (see
+    /// `beginBackgroundFlush`, which calls this then immediately starts a fresh
+    /// recording so things continue seamlessly if the app returns to the foreground)
+    /// — safe to block here since no more frames are coming until then.
     private nonisolated func finishRecording() {
         guard let writer = assetWriter, let input = assetWriterInput else {
             assetWriter = nil
             assetWriterInput = nil
             pixelBufferAdaptor = nil
             currentSegmentURL = nil
-            segmentStartedAt = nil
             return
         }
         let url = currentSegmentURL
@@ -616,7 +574,6 @@ final class CameraManager: NSObject, ObservableObject {
         assetWriterInput = nil
         pixelBufferAdaptor = nil
         currentSegmentURL = nil
-        segmentStartedAt = nil
 
         guard writer.status == .completed, let url else { return }
         let saveSemaphore = DispatchSemaphore(value: 0)
@@ -652,10 +609,6 @@ final class CameraManager: NSObject, ObservableObject {
     /// Composites the current detections onto `pixelBuffer` and appends the result
     /// to the in-progress recording, so the saved file matches what's on screen.
     private nonisolated func appendRecordingFrame(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
-        if let segmentStartedAt, Date().timeIntervalSince(segmentStartedAt) >= segmentDuration {
-            rotateSegment()
-        }
-
         guard let writer = assetWriter else { return }
 
         // Most commonly caused by storage filling up mid-drive. Recover instead of
@@ -751,10 +704,10 @@ final class CameraManager: NSObject, ObservableObject {
         let width          = CVPixelBufferGetWidth(destination)
         // `source` and `destination` come from independent allocations (the live
         // camera frame vs. the writer's pixel buffer pool) and aren't guaranteed to
-        // match — a segment-rotation boundary in particular can hand this a freshly
-        // (re)created pool whose buffer differs slightly from the incoming frame.
-        // Clamping to the smaller of the two avoids reading past the end of
-        // whichever buffer is shorter, which previously crashed the whole session.
+        // match — e.g. right after backgrounding starts a fresh writer/pool, its
+        // buffer can differ slightly from the incoming frame. Clamping to the
+        // smaller of the two avoids reading past the end of whichever buffer is
+        // shorter, which previously crashed the whole session.
         let height         = min(CVPixelBufferGetHeight(source), CVPixelBufferGetHeight(destination))
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
         let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)

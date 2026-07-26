@@ -131,7 +131,7 @@ final class InferenceEngine: ObservableObject {
     /// to reproduce the preview's aspect-fill crop instead of naively stretching boxes
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
-    @Published private(set) var isSmoothingEnabled = true
+    @Published private(set) var isSmoothingEnabled = false
 
     private let modelManager: ModelManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
