@@ -36,3 +36,6 @@ runs/
 
 # YOLO label caches (regenerated automatically)
 *.cache
+
+# Recorded video clips (dev testing / dashcam output) — large binaries, not code
+*.mov

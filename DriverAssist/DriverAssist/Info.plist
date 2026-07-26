@@ -26,6 +26,8 @@
 	<string>DriverAssist uses the camera to detect vehicles, pedestrians, and cyclists in the live view.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>DriverAssist listens for voice commands ("small", "nano", "low light on", "low light off") to control detection hands-free.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>DriverAssist saves completed recording segments to your Photos library so they're never lost if the app is closed mid-drive.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>DriverAssist uses speech recognition to respond to voice commands hands-free while driving.</string>
 	<key>UIApplicationSceneManifest</key>

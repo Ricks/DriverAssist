@@ -66,11 +66,13 @@ enum OverlayRenderer {
     static func drawHUD(
         modelLabel: String,
         lowLightEnabled: Bool,
+        autoLowLightEnabled: Bool,
         smoothingEnabled: Bool,
         in context: CGContext,
         size: CGSize
     ) {
-        let lowLightText = "low-light: \(lowLightEnabled ? "on" : "off")"
+        let lowLightState = lowLightEnabled ? "on" : "off"
+        let lowLightText = autoLowLightEnabled ? "low-light: auto (\(lowLightState))" : "low-light: \(lowLightState)"
         let smoothingText = "smoothing: \(smoothingEnabled ? "on" : "off")"
         drawCornerLabel(modelLabel, in: context, size: size, corner: .bottomLeading)
         drawCornerLabel(lowLightText, in: context, size: size, corner: .bottomTrailing)

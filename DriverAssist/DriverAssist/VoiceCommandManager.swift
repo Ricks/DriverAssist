@@ -9,13 +9,14 @@ import AVFoundation
 import Speech
 
 /// Listens continuously for a fixed set of spoken commands ("small", "nano",
-/// "low light on", "low light off", "smoothing on", "smoothing off") and reports
-/// them via `onCommand`.
+/// "low light on", "low light off", "low light auto", "smoothing on",
+/// "smoothing off") and reports them via `onCommand`.
 @MainActor
 final class VoiceCommandManager: NSObject, ObservableObject {
     enum Command: Equatable {
         case selectModel(DetectorModel)
         case lowLight(Bool)
+        case lowLightAuto
         case smoothing(Bool)
     }
 
@@ -139,7 +140,9 @@ final class VoiceCommandManager: NSObject, ObservableObject {
     private func handle(transcript: String) {
         let lowered = transcript.lowercased()
         let command: Command?
-        if lowered.contains("low light on") {
+        if lowered.contains("low light auto") {
+            command = .lowLightAuto
+        } else if lowered.contains("low light on") {
             command = .lowLight(true)
         } else if lowered.contains("low light off") {
             command = .lowLight(false)

@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 // MARK: — Root view
 
@@ -27,6 +28,9 @@ struct InferenceView: View {
     @StateObject private var cameraManager = CameraManager()
     @StateObject private var voiceCommandManager = VoiceCommandManager()
 
+    @State private var batteryLevel: Float = UIDevice.current.batteryLevel
+    @State private var batteryState: UIDevice.BatteryState = UIDevice.current.batteryState
+
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         _inferenceEngine  = StateObject(wrappedValue: InferenceEngine(modelManager: modelManager))
@@ -42,6 +46,10 @@ struct InferenceView: View {
 
             VStack {
                 HStack {
+                    Text(recordingLabel)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(isRecordingHealthy ? .white.opacity(0.75) : Color.red)
+                        .shadow(color: .black.opacity(0.6), radius: 2)
                     Spacer()
                     Text(smoothingLabel)
                         .font(.system(size: 24, weight: .medium))
@@ -85,8 +93,20 @@ struct InferenceView: View {
         .onChange(of: inferenceEngine.isSmoothingEnabled) { _, newValue in
             cameraManager.currentSmoothingEnabled = newValue
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)) { _ in
+            batteryLevel = UIDevice.current.batteryLevel
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryStateDidChangeNotification)) { _ in
+            batteryState = UIDevice.current.batteryState
+        }
         .onAppear {
             DebugFileLogger.reset()
+            // Keeps the screen (and thus the camera/recording) awake for the whole
+            // drive instead of auto-locking after the idle timeout.
+            UIApplication.shared.isIdleTimerDisabled = true
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            batteryLevel = UIDevice.current.batteryLevel
+            batteryState = UIDevice.current.batteryState
             modelManager.loadInitialModel()
             cameraManager.currentModelLabel = modelLabel
             cameraManager.currentSmoothingEnabled = inferenceEngine.isSmoothingEnabled
@@ -100,6 +120,8 @@ struct InferenceView: View {
                     modelManager?.switchModel(to: model)
                 case .lowLight(let enabled):
                     cameraManager?.setLowLightBoost(enabled)
+                case .lowLightAuto:
+                    cameraManager?.enableAutoLowLight()
                 case .smoothing(let enabled):
                     inferenceEngine?.setSmoothingEnabled(enabled)
                 }
@@ -107,6 +129,8 @@ struct InferenceView: View {
             voiceCommandManager.start()
         }
         .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+            UIDevice.current.isBatteryMonitoringEnabled = false
             cameraManager.stop()
             voiceCommandManager.stop()
         }
@@ -122,11 +146,34 @@ struct InferenceView: View {
     }
 
     private var lowLightLabel: String {
-        "low-light: \(cameraManager.isLowLightBoostEnabled ? "on" : "off")"
+        let state = cameraManager.isLowLightBoostEnabled ? "on" : "off"
+        return cameraManager.isAutoLowLightEnabled ? "low-light: auto (\(state))" : "low-light: \(state)"
     }
 
     private var smoothingLabel: String {
         "smoothing: \(inferenceEngine.isSmoothingEnabled ? "on" : "off")"
+    }
+
+    /// True only when unplugged and below 20% — plugged-in low battery isn't a risk
+    /// to warn about, and -1 (monitoring not yet started) shouldn't read as low.
+    private var isBatteryLow: Bool {
+        batteryState == .unplugged && batteryLevel >= 0 && batteryLevel < 0.2
+    }
+
+    private var recordingLabel: String {
+        if !cameraManager.isRecording {
+            return "⚠ NOT RECORDING"
+        } else if cameraManager.isStorageLow {
+            return "⚠ LOW STORAGE"
+        } else if isBatteryLow {
+            return "⚠ LOW BATTERY"
+        } else {
+            return "● REC"
+        }
+    }
+
+    private var isRecordingHealthy: Bool {
+        cameraManager.isRecording && !cameraManager.isStorageLow && !isBatteryLow
     }
 
     private func cycleModel() {
