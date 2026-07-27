@@ -117,6 +117,7 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
     private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
+    private nonisolated(unsafe) var focusSettleObservation: NSKeyValueObservation?
 
     /// The exposure bias (in EV) the boost is currently applying, so it can be
     /// restored after a probe. Written and read only on `sessionQueue` — no lock
@@ -270,17 +271,22 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// The road ahead is always far away, so autofocus hunting near objects (the
-    /// dashboard, a windshield reflection) is pure downside here. This restricts
-    /// the *range* autofocus is allowed to search, while leaving continuous
-    /// autofocus running — a hard focus lock (`setFocusModeLocked`) was tried
-    /// here previously, but a locked lens position isn't guaranteed to land at
-    /// true infinity focus (a lens's mechanical far stop and true infinity focus
-    /// aren't always the same point), which is what produced permanently blurry
-    /// recordings.
+    /// dashboard, a windshield reflection) is pure downside here. Restricting the
+    /// *range* autofocus searches to `.far` (while leaving continuous autofocus
+    /// running) stops it hunting near, but confirmed on-device it still visibly
+    /// hunts *within* the far range — refocusing between, say, a car 15m ahead and
+    /// a building 200m ahead — which reads as "going in and out of focus" over a
+    /// real drive. So: let it run just long enough to settle on a genuinely sharp
+    /// far-field position, then lock there. A blind `lensPosition` guess isn't
+    /// guaranteed to land at true infinity focus (a lens's mechanical far stop and
+    /// true infinity focus aren't always the same point) — that's what produced
+    /// permanently blurry recordings before — but the position autofocus itself
+    /// converges on has actually been verified sharp.
     private nonisolated func restrictFocusToFarRange(for device: AVCaptureDevice) {
         guard
             device.isFocusModeSupported(.continuousAutoFocus),
-            device.isAutoFocusRangeRestrictionSupported
+            device.isAutoFocusRangeRestrictionSupported,
+            device.isFocusModeSupported(.locked)
         else { return }
         do {
             try device.lockForConfiguration()
@@ -288,7 +294,23 @@ final class CameraManager: NSObject, ObservableObject {
             device.autoFocusRangeRestriction = .far
             device.focusMode = .continuousAutoFocus
         } catch {
-            // Device may be mid-reconfiguration; focus stays on its previous mode.
+            return
+        }
+
+        focusSettleObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] device, change in
+            guard change.newValue == false else { return }
+            self?.focusSettleObservation = nil
+            self?.lockFocus(at: device)
+        }
+    }
+
+    private nonisolated func lockFocus(at device: AVCaptureDevice) {
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.setFocusModeLocked(lensPosition: device.lensPosition, completionHandler: nil)
+        } catch {
+            // Device may be mid-reconfiguration; focus stays continuous (still far-restricted).
         }
     }
 
