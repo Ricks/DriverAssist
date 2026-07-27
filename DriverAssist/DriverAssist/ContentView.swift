@@ -46,15 +46,27 @@ struct InferenceView: View {
 
             VStack {
                 HStack {
-                    Text(recordingLabel)
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundStyle(isRecordingHealthy ? .white.opacity(0.75) : Color.red)
-                        .shadow(color: .black.opacity(0.6), radius: 2)
+                    VStack(alignment: .leading) {
+                        Text(recordingLabel)
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundStyle(isRecordingHealthy ? .white.opacity(0.75) : Color.red)
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                        Text(twoPassLabel)
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                    }
                     Spacer()
-                    Text(smoothingLabel)
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.75))
-                        .shadow(color: .black.opacity(0.6), radius: 2)
+                    VStack(alignment: .trailing) {
+                        Text(smoothingLabel)
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                        Text(stabilizationLabel)
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                    }
                 }
                 Spacer()
                 HStack {
@@ -78,7 +90,9 @@ struct InferenceView: View {
             DragGesture(minimumDistance: 24)
                 .onEnded { value in
                     if abs(value.translation.width) > abs(value.translation.height) {
-                        cycleModel()
+                        // Left swipe (finger moves right-to-left) advances toward medium;
+                        // right swipe backs toward nano. Neither wraps around.
+                        cycleModel(forward: value.translation.width < 0)
                     } else {
                         cameraManager.toggleLowLightBoost()
                     }
@@ -92,6 +106,9 @@ struct InferenceView: View {
         }
         .onChange(of: inferenceEngine.isSmoothingEnabled) { _, newValue in
             cameraManager.currentSmoothingEnabled = newValue
+        }
+        .onChange(of: inferenceEngine.isTwoPassEnabled) { _, newValue in
+            cameraManager.currentTwoPassEnabled = newValue
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)) { _ in
             batteryLevel = UIDevice.current.batteryLevel
@@ -110,6 +127,7 @@ struct InferenceView: View {
             modelManager.loadInitialModel()
             cameraManager.currentModelLabel = modelLabel
             cameraManager.currentSmoothingEnabled = inferenceEngine.isSmoothingEnabled
+            cameraManager.currentTwoPassEnabled = inferenceEngine.isTwoPassEnabled
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
                 inferenceEngine?.process(pixelBuffer: pixelBuffer)
             }
@@ -124,6 +142,10 @@ struct InferenceView: View {
                     cameraManager?.enableAutoLowLight()
                 case .smoothing(let enabled):
                     inferenceEngine?.setSmoothingEnabled(enabled)
+                case .twoPass(let enabled):
+                    inferenceEngine?.setTwoPassEnabled(enabled)
+                case .stabilization(let enabled):
+                    cameraManager?.setStabilizationEnabled(enabled)
                 }
             }
             voiceCommandManager.start()
@@ -140,8 +162,9 @@ struct InferenceView: View {
 
     private var modelLabel: String {
         switch modelManager.selectedModel {
-        case .small: return "small"
-        case .nano:  return "nano"
+        case .small:  return "small"
+        case .nano:   return "nano"
+        case .medium: return "medium"
         }
     }
 
@@ -152,6 +175,14 @@ struct InferenceView: View {
 
     private var smoothingLabel: String {
         "smoothing: \(inferenceEngine.isSmoothingEnabled ? "on" : "off")"
+    }
+
+    private var twoPassLabel: String {
+        "two-pass: \(inferenceEngine.isTwoPassEnabled ? "on" : "off")"
+    }
+
+    private var stabilizationLabel: String {
+        "stabilization: \(cameraManager.isStabilizationEnabled ? "on" : "off")"
     }
 
     /// True only when unplugged and below 20% — plugged-in low battery isn't a risk
@@ -176,11 +207,13 @@ struct InferenceView: View {
         cameraManager.isRecording && !cameraManager.isStorageLow && !isBatteryLow
     }
 
-    private func cycleModel() {
+    /// Steps one position toward medium (`forward`) or toward nano, clamping at
+    /// whichever end it reaches rather than wrapping around.
+    private func cycleModel(forward: Bool) {
         let models = DetectorModel.allCases
         guard let index = models.firstIndex(of: modelManager.selectedModel) else { return }
-        let next = models[(index + 1) % models.count]
-        modelManager.switchModel(to: next)
+        let nextIndex = forward ? min(index + 1, models.count - 1) : max(index - 1, 0)
+        modelManager.switchModel(to: models[nextIndex])
     }
 }
 

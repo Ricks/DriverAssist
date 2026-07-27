@@ -41,6 +41,11 @@ final class CameraManager: NSObject, ObservableObject {
     /// rather than only reporting it after the fact.
     @Published private(set) var isStorageLow = false
 
+    /// Whether `.standard` video stabilization is applied to the capture connection.
+    /// Published for the HUD text; toggling also updates `currentStabilizationEnabled`
+    /// below for the recording bake.
+    @Published private(set) var isStabilizationEnabled = false
+
     /// Latest detections to bake into recorded frames. Written from the main actor
     /// (as inference results arrive) and read from `sessionQueue` (as frames are
     /// appended to the recording), so access is guarded by `overlayLock`.
@@ -78,12 +83,30 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentAutoLowLightEnabled = newValue; overlayLock.unlock() }
     }
 
+    /// Current two-pass-detection state ("two-pass on/off") to bake into recorded
+    /// frames, mirroring `InferenceEngine.isTwoPassEnabled` (owned there, synced in
+    /// from the main actor).
+    nonisolated var currentTwoPassEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentTwoPassEnabled }
+        set { overlayLock.lock(); _currentTwoPassEnabled = newValue; overlayLock.unlock() }
+    }
+
+    /// Nonisolated mirror of `isStabilizationEnabled`, readable from `sessionQueue`
+    /// while baking the recording overlay (and while applying the mode to the
+    /// capture connection in `configure()`/`applyStabilizationMode`).
+    nonisolated var currentStabilizationEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentStabilizationEnabled }
+        set { overlayLock.lock(); _currentStabilizationEnabled = newValue; overlayLock.unlock() }
+    }
+
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
     private nonisolated(unsafe) var _currentModelLabel: String = ""
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
     private nonisolated(unsafe) var _currentSmoothingEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
+    private nonisolated(unsafe) var _currentTwoPassEnabled: Bool = true
+    private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -128,6 +151,30 @@ final class CameraManager: NSObject, ObservableObject {
     /// actually starts failing, instead of only finding out after the fact.
     private let lowStorageThresholdBytes: Int64 = 1_000_000_000
 
+    private static let lowLightBoostDefaultsKey = "settings.lowLightBoostEnabled"
+    private static let stabilizationDefaultsKey = "settings.stabilizationEnabled"
+
+    override init() {
+        super.init()
+        let defaults = UserDefaults.standard
+        // isAutoLowLightEnabled is deliberately NOT persisted — every launch starts
+        // back in auto regardless of whatever manual override was last in effect, so
+        // a prior drive's "low light off" doesn't silently carry over and suppress
+        // auto-detection on a new one.
+        if defaults.object(forKey: Self.lowLightBoostDefaultsKey) != nil {
+            isLowLightBoostEnabled = defaults.bool(forKey: Self.lowLightBoostDefaultsKey)
+        }
+        if defaults.object(forKey: Self.stabilizationDefaultsKey) != nil {
+            isStabilizationEnabled = defaults.bool(forKey: Self.stabilizationDefaultsKey)
+        }
+        // Keep the nonisolated mirrors in sync with what was just loaded — `configure()`
+        // applies the boost/stabilization to the actual capture device from these once
+        // it's available.
+        currentAutoLowLightEnabled = isAutoLowLightEnabled
+        currentLowLightEnabled = isLowLightBoostEnabled
+        currentStabilizationEnabled = isStabilizationEnabled
+    }
+
     func start() {
         // Requested up front (rather than lazily on the first segment save) so the
         // permission dialog doesn't interrupt an in-progress drive.
@@ -171,6 +218,7 @@ final class CameraManager: NSObject, ObservableObject {
         isAutoLowLightEnabled = false
         currentAutoLowLightEnabled = false
         applyLowLightState(enabled)
+        UserDefaults.standard.set(enabled, forKey: Self.lowLightBoostDefaultsKey)
     }
 
     /// Hands control back to the auto-detector (voice: "low light auto"). The next
@@ -178,6 +226,24 @@ final class CameraManager: NSObject, ObservableObject {
     func enableAutoLowLight() {
         isAutoLowLightEnabled = true
         currentAutoLowLightEnabled = true
+    }
+
+    /// Sets `.standard` video stabilization on/off (voice: "stabilization on"/"off").
+    /// `.standard` rather than `.cinematic`/`.cinematicExtended` deliberately — those
+    /// crop in further and add multi-frame look-ahead latency, both undesirable here.
+    func setStabilizationEnabled(_ enabled: Bool) {
+        isStabilizationEnabled = enabled
+        currentStabilizationEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.stabilizationDefaultsKey)
+        sessionQueue.async { [weak self] in self?.applyStabilizationMode(enabled: enabled) }
+    }
+
+    private nonisolated func applyStabilizationMode(enabled: Bool) {
+        guard
+            let connection = videoOutput.connection(with: .video),
+            connection.isVideoStabilizationSupported
+        else { return }
+        connection.preferredVideoStabilizationMode = enabled ? .standard : .off
     }
 
     private func applyLowLightState(_ enabled: Bool) {
@@ -345,6 +411,13 @@ final class CameraManager: NSObject, ObservableObject {
         captureDevice = device
         restrictFocusToFarRange(for: device)
 
+        // Apply a persisted (non-auto) low-light boost to the newly configured
+        // device — loaded into the published/mirrored state in init(), before a
+        // device existed to apply it to.
+        if !currentAutoLowLightEnabled, currentLowLightEnabled {
+            applyExposureBias(enabled: true)
+        }
+
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
@@ -354,6 +427,10 @@ final class CameraManager: NSObject, ObservableObject {
         if session.canAddOutput(videoOutput) {
             session.addOutput(videoOutput)
         }
+
+        // The connection this applies to only exists once the output is attached to
+        // the session above.
+        applyStabilizationMode(enabled: currentStabilizationEnabled)
 
         configureRotationCoordinator(for: device)
 
@@ -536,15 +613,12 @@ final class CameraManager: NSObject, ObservableObject {
                 completion(nil)
                 return
             }
-            export.outputURL = finalizedURL
-            export.outputFileType = .mov
-            export.exportAsynchronously {
-                guard export.status == .completed else {
-                    print("[CameraManager] failed to finalize orphaned recording \(url.lastPathComponent): \(export.error?.localizedDescription ?? "unknown")")
-                    completion(nil)
-                    return
-                }
+            do {
+                try await export.export(to: finalizedURL, as: .mov)
                 completion(finalizedURL)
+            } catch {
+                print("[CameraManager] failed to finalize orphaned recording \(url.lastPathComponent): \(error.localizedDescription)")
+                completion(nil)
             }
         }
     }
@@ -782,7 +856,9 @@ final class CameraManager: NSObject, ObservableObject {
             modelLabel: currentModelLabel,
             lowLightEnabled: currentLowLightEnabled,
             autoLowLightEnabled: currentAutoLowLightEnabled,
-            smoothingEnabled: currentSmoothingEnabled
+            smoothingEnabled: currentSmoothingEnabled,
+            twoPassEnabled: currentTwoPassEnabled,
+            stabilizationEnabled: currentStabilizationEnabled
         )
         adaptor.append(outputBuffer, withPresentationTime: presentationTime)
     }
@@ -794,7 +870,9 @@ final class CameraManager: NSObject, ObservableObject {
         modelLabel: String,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
-        smoothingEnabled: Bool
+        smoothingEnabled: Bool,
+        twoPassEnabled: Bool,
+        stabilizationEnabled: Bool
     ) {
         CVPixelBufferLockBaseAddress(source, .readOnly)
         CVPixelBufferLockBaseAddress(destination, [])
@@ -857,6 +935,8 @@ final class CameraManager: NSObject, ObservableObject {
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
             smoothingEnabled: smoothingEnabled,
+            twoPassEnabled: twoPassEnabled,
+            stabilizationEnabled: stabilizationEnabled,
             in: context,
             size: size
         )

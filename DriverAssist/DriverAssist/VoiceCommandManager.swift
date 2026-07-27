@@ -9,9 +9,10 @@ import AVFoundation
 import Speech
 import UIKit
 
-/// Listens continuously for a fixed set of spoken commands ("small", "nano",
+/// Listens continuously for a fixed set of spoken commands ("small", "nano", "medium",
 /// "low light on", "low light off", "low light auto", "smoothing on",
-/// "smoothing off") and reports them via `onCommand`.
+/// "smoothing off", "two pass on", "two pass off", "stabilization on",
+/// "stabilization off") and reports them via `onCommand`.
 @MainActor
 final class VoiceCommandManager: NSObject, ObservableObject {
     enum Command: Equatable {
@@ -19,6 +20,8 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         case lowLight(Bool)
         case lowLightAuto
         case smoothing(Bool)
+        case twoPass(Bool)
+        case stabilization(Bool)
     }
 
     var onCommand: ((Command) -> Void)?
@@ -217,8 +220,21 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             command = .smoothing(true)
         } else if lowered.contains("smoothing off") {
             command = .smoothing(false)
+        // "two" reliably transcribes as "to"/"too" here (confirmed on-device: saying
+        // "two-pass on" settles as "to pass on", never "two pass on") — accept all
+        // three homophones for both directions.
+        } else if isTwoPassCommand(lowered, state: "on") {
+            command = .twoPass(true)
+        } else if isTwoPassCommand(lowered, state: "off") {
+            command = .twoPass(false)
+        } else if lowered.contains("stabilization on") {
+            command = .stabilization(true)
+        } else if lowered.contains("stabilization off") {
+            command = .stabilization(false)
         } else if lowered.contains("nano") {
             command = .selectModel(.nano)
+        } else if lowered.contains("medium") {
+            command = .selectModel(.medium)
         } else if lowered.contains("small") {
             command = .selectModel(.small)
         } else {
@@ -230,5 +246,9 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         startRecognitionTask()
+    }
+
+    private func isTwoPassCommand(_ lowered: String, state: String) -> Bool {
+        ["two", "to", "too"].contains { lowered.contains("\($0) pass \(state)") }
     }
 }

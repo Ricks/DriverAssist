@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1E86CD43C56742E08A0AB38B /* yolo26m.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 9FEF06E7382E46159EC9B04E /* yolo26m.mlpackage */; };
 		A9EC1A393010098E0037CCF6 /* yolo26n.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */; };
 		A9EC1A3B3010099C0037CCF6 /* yolo26s.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */; };
 /* End PBXBuildFile section */
@@ -29,6 +30,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		9FEF06E7382E46159EC9B04E /* yolo26m.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26m.mlpackage; sourceTree = "<group>"; };
 		A9EC19C8300EC6900037CCF6 /* DriverAssist.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DriverAssist.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A9EC19D8300EC6910037CCF6 /* DriverAssistTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DriverAssistTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A9EC19E2300EC6910037CCF6 /* DriverAssistUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DriverAssistUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -101,6 +103,7 @@
 				A9EC19C9300EC6900037CCF6 /* Products */,
 				A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */,
 				A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */,
+				9FEF06E7382E46159EC9B04E /* yolo26m.mlpackage */,
 			);
 			sourceTree = "<group>";
 		};
@@ -236,6 +239,7 @@
 			files = (
 				A9EC1A3B3010099C0037CCF6 /* yolo26s.mlpackage in Resources */,
 				A9EC1A393010098E0037CCF6 /* yolo26n.mlpackage in Resources */,
+				1E86CD43C56742E08A0AB38B /* yolo26m.mlpackage in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -1,9 +1,13 @@
 import Foundation
 import CoreML
 
+// Declaration order is the swipe-cycle order (nano → small → medium) — see
+// `ContentView.cycleModel(forward:)`, which clamps at either end rather than
+// wrapping around.
 enum DetectorModel: String, CaseIterable, Codable {
-    case small = "yolo26s"
-    case nano  = "yolo26n"
+    case nano   = "yolo26n"
+    case small  = "yolo26s"
+    case medium = "yolo26m"
 }
 
 @MainActor
@@ -19,13 +23,20 @@ final class ModelManager: ObservableObject {
 
     var model: MLModel? { models[selectedModel] }
 
+    private static let selectedModelDefaultsKey = "settings.selectedModel"
+
     init(defaultModel: DetectorModel = .small) {
         let config = MLModelConfiguration()
         // .all routes through the GPU/MPSGraph backend, which crashes compiling this
         // model ("MLIR pass manager failed"). CPU + Neural Engine works.
         config.computeUnits = .cpuAndNeuralEngine
         self.configuration = config
-        self.selectedModel = defaultModel
+        if let raw = UserDefaults.standard.string(forKey: Self.selectedModelDefaultsKey),
+           let persisted = DetectorModel(rawValue: raw) {
+            self.selectedModel = persisted
+        } else {
+            self.selectedModel = defaultModel
+        }
     }
 
     func loadInitialModel() {
@@ -40,6 +51,7 @@ final class ModelManager: ObservableObject {
         selectedModel = newModel
         isLoaded = models[newModel] != nil
         lastError = nil
+        UserDefaults.standard.set(newModel.rawValue, forKey: Self.selectedModelDefaultsKey)
     }
 
     private func startLoading(_ newModel: DetectorModel) {

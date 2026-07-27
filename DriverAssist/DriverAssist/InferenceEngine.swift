@@ -43,23 +43,46 @@ struct YOLODecoder: Sendable {
         7: "truck"
     ]
 
-    private let modelInputSize: Float = 640
     private let confidenceThreshold: Float = 0.25
 
-    func run(model: MLModel, pixelBuffer: CVPixelBuffer) throws -> [Detection] {
+    /// Centered region (top-left-origin normalized, matching `Detection.boundingBox`'s
+    /// convention) used for the second "zoom" pass in two-pass mode — a 2x digital
+    /// zoom on the road ahead. Cropped symmetrically so it keeps the source's 16:9
+    /// aspect ratio and doesn't reintroduce distortion when scaled to the model input.
+    private let zoomRegion = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+
+    /// Runs the model once on the full frame and, when `twoPass` is on, a second time
+    /// on a cropped/zoomed center region — a distant object occupies far more of the
+    /// model's fixed input pixels in the zoomed pass, which is what actually extends
+    /// detection range, at roughly double the compute cost per frame. Results from
+    /// both passes are merged and de-duplicated by NMS.
+    func run(model: MLModel, pixelBuffer: CVPixelBuffer, twoPass: Bool) throws -> [Detection] {
         guard let constraint = model.modelDescription.inputDescriptionsByName["image"]?.imageConstraint else {
             throw InferenceError.missingOutput("no image input constraint on model")
         }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            throw InferenceError.missingOutput("failed to create CGImage from pixel buffer")
+
+        let fullImage = CIImage(cvPixelBuffer: pixelBuffer)
+        var detections = try runSinglePass(fullImage, model: model, constraint: constraint)
+
+        if twoPass {
+            let croppedImage = fullImage.cropped(to: ciCropRect(for: zoomRegion, in: fullImage.extent))
+            let zoomedDetections = try runSinglePass(croppedImage, model: model, constraint: constraint)
+            detections.append(contentsOf: remap(zoomedDetections, into: zoomRegion))
         }
 
-        // The camera delivers full-resolution (4K where supported) frames but the model
-        // requires an exact 640x640 match (MLFeatureValue(pixelBuffer:) alone doesn't
-        // resize) — scale to fit here. Capturing at the highest resolution available
-        // means more real detail survives this downscale, which is what actually helps
-        // detect small/distant objects — the model's input size is fixed regardless.
+        return DetectionFilter.nonMaxSuppression(detections)
+    }
+
+    // The camera delivers full-resolution (4K where supported), 16:9 frames. The
+    // model's input is exported at a matching 1152x640 (also 16:9, not square), so
+    // .scaleFill no longer distorts proportions the way it would squashing 16:9 into
+    // a square — it now just scales both axes by very nearly the same factor.
+    // Capturing at the highest resolution available means more real detail survives
+    // this downscale, which is what actually helps detect small/distant objects.
+    private func runSinglePass(_ image: CIImage, model: MLModel, constraint: MLImageConstraint) throws -> [Detection] {
+        guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+            throw InferenceError.missingOutput("failed to create CGImage from pixel buffer")
+        }
         let imageFeature = try MLFeatureValue(
             cgImage: cgImage,
             constraint: constraint,
@@ -67,10 +90,47 @@ struct YOLODecoder: Sendable {
         )
         let input = try MLDictionaryFeatureProvider(dictionary: ["image": imageFeature])
         let output = try model.prediction(from: input)
-        return try decodeDetections(from: output)
+        return try decodeDetections(
+            from: output,
+            modelWidth: Float(constraint.pixelsWide),
+            modelHeight: Float(constraint.pixelsHigh)
+        )
     }
 
-    func decodeDetections(from output: MLFeatureProvider) throws -> [Detection] {
+    /// Converts a top-left-origin normalized region into Core Image's own bottom-left-
+    /// origin pixel space (`CIImage.extent` has y increasing upward, the opposite of
+    /// `Detection.boundingBox`'s convention) so it can be passed to `CIImage.cropped(to:)`.
+    func ciCropRect(for region: CGRect, in extent: CGRect) -> CGRect {
+        let yFromBottomFraction = 1 - (region.minY + region.height)
+        return CGRect(
+            x: extent.minX + region.minX * extent.width,
+            y: extent.minY + yFromBottomFraction * extent.height,
+            width: region.width * extent.width,
+            height: region.height * extent.height
+        )
+    }
+
+    /// Detections from the cropped "zoom" pass are normalized to the crop's own
+    /// frame; remap into full-frame-normalized coordinates via the same (top-left-
+    /// origin normalized) region used to create the crop — no axis flip needed here,
+    /// unlike `ciCropRect`, since both sides are already in that convention.
+    func remap(_ detections: [Detection], into region: CGRect) -> [Detection] {
+        detections.map { detection in
+            let box = detection.boundingBox
+            return Detection(
+                label: detection.label,
+                confidence: detection.confidence,
+                boundingBox: CGRect(
+                    x: region.minX + box.minX * region.width,
+                    y: region.minY + box.minY * region.height,
+                    width: box.width * region.width,
+                    height: box.height * region.height
+                )
+            )
+        }
+    }
+
+    func decodeDetections(from output: MLFeatureProvider, modelWidth: Float, modelHeight: Float) throws -> [Detection] {
         guard let array = output.featureNames.lazy
             .compactMap({ output.featureValue(for: $0)?.multiArrayValue })
             .first
@@ -93,10 +153,14 @@ struct YOLODecoder: Sendable {
             let cls = Int(value(in: array, at: [0, i, 5]).rounded())
             guard let label = cocoTargets[cls] else { continue }
 
-            let x1 = value(in: array, at: [0, i, 0]) / modelInputSize
-            let y1 = value(in: array, at: [0, i, 1]) / modelInputSize
-            let x2 = value(in: array, at: [0, i, 2]) / modelInputSize
-            let y2 = value(in: array, at: [0, i, 3]) / modelInputSize
+            // x/y are denormalized against the model's own (possibly non-square) input
+            // dimensions independently — using a single shared divisor here would
+            // silently reintroduce the aspect-ratio distortion the rectangular export
+            // was meant to eliminate.
+            let x1 = value(in: array, at: [0, i, 0]) / modelWidth
+            let y1 = value(in: array, at: [0, i, 1]) / modelHeight
+            let x2 = value(in: array, at: [0, i, 2]) / modelWidth
+            let y2 = value(in: array, at: [0, i, 3]) / modelHeight
 
             let box = CGRect(
                 x: CGFloat(x1),
@@ -135,6 +199,7 @@ final class InferenceEngine: ObservableObject {
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
     @Published private(set) var isSmoothingEnabled = false
+    @Published private(set) var isTwoPassEnabled = true
 
     private let modelManager: ModelManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
@@ -143,8 +208,18 @@ final class InferenceEngine: ObservableObject {
     private var isBusy = false
     private var frameCount = 0
 
+    private static let smoothingDefaultsKey = "settings.smoothingEnabled"
+    private static let twoPassDefaultsKey = "settings.twoPassEnabled"
+
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Self.smoothingDefaultsKey) != nil {
+            isSmoothingEnabled = defaults.bool(forKey: Self.smoothingDefaultsKey)
+        }
+        if defaults.object(forKey: Self.twoPassDefaultsKey) != nil {
+            isTwoPassEnabled = defaults.bool(forKey: Self.twoPassDefaultsKey)
+        }
     }
 
     /// Resets tracking state on change so a stale pre-toggle position can't get
@@ -153,6 +228,12 @@ final class InferenceEngine: ObservableObject {
         guard enabled != isSmoothingEnabled else { return }
         isSmoothingEnabled = enabled
         smoother.reset()
+        UserDefaults.standard.set(enabled, forKey: Self.smoothingDefaultsKey)
+    }
+
+    func setTwoPassEnabled(_ enabled: Bool) {
+        isTwoPassEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.twoPassDefaultsKey)
     }
 
     func process(pixelBuffer: CVPixelBuffer) {
@@ -170,12 +251,14 @@ final class InferenceEngine: ObservableObject {
         let pixelBufferBox = UncheckedSendableBox(value: pixelBuffer)
         let modelBox = UncheckedSendableBox(value: model)
         let decoder = self.decoder
+        let twoPass = isTwoPassEnabled
 
         queue.async { [weak self] in
             do {
                 let detections = try decoder.run(
                     model: modelBox.value,
-                    pixelBuffer: pixelBufferBox.value
+                    pixelBuffer: pixelBufferBox.value,
+                    twoPass: twoPass
                 )
 
                 Task { @MainActor [weak self] in

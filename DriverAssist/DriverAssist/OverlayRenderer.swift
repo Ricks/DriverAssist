@@ -57,55 +57,70 @@ enum OverlayRenderer {
     }
 
     private enum Corner {
-        case bottomLeading, bottomTrailing, topTrailing
+        case topLeading, bottomLeading, bottomTrailing, topTrailing
     }
 
-    /// Draws the model-name, low-light-state, and smoothing-state labels in the
-    /// screen corners, mirroring the live HUD text in `ContentView` so recordings
-    /// match what's on screen.
+    /// Draws the model-name, low-light-state, smoothing-state, two-pass-state, and
+    /// stabilization-state labels in the screen corners, mirroring the live HUD text
+    /// in `ContentView` so recordings match what's on screen.
     static func drawHUD(
         modelLabel: String,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         smoothingEnabled: Bool,
+        twoPassEnabled: Bool,
+        stabilizationEnabled: Bool,
         in context: CGContext,
         size: CGSize
     ) {
         let lowLightState = lowLightEnabled ? "on" : "off"
         let lowLightText = autoLowLightEnabled ? "low-light: auto (\(lowLightState))" : "low-light: \(lowLightState)"
         let smoothingText = "smoothing: \(smoothingEnabled ? "on" : "off")"
-        drawCornerLabel(modelLabel, in: context, size: size, corner: .bottomLeading)
-        drawCornerLabel(lowLightText, in: context, size: size, corner: .bottomTrailing)
-        drawCornerLabel(smoothingText, in: context, size: size, corner: .topTrailing)
+        let twoPassText = "two-pass: \(twoPassEnabled ? "on" : "off")"
+        let stabilizationText = "stabilization: \(stabilizationEnabled ? "on" : "off")"
+        drawCornerLabels([modelLabel], in: context, size: size, corner: .bottomLeading)
+        drawCornerLabels([lowLightText], in: context, size: size, corner: .bottomTrailing)
+        drawCornerLabels([smoothingText, stabilizationText], in: context, size: size, corner: .topTrailing)
+        drawCornerLabels([twoPassText], in: context, size: size, corner: .topLeading)
     }
 
-    private static func drawCornerLabel(_ string: String, in context: CGContext, size: CGSize, corner: Corner) {
-        let text = string as NSString
+    /// Draws one or more lines stacked at a screen corner (top corners stack
+    /// downward from the margin; bottom corners stack upward so the last line sits
+    /// at the margin), mirroring the `VStack` layout of the live HUD in `ContentView`.
+    private static func drawCornerLabels(_ lines: [String], in context: CGContext, size: CGSize, corner: Corner) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: UIFont.systemFont(ofSize: 24, weight: .medium),
             .foregroundColor: UIColor.white.withAlphaComponent(0.75)
         ]
-        let textSize = text.size(withAttributes: attributes)
         let margin: CGFloat = 12
+        let lineSpacing: CGFloat = 4
+        let sizes = lines.map { ($0 as NSString).size(withAttributes: attributes) }
 
-        let x: CGFloat
-        let y: CGFloat
+        var y: CGFloat
         switch corner {
-        case .bottomLeading:
-            x = margin
-            y = size.height - textSize.height - margin
-        case .bottomTrailing:
-            x = size.width - textSize.width - margin
-            y = size.height - textSize.height - margin
-        case .topTrailing:
-            x = size.width - textSize.width - margin
+        case .topLeading, .topTrailing:
             y = margin
+        case .bottomLeading, .bottomTrailing:
+            let totalHeight = sizes.reduce(0) { $0 + $1.height } + CGFloat(max(0, lines.count - 1)) * lineSpacing
+            y = size.height - totalHeight - margin
         }
 
         UIGraphicsPushContext(context)
         context.saveGState()
         context.setShadow(offset: .zero, blur: 4, color: UIColor.black.withAlphaComponent(0.6).cgColor)
-        text.draw(at: CGPoint(x: x, y: y), withAttributes: attributes)
+
+        for (line, textSize) in zip(lines, sizes) {
+            let x: CGFloat
+            switch corner {
+            case .topLeading, .bottomLeading:
+                x = margin
+            case .topTrailing, .bottomTrailing:
+                x = size.width - textSize.width - margin
+            }
+            (line as NSString).draw(at: CGPoint(x: x, y: y), withAttributes: attributes)
+            y += textSize.height + lineSpacing
+        }
+
         context.restoreGState()
         UIGraphicsPopContext()
     }
