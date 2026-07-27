@@ -7,6 +7,7 @@
 
 import AVFoundation
 import Speech
+import UIKit
 
 /// Listens continuously for a fixed set of spoken commands ("small", "nano",
 /// "low light on", "low light off", "low light auto", "smoothing on",
@@ -40,7 +41,14 @@ final class VoiceCommandManager: NSObject, ObservableObject {
     /// task — which fire asynchronously — can recognize they're superseded and no-op.
     private var listeningGeneration = 0
 
+    private var observersRegistered = false
+    /// True while paused for an audio interruption or backgrounding, so foreground/
+    /// interruption-ended notifications know whether to resume — as opposed to the
+    /// user (or the app) having called `stop()` deliberately.
+    private var wasInterrupted = false
+
     func start() {
+        registerLifecycleObservers()
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -78,6 +86,60 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         }
         audioEngine.stop()
         isListening = false
+        wasInterrupted = false
+    }
+
+    /// Recognition silently and permanently stops on any mic interruption (a call,
+    /// Siri, Control Center) or backgrounding (screen lock, switching apps) unless
+    /// explicitly restarted — `AVAudioEngine`/`SFSpeechRecognitionTask` don't resume
+    /// on their own. This restarts listening once the interruption clears or the app
+    /// returns to the foreground, mirroring `CameraManager`'s session-recovery observers.
+    private func registerLifecycleObservers() {
+        guard !observersRegistered else { return }
+        observersRegistered = true
+
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
+        ) { [weak self] notification in
+            guard
+                let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                let type = AVAudioSession.InterruptionType(rawValue: typeValue)
+            else { return }
+            switch type {
+            case .began:
+                Task { @MainActor in self?.pauseForInterruption() }
+            case .ended:
+                let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                guard AVAudioSession.InterruptionOptions(rawValue: optionsValue).contains(.shouldResume) else { return }
+                Task { @MainActor in self?.resumeAfterInterruption() }
+            @unknown default:
+                break
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in self?.pauseForInterruption() }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in self?.resumeAfterInterruption() }
+        }
+    }
+
+    private func pauseForInterruption() {
+        guard isListening else { return }
+        stop()
+        wasInterrupted = true
+    }
+
+    private func resumeAfterInterruption() {
+        guard wasInterrupted else { return }
+        wasInterrupted = false
+        beginSession()
     }
 
     private func beginSession() {
@@ -130,7 +192,12 @@ final class VoiceCommandManager: NSObject, ObservableObject {
                 if let result {
                     self.handle(transcript: result.bestTranscription.formattedString)
                 }
-                if error != nil {
+                // Tasks are single-shot — they always end via an error or a final
+                // result, and either way something needs to start the next one or
+                // listening silently stops for good. `handle` above already restarts
+                // when a command matched; the generation check skips a double
+                // restart in that case (it will have already moved on).
+                if generation == self.listeningGeneration, error != nil || (result?.isFinal ?? false) {
                     self.startRecognitionTask()
                 }
             }

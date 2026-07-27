@@ -203,6 +203,29 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    /// The road ahead is always far away, so autofocus hunting near objects (the
+    /// dashboard, a windshield reflection) is pure downside here. This restricts
+    /// the *range* autofocus is allowed to search, while leaving continuous
+    /// autofocus running — a hard focus lock (`setFocusModeLocked`) was tried
+    /// here previously, but a locked lens position isn't guaranteed to land at
+    /// true infinity focus (a lens's mechanical far stop and true infinity focus
+    /// aren't always the same point), which is what produced permanently blurry
+    /// recordings.
+    private nonisolated func restrictFocusToFarRange(for device: AVCaptureDevice) {
+        guard
+            device.isFocusModeSupported(.continuousAutoFocus),
+            device.isAutoFocusRangeRestrictionSupported
+        else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.autoFocusRangeRestriction = .far
+            device.focusMode = .continuousAutoFocus
+        } catch {
+            // Device may be mid-reconfiguration; focus stays on its previous mode.
+        }
+    }
+
     /// Estimates scene brightness from the actual captured frame and, while
     /// auto-detection is enabled, engages or releases the low-light boost.
     ///
@@ -320,6 +343,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
         session.addInput(input)
         captureDevice = device
+        restrictFocusToFarRange(for: device)
 
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -435,17 +459,93 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// Sweeps any `recording-*.mov` left behind by a previous run (e.g. the process
     /// was killed mid-segment, which is the normal case — see `startNewRecording`)
-    /// into the Photos library. Fragmented `.mov` files stay structurally valid
-    /// without a clean `finishWriting()`, so these are safe to import as-is; this is
-    /// what guarantees a session's footage ends up saved regardless of how the app
-    /// was terminated, not just on a clean stop.
+    /// into the Photos library. `movieFragmentInterval` means a file killed *after*
+    /// its first fragment interval has a valid `moov` for everything up to that
+    /// point, but PhotoKit's asset-resource validation still rejects it as-is with
+    /// `PHPhotosErrorInvalidResource` — passthrough-exporting first (see
+    /// `finalizeFragmentedMovie`) rewrites the container header without
+    /// re-encoding, which PhotoKit does accept. A file killed *before* its first
+    /// fragment interval (or recorded before `movieFragmentInterval` existed at
+    /// all) never got a `moov` written at all; that footage is genuinely gone, so
+    /// `finalizeFragmentedMovie` discards those instead of retrying them forever.
     private nonisolated func recoverOrphanedRecordings() {
         guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
               let files = try? FileManager.default.contentsOfDirectory(at: documents, includingPropertiesForKeys: nil)
         else { return }
 
-        for file in files where file.lastPathComponent.hasPrefix("recording-") && file.pathExtension == "mov" {
-            saveToPhotoLibrary(file)
+        let orphans = files.filter { $0.lastPathComponent.hasPrefix("recording-") && $0.pathExtension == "mov" }
+        recoverNextOrphan(orphans, at: 0)
+    }
+
+    /// Recovers one orphan at a time rather than firing every export concurrently —
+    /// iOS caps how many `AVAssetExportSession`/media-service sessions can run at
+    /// once, and launching a dozen at once at app startup made every one of them
+    /// fail immediately instead of queuing.
+    private nonisolated func recoverNextOrphan(_ files: [URL], at index: Int) {
+        guard index < files.count else { return }
+        let file = files[index]
+
+        finalizeFragmentedMovie(at: file) { [weak self] finalizedURL in
+            guard let self else { return }
+            guard let finalizedURL else {
+                self.recoverNextOrphan(files, at: index + 1)
+                return
+            }
+            self.saveToPhotoLibrary(finalizedURL) { success in
+                if success {
+                    try? FileManager.default.removeItem(at: file)
+                } else {
+                    // Save failed (e.g. permission denial) — drop the redundant
+                    // finalized copy and leave the original as the single
+                    // manually-recoverable file, per `saveToPhotoLibrary`.
+                    try? FileManager.default.removeItem(at: finalizedURL)
+                }
+                self.recoverNextOrphan(files, at: index + 1)
+            }
+        }
+    }
+
+    /// Rewrites a fragmented, never-finalized `.mov` (see `recoverOrphanedRecordings`)
+    /// into a properly closed one via passthrough export — same audio/video data,
+    /// no re-encoding, just a corrected container header — so PhotoKit will accept
+    /// it. Calls back with the finalized file's URL, or nil if there's nothing to
+    /// save: either the original has no `moov` at all (checked up front via
+    /// `isReadable`, since asking `AVAssetExportSession` to open one of these
+    /// directly fails with an opaque, unhelpful error), in which case it's deleted
+    /// here since that footage is unrecoverable, or the export itself failed for
+    /// some other reason, in which case the original is left alone for a later
+    /// retry.
+    private nonisolated func finalizeFragmentedMovie(at url: URL, completion: @escaping (URL?) -> Void) {
+        let asset = AVURLAsset(url: url)
+        Task {
+            do {
+                _ = try await asset.load(.isReadable)
+            } catch {
+                print("[CameraManager] discarding unrecoverable orphaned recording \(url.lastPathComponent) (no moov — killed before its first fragment interval): \(error.localizedDescription)")
+                try? FileManager.default.removeItem(at: url)
+                completion(nil)
+                return
+            }
+
+            let finalizedURL = url.deletingLastPathComponent()
+                .appendingPathComponent(url.deletingPathExtension().lastPathComponent + "-finalized")
+                .appendingPathExtension("mov")
+            try? FileManager.default.removeItem(at: finalizedURL)
+
+            guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+                completion(nil)
+                return
+            }
+            export.outputURL = finalizedURL
+            export.outputFileType = .mov
+            export.exportAsynchronously {
+                guard export.status == .completed else {
+                    print("[CameraManager] failed to finalize orphaned recording \(url.lastPathComponent): \(export.error?.localizedDescription ?? "unknown")")
+                    completion(nil)
+                    return
+                }
+                completion(finalizedURL)
+            }
         }
     }
 
@@ -456,8 +556,16 @@ final class CameraManager: NSObject, ObservableObject {
         let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
         rotationCoordinator = coordinator
 
-        applyCaptureRotation(coordinator.videoRotationAngleForHorizonLevelCapture)
-        rotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.new]) { [weak self] _, change in
+        // `...Capture` is Apple's angle for one-shot still-photo capture; our video
+        // data output is a continuously-live connection (feeds both the recording
+        // and inference), which is what `...Preview` is for. Using `...Capture` here
+        // meant the angle it read at startup didn't match the value the coordinator
+        // settled on moments later, so the very first recorded frame (which sizes
+        // the recording's writer for the whole session) locked in different
+        // dimensions than every frame after it — producing a permanently
+        // letterboxed recording.
+        applyCaptureRotation(coordinator.videoRotationAngleForHorizonLevelPreview)
+        rotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.new]) { [weak self] _, change in
             guard let angle = change.newValue else { return }
             self?.applyCaptureRotation(angle)
         }
@@ -576,7 +684,7 @@ final class CameraManager: NSObject, ObservableObject {
 
         guard writer.status == .completed, let url else { return }
         let saveSemaphore = DispatchSemaphore(value: 0)
-        saveToPhotoLibrary(url) { saveSemaphore.signal() }
+        saveToPhotoLibrary(url) { _ in saveSemaphore.signal() }
         saveSemaphore.wait()
     }
 
@@ -585,11 +693,11 @@ final class CameraManager: NSObject, ObservableObject {
     /// (where the last incident's evidence was found) and doesn't grow unbounded.
     /// Leaves the file in place on failure (including permission denial) so it can
     /// still be recovered manually via Files, and so a later sweep can retry it.
-    private nonisolated func saveToPhotoLibrary(_ url: URL, completion: (() -> Void)? = nil) {
+    private nonisolated func saveToPhotoLibrary(_ url: URL, completion: ((Bool) -> Void)? = nil) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 print("[CameraManager] Photos permission not granted (\(status.rawValue)); leaving \(url.lastPathComponent) in app storage")
-                completion?()
+                completion?(false)
                 return
             }
             PHPhotoLibrary.shared().performChanges({
@@ -600,7 +708,7 @@ final class CameraManager: NSObject, ObservableObject {
                 } else {
                     print("[CameraManager] failed to save \(url.lastPathComponent) to Photos: \(error?.localizedDescription ?? "unknown")")
                 }
-                completion?()
+                completion?(success)
             }
         }
     }
@@ -701,16 +809,27 @@ final class CameraManager: NSObject, ObservableObject {
         else { return }
 
         let width          = CVPixelBufferGetWidth(destination)
+        let dstHeight      = CVPixelBufferGetHeight(destination)
+        let srcHeight      = CVPixelBufferGetHeight(source)
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)
+
         // `source` and `destination` come from independent allocations (the live
         // camera frame vs. the writer's pixel buffer pool) and aren't guaranteed to
         // match — e.g. right after backgrounding starts a fresh writer/pool, its
-        // buffer can differ slightly from the incoming frame. Clamping to the
-        // smaller of the two avoids reading past the end of whichever buffer is
-        // shorter, which previously crashed the whole session.
-        let height         = min(CVPixelBufferGetHeight(source), CVPixelBufferGetHeight(destination))
-        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
-        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)
-        let rowBytes       = min(srcBytesPerRow, dstBytesPerRow)
+        // buffer can differ slightly from the incoming frame. When they don't match,
+        // clear the destination first: `destination` comes from a recycled pool, so
+        // otherwise the copy below (clamped to the smaller of the two, to avoid
+        // reading past the end of whichever buffer is shorter) only overwrites part
+        // of it and leaves a previous frame's pixels — HUD and all — sitting in the
+        // rest, which is what made a recording look like it had split into two
+        // frames stacked on top of each other.
+        if srcHeight != dstHeight || srcBytesPerRow != dstBytesPerRow {
+            memset(dstBase, 0, dstBytesPerRow * dstHeight)
+        }
+
+        let height   = min(srcHeight, dstHeight)
+        let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
 
         for row in 0..<height {
             memcpy(dstBase.advanced(by: row * dstBytesPerRow), srcBase.advanced(by: row * srcBytesPerRow), rowBytes)
