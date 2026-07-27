@@ -55,8 +55,11 @@ struct YOLODecoder: Sendable {
             throw InferenceError.missingOutput("failed to create CGImage from pixel buffer")
         }
 
-        // The camera delivers 1280x720 frames but the model requires an exact 640x640
-        // match (MLFeatureValue(pixelBuffer:) alone doesn't resize) — scale to fit here.
+        // The camera delivers full-resolution (4K where supported) frames but the model
+        // requires an exact 640x640 match (MLFeatureValue(pixelBuffer:) alone doesn't
+        // resize) — scale to fit here. Capturing at the highest resolution available
+        // means more real detail survives this downscale, which is what actually helps
+        // detect small/distant objects — the model's input size is fixed regardless.
         let imageFeature = try MLFeatureValue(
             cgImage: cgImage,
             constraint: constraint,

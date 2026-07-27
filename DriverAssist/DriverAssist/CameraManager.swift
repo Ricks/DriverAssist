@@ -331,7 +331,7 @@ final class CameraManager: NSObject, ObservableObject {
         recoverOrphanedRecordings()
 
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
+        session.sessionPreset = session.canSetSessionPreset(.hd4K3840x2160) ? .hd4K3840x2160 : .hd1280x720
 
         guard
             let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
