@@ -38,6 +38,12 @@ struct InferenceView: View {
     @State private var thermalBlinkOn = true
     private let thermalBlinkTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
+    // Dashcam usage means the screen is mounted and glanced at, not stared at —
+    // dimming it saves real power over a long drive without losing the HUD's
+    // legibility. Restored on disappear rather than left dim system-wide.
+    @State private var previousBrightness: CGFloat = UIScreen.main.brightness
+    private static let dimmedBrightness: CGFloat = 0.6
+
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         _inferenceEngine  = StateObject(wrappedValue: InferenceEngine(modelManager: modelManager))
@@ -128,6 +134,10 @@ struct InferenceView: View {
         .onChange(of: inferenceEngine.isTwoPassEnabled) { _, newValue in
             cameraManager.currentTwoPassEnabled = newValue
         }
+        .onChange(of: inferenceEngine.lastFrameElapsedMs) { _, newValue in
+            let configKey = "\(modelManager.selectedModel.rawValue)|\(inferenceEngine.isTwoPassEnabled)"
+            cameraManager.recordInferenceLatency(newValue, configKey: configKey)
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)) { _ in
             batteryLevel = UIDevice.current.batteryLevel
         }
@@ -142,6 +152,8 @@ struct InferenceView: View {
             // Keeps the screen (and thus the camera/recording) awake for the whole
             // drive instead of auto-locking after the idle timeout.
             UIApplication.shared.isIdleTimerDisabled = true
+            previousBrightness = UIScreen.main.brightness
+            UIScreen.main.brightness = Self.dimmedBrightness
             UIDevice.current.isBatteryMonitoringEnabled = true
             batteryLevel = UIDevice.current.batteryLevel
             batteryState = UIDevice.current.batteryState
@@ -170,6 +182,7 @@ struct InferenceView: View {
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            UIScreen.main.brightness = previousBrightness
             UIDevice.current.isBatteryMonitoringEnabled = false
             cameraManager.stop()
             voiceCommandManager.stop()
@@ -201,7 +214,7 @@ struct InferenceView: View {
 
     private var thermalLabel: String {
         let state = cameraManager.thermalState == .nominal ? "OK" : CameraManager.thermalStateName(cameraManager.thermalState).uppercased()
-        return "thermal: \(state)"
+        return "thermal: \(state) \(cameraManager.thermalSpeedPercent)%"
     }
 
     private var thermalLabelColor: Color {

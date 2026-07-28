@@ -55,6 +55,30 @@ final class CameraManager: NSObject, ObservableObject {
     /// settings (1080p/15fps) actually stayed sustainable.
     @Published private(set) var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
 
+    /// Empirical "% of full speed" derived from actual per-frame inference latency
+    /// (see `recordInferenceLatency`), not from `thermalState` directly — Apple
+    /// doesn't publish a numeric throttle factor for `.fair`/`.serious`/`.critical`,
+    /// so this measures the real thing instead: 100% at the baseline latency seen
+    /// while `.nominal`, dropping as frames actually start taking longer.
+    @Published private(set) var thermalSpeedPercent: Int = 100
+
+    // Baseline inference latency (ms) measured while `.nominal`, and the model/
+    // two-pass config it was measured under — see `recordInferenceLatency`. Only
+    // ever touched from the main actor (that method is only called from
+    // `ContentView`'s `onChange(of: inferenceEngine.lastFrameElapsedMs)`).
+    private var thermalBaselineElapsedMs: Double?
+    private var thermalBaselineConfigKey: String?
+    // Smoothed "current" latency (unlike the baseline, updated every frame regardless
+    // of thermal state) so the published percent reflects a stable trend rather than
+    // one noisy frame's timing.
+    private var thermalCurrentElapsedMs: Double?
+    // Gates how often `thermalSpeedPercent` actually changes — every frame was too
+    // jumpy to read at a glance, so it now only updates on a real thermal-state
+    // transition or every 5s otherwise.
+    private var lastPublishedThermalState: ProcessInfo.ThermalState?
+    private var lastThermalPercentPublishTime: CFAbsoluteTime = 0
+    private static let thermalPercentPublishInterval: CFAbsoluteTime = 5
+
     /// Latest detections to bake into recorded frames. Written from the main actor
     /// (as inference results arrive) and read from `sessionQueue` (as frames are
     /// appended to the recording), so access is guarded by `overlayLock`.
@@ -107,6 +131,13 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentThermalState = newValue; overlayLock.unlock() }
     }
 
+    /// Nonisolated mirror of `thermalSpeedPercent`, readable from `sessionQueue`
+    /// while baking the recording overlay.
+    nonisolated var currentThermalSpeedPercent: Int {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentThermalSpeedPercent }
+        set { overlayLock.lock(); _currentThermalSpeedPercent = newValue; overlayLock.unlock() }
+    }
+
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
     private nonisolated(unsafe) var _currentModelLabel: String = ""
@@ -115,6 +146,7 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var _currentTwoPassEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
     private nonisolated(unsafe) var _currentThermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+    private nonisolated(unsafe) var _currentThermalSpeedPercent: Int = 100
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -680,6 +712,60 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    /// Feeds a just-completed frame's inference latency into the "% of full speed"
+    /// metric. `configKey` (model + two-pass state) resets the baseline whenever it
+    /// changes, since switching models/two-pass changes latency on its own and
+    /// would otherwise get misread as thermal throttling.
+    func recordInferenceLatency(_ elapsedMs: Double, configKey: String) {
+        guard elapsedMs > 0 else { return }
+
+        if thermalBaselineConfigKey != configKey {
+            thermalBaselineConfigKey = configKey
+            thermalBaselineElapsedMs = nil
+            thermalCurrentElapsedMs = nil
+            // Force the next available reading to publish immediately rather than
+            // waiting up to 5s under what's now a stale reading for the old config.
+            lastThermalPercentPublishTime = 0
+        }
+
+        if thermalState == .nominal {
+            // EMA so a handful of noisy frames don't yank the baseline around.
+            if let existing = thermalBaselineElapsedMs {
+                thermalBaselineElapsedMs = existing * 0.9 + elapsedMs * 0.1
+            } else {
+                thermalBaselineElapsedMs = elapsedMs
+            }
+        }
+
+        // Separate, faster-decaying EMA of the *current* latency (tracked regardless
+        // of thermal state) so the displayed percent reflects a stable trend instead
+        // of one noisy frame's timing.
+        if let existing = thermalCurrentElapsedMs {
+            thermalCurrentElapsedMs = existing * 0.8 + elapsedMs * 0.2
+        } else {
+            thermalCurrentElapsedMs = elapsedMs
+        }
+
+        guard let baseline = thermalBaselineElapsedMs, baseline > 0, let current = thermalCurrentElapsedMs else {
+            return
+        }
+
+        // Only actually update the published value on a real thermal-state
+        // transition, or every `thermalPercentPublishInterval` seconds otherwise —
+        // computing it every frame was accurate but too jumpy to read at a glance.
+        let now = CFAbsoluteTimeGetCurrent()
+        let stateChanged = lastPublishedThermalState != thermalState
+        guard stateChanged || now - lastThermalPercentPublishTime >= Self.thermalPercentPublishInterval else {
+            return
+        }
+        lastPublishedThermalState = thermalState
+        lastThermalPercentPublishTime = now
+
+        let percent = min(100, max(0, Int((baseline / current * 100).rounded())))
+        thermalSpeedPercent = percent
+        currentThermalSpeedPercent = percent
+    }
+
     nonisolated static func thermalStateName(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
         case .nominal:  return "nominal"
@@ -1148,7 +1234,8 @@ final class CameraManager: NSObject, ObservableObject {
         let size = CGSize(width: width, height: height)
         OverlayRenderer.draw(detections, in: context, size: size)
         let blinkOn = Self.thermalBlinkOn()
-        let thermalText = "thermal: \(thermalState == .nominal ? "OK" : Self.thermalStateName(thermalState).uppercased())"
+        let thermalStateText = thermalState == .nominal ? "OK" : Self.thermalStateName(thermalState).uppercased()
+        let thermalText = "thermal: \(thermalStateText) \(currentThermalSpeedPercent)%"
         OverlayRenderer.drawHUD(
             modelLabel: modelLabel,
             lowLightEnabled: lowLightEnabled,

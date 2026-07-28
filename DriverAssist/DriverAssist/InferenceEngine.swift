@@ -206,6 +206,10 @@ final class InferenceEngine: ObservableObject {
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
     @Published private(set) var isTwoPassEnabled = true
+    /// Wall-clock time the most recently completed frame took to run through the
+    /// decoder, in ms — feeds `CameraManager.recordInferenceLatency` for the
+    /// thermal "% of full speed" metric.
+    @Published private(set) var lastFrameElapsedMs: Double = 0
 
     private let modelManager: ModelManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
@@ -275,6 +279,7 @@ final class InferenceEngine: ObservableObject {
         self.detections = detections
         self.lastError = nil
         self.isBusy = false
+        self.lastFrameElapsedMs = elapsedMs
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {
             print(String(format: "[InferenceEngine] frame %d: %.0fms model=%@ twoPass=%@ detections=%d",
