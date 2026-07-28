@@ -48,35 +48,29 @@ struct InferenceView: View {
                 HStack {
                     VStack(alignment: .leading) {
                         Text(recordingLabel)
-                            .font(.system(size: 24, weight: .medium))
+                            .font(.system(size: 36, weight: .medium))
                             .foregroundStyle(isRecordingHealthy ? .white.opacity(0.75) : Color.red)
                             .shadow(color: .black.opacity(0.6), radius: 2)
                         Text(twoPassLabel)
-                            .font(.system(size: 24, weight: .medium))
+                            .font(.system(size: 36, weight: .medium))
                             .foregroundStyle(.white.opacity(0.75))
                             .shadow(color: .black.opacity(0.6), radius: 2)
                     }
                     Spacer()
-                    VStack(alignment: .trailing) {
-                        Text(smoothingLabel)
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.75))
-                            .shadow(color: .black.opacity(0.6), radius: 2)
-                        Text(stabilizationLabel)
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.75))
-                            .shadow(color: .black.opacity(0.6), radius: 2)
-                    }
+                    Text(stabilizationLabel)
+                        .font(.system(size: 36, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .shadow(color: .black.opacity(0.6), radius: 2)
                 }
                 Spacer()
                 HStack {
                     Text(modelLabel)
-                        .font(.system(size: 24, weight: .medium))
+                        .font(.system(size: 36, weight: .medium))
                         .foregroundStyle(.white.opacity(0.75))
                         .shadow(color: .black.opacity(0.6), radius: 2)
                     Spacer()
                     Text(lowLightLabel)
-                        .font(.system(size: 24, weight: .medium))
+                        .font(.system(size: 36, weight: .medium))
                         .foregroundStyle(.white.opacity(0.75))
                         .shadow(color: .black.opacity(0.6), radius: 2)
                 }
@@ -94,7 +88,7 @@ struct InferenceView: View {
                         // right swipe backs toward nano. Neither wraps around.
                         cycleModel(forward: value.translation.width < 0)
                     } else {
-                        cameraManager.toggleLowLightBoost()
+                        inferenceEngine.toggleTwoPass()
                     }
                 }
         )
@@ -103,9 +97,6 @@ struct InferenceView: View {
         }
         .onChange(of: modelManager.selectedModel) { _, _ in
             cameraManager.currentModelLabel = modelLabel
-        }
-        .onChange(of: inferenceEngine.isSmoothingEnabled) { _, newValue in
-            cameraManager.currentSmoothingEnabled = newValue
         }
         .onChange(of: inferenceEngine.isTwoPassEnabled) { _, newValue in
             cameraManager.currentTwoPassEnabled = newValue
@@ -126,7 +117,6 @@ struct InferenceView: View {
             batteryState = UIDevice.current.batteryState
             modelManager.loadInitialModel()
             cameraManager.currentModelLabel = modelLabel
-            cameraManager.currentSmoothingEnabled = inferenceEngine.isSmoothingEnabled
             cameraManager.currentTwoPassEnabled = inferenceEngine.isTwoPassEnabled
             cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
                 inferenceEngine?.process(pixelBuffer: pixelBuffer)
@@ -140,8 +130,6 @@ struct InferenceView: View {
                     cameraManager?.setLowLightBoost(enabled)
                 case .lowLightAuto:
                     cameraManager?.enableAutoLowLight()
-                case .smoothing(let enabled):
-                    inferenceEngine?.setSmoothingEnabled(enabled)
                 case .twoPass(let enabled):
                     inferenceEngine?.setTwoPassEnabled(enabled)
                 case .stabilization(let enabled):
@@ -171,10 +159,6 @@ struct InferenceView: View {
     private var lowLightLabel: String {
         let state = cameraManager.isLowLightBoostEnabled ? "on" : "off"
         return cameraManager.isAutoLowLightEnabled ? "low-light: auto (\(state))" : "low-light: \(state)"
-    }
-
-    private var smoothingLabel: String {
-        "smoothing: \(inferenceEngine.isSmoothingEnabled ? "on" : "off")"
     }
 
     private var twoPassLabel: String {

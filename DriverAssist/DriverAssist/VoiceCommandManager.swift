@@ -10,16 +10,14 @@ import Speech
 import UIKit
 
 /// Listens continuously for a fixed set of spoken commands ("small", "nano", "medium",
-/// "low light on", "low light off", "low light auto", "smoothing on",
-/// "smoothing off", "two pass on", "two pass off", "stabilization on",
-/// "stabilization off") and reports them via `onCommand`.
+/// "low light on", "low light off", "low light auto", "two pass on", "two pass off",
+/// "stabilization on", "stabilization off") and reports them via `onCommand`.
 @MainActor
 final class VoiceCommandManager: NSObject, ObservableObject {
     enum Command: Equatable {
         case selectModel(DetectorModel)
         case lowLight(Bool)
         case lowLightAuto
-        case smoothing(Bool)
         case twoPass(Bool)
         case stabilization(Bool)
     }
@@ -216,10 +214,6 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             command = .lowLight(true)
         } else if lowered.contains("low light off") {
             command = .lowLight(false)
-        } else if lowered.contains("smoothing on") {
-            command = .smoothing(true)
-        } else if lowered.contains("smoothing off") {
-            command = .smoothing(false)
         // "two" reliably transcribes as "to"/"too" here (confirmed on-device: saying
         // "two-pass on" settles as "to pass on", never "two pass on") — accept all
         // three homophones for both directions.

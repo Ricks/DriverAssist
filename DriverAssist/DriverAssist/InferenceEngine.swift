@@ -198,42 +198,31 @@ final class InferenceEngine: ObservableObject {
     /// to reproduce the preview's aspect-fill crop instead of naively stretching boxes
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
-    @Published private(set) var isSmoothingEnabled = false
     @Published private(set) var isTwoPassEnabled = true
 
     private let modelManager: ModelManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
-    private let smoother = DetectionSmoother()
     private var isBusy = false
     private var frameCount = 0
 
-    private static let smoothingDefaultsKey = "settings.smoothingEnabled"
     private static let twoPassDefaultsKey = "settings.twoPassEnabled"
 
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         let defaults = UserDefaults.standard
-        if defaults.object(forKey: Self.smoothingDefaultsKey) != nil {
-            isSmoothingEnabled = defaults.bool(forKey: Self.smoothingDefaultsKey)
-        }
         if defaults.object(forKey: Self.twoPassDefaultsKey) != nil {
             isTwoPassEnabled = defaults.bool(forKey: Self.twoPassDefaultsKey)
         }
     }
 
-    /// Resets tracking state on change so a stale pre-toggle position can't get
-    /// blended into the first frame after re-enabling.
-    func setSmoothingEnabled(_ enabled: Bool) {
-        guard enabled != isSmoothingEnabled else { return }
-        isSmoothingEnabled = enabled
-        smoother.reset()
-        UserDefaults.standard.set(enabled, forKey: Self.smoothingDefaultsKey)
-    }
-
     func setTwoPassEnabled(_ enabled: Bool) {
         isTwoPassEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.twoPassDefaultsKey)
+    }
+
+    func toggleTwoPass() {
+        setTwoPassEnabled(!isTwoPassEnabled)
     }
 
     func process(pixelBuffer: CVPixelBuffer) {
@@ -252,6 +241,8 @@ final class InferenceEngine: ObservableObject {
         let modelBox = UncheckedSendableBox(value: model)
         let decoder = self.decoder
         let twoPass = isTwoPassEnabled
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let modelLabel = modelManager.selectedModel.rawValue
 
         queue.async { [weak self] in
             do {
@@ -260,9 +251,10 @@ final class InferenceEngine: ObservableObject {
                     pixelBuffer: pixelBufferBox.value,
                     twoPass: twoPass
                 )
+                let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
 
                 Task { @MainActor [weak self] in
-                    self?.finishSuccess(detections)
+                    self?.finishSuccess(detections, elapsedMs: elapsedMs, modelLabel: modelLabel, twoPass: twoPass)
                 }
             } catch {
                 Task { @MainActor [weak self] in
@@ -272,13 +264,14 @@ final class InferenceEngine: ObservableObject {
         }
     }
 
-    private func finishSuccess(_ detections: [Detection]) {
-        self.detections = isSmoothingEnabled ? smoother.smooth(detections) : detections
+    private func finishSuccess(_ detections: [Detection], elapsedMs: Double, modelLabel: String, twoPass: Bool) {
+        self.detections = detections
         self.lastError = nil
         self.isBusy = false
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {
-            print("[InferenceEngine] frame \(frameCount): \(detections.count) detection(s)")
+            print(String(format: "[InferenceEngine] frame %d: %.0fms model=%@ twoPass=%@ detections=%d",
+                          frameCount, elapsedMs, modelLabel, String(twoPass), detections.count))
         }
     }
 

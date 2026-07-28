@@ -25,9 +25,9 @@ final class CameraManager: NSObject, ObservableObject {
     @Published private(set) var isLowLightBoostEnabled = false
 
     /// Whether the ISO-based auto-detector is currently in control of the boost. A
-    /// manual swipe/voice override suspends this until `enableAutoLowLight()` is
-    /// called again (voice: "low light auto"), so auto-detection doesn't immediately
-    /// fight an explicit override.
+    /// manual voice override suspends this until `enableAutoLowLight()` is called
+    /// again (voice: "low light auto"), so auto-detection doesn't immediately fight
+    /// an explicit override.
     @Published private(set) var isAutoLowLightEnabled = true
 
     /// Whether frames are actively being written to a recording segment right now.
@@ -68,14 +68,6 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentLowLightEnabled = newValue; overlayLock.unlock() }
     }
 
-    /// Current detection-smoothing state ("smoothing on/off") to bake into recorded
-    /// frames, mirroring `InferenceEngine.isSmoothingEnabled` (owned there, synced in
-    /// from the main actor).
-    nonisolated var currentSmoothingEnabled: Bool {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentSmoothingEnabled }
-        set { overlayLock.lock(); _currentSmoothingEnabled = newValue; overlayLock.unlock() }
-    }
-
     /// Nonisolated mirror of `isAutoLowLightEnabled`, readable from `sessionQueue`
     /// while baking the recording overlay.
     private nonisolated var currentAutoLowLightEnabled: Bool {
@@ -103,7 +95,6 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
     private nonisolated(unsafe) var _currentModelLabel: String = ""
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
-    private nonisolated(unsafe) var _currentSmoothingEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
     private nonisolated(unsafe) var _currentTwoPassEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
@@ -205,16 +196,9 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Toggles the low-light exposure boost, biasing auto-exposure brighter to help
-    /// detection in dark scenes (at the cost of more sensor noise). A manual action,
-    /// so this suspends auto-detection — see `setLowLightBoost`.
-    func toggleLowLightBoost() {
-        setLowLightBoost(!isLowLightBoostEnabled)
-    }
-
-    /// Sets the low-light exposure boost to an explicit state (swipe gesture, or
-    /// voice commands "low light on"/"off"). Suspends auto-detection until
-    /// `enableAutoLowLight()` is called again, so the two don't immediately fight.
+    /// Sets the low-light exposure boost to an explicit state (voice commands "low
+    /// light on"/"off"). Suspends auto-detection until `enableAutoLowLight()` is
+    /// called again, so the two don't immediately fight.
     func setLowLightBoost(_ enabled: Bool) {
         isAutoLowLightEnabled = false
         currentAutoLowLightEnabled = false
@@ -311,6 +295,31 @@ final class CameraManager: NSObject, ObservableObject {
             device.setFocusModeLocked(lensPosition: device.lensPosition, completionHandler: nil)
         } catch {
             // Device may be mid-reconfiguration; focus stays continuous (still far-restricted).
+        }
+    }
+
+    /// AE is free to reach its brightness target either by raising ISO/gain or
+    /// by slowing the shutter. At night -- especially with the low-light bias
+    /// below pushing the target brighter still -- a slower shutter is the
+    /// cheaper way for AE to get there, but its also the one that blurs a
+    /// moving vehicle (and everything else on the road) worse than sensor
+    /// noise ever would for YOLO26s purposes. Capping the max exposure
+    /// duration removes that option, forcing AE to compensate with ISO/gain
+    /// instead.
+    private nonisolated func restrictMaxExposureDuration(for device: AVCaptureDevice) {
+        // 1/60s is a conservative starting point: every iPhone video format
+        // supports at least 1/30s per Apples baseline requirements, so this
+        // is safe across devices. Tune against real night-driving footage --
+        // slower (e.g. 1/30s) trades some blur for less ISO noise/darkness;
+        // faster (e.g. 1/120s) does the opposite.
+        let maxDuration = CMTime(value: 1, timescale: 60)
+        guard device.activeFormat.maxExposureDuration > maxDuration else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.activeMaxExposureDuration = maxDuration
+        } catch {
+            // Device may be mid-reconfiguration; AE keeps its wider default range this time.
         }
     }
 
@@ -432,6 +441,8 @@ final class CameraManager: NSObject, ObservableObject {
         session.addInput(input)
         captureDevice = device
         restrictFocusToFarRange(for: device)
+        restrictMaxExposureDuration(for: device)
+        restrictMaxExposureDuration(for: device)
 
         // Apply a persisted (non-auto) low-light boost to the newly configured
         // device — loaded into the published/mirrored state in init(), before a
@@ -878,7 +889,6 @@ final class CameraManager: NSObject, ObservableObject {
             modelLabel: currentModelLabel,
             lowLightEnabled: currentLowLightEnabled,
             autoLowLightEnabled: currentAutoLowLightEnabled,
-            smoothingEnabled: currentSmoothingEnabled,
             twoPassEnabled: currentTwoPassEnabled,
             stabilizationEnabled: currentStabilizationEnabled
         )
@@ -892,7 +902,6 @@ final class CameraManager: NSObject, ObservableObject {
         modelLabel: String,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
-        smoothingEnabled: Bool,
         twoPassEnabled: Bool,
         stabilizationEnabled: Bool
     ) {
@@ -956,7 +965,6 @@ final class CameraManager: NSObject, ObservableObject {
             modelLabel: modelLabel,
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
-            smoothingEnabled: smoothingEnabled,
             twoPassEnabled: twoPassEnabled,
             stabilizationEnabled: stabilizationEnabled,
             in: context,
