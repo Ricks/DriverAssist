@@ -60,15 +60,17 @@ enum OverlayRenderer {
         case topLeading, bottomLeading, bottomTrailing, topTrailing
     }
 
-    /// Draws the model-name, low-light-state, two-pass-state, and stabilization-state
-    /// labels in the screen corners, mirroring the live HUD text in `ContentView` so
-    /// recordings match what's on screen.
+    /// Draws the model-name, low-light-state, two-pass-state, stabilization-state,
+    /// and thermal-state labels in the screen corners, mirroring the live HUD text
+    /// in `ContentView` so recordings match what's on screen.
     static func drawHUD(
         modelLabel: String,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         twoPassEnabled: Bool,
         stabilizationEnabled: Bool,
+        thermalText: String,
+        thermalColor: UIColor,
         in context: CGContext,
         size: CGSize
     ) {
@@ -76,23 +78,23 @@ enum OverlayRenderer {
         let lowLightText = autoLowLightEnabled ? "low-light: auto (\(lowLightState))" : "low-light: \(lowLightState)"
         let twoPassText = "two-pass: \(twoPassEnabled ? "on" : "off")"
         let stabilizationText = "stabilization: \(stabilizationEnabled ? "on" : "off")"
-        drawCornerLabels([modelLabel], in: context, size: size, corner: .bottomLeading)
-        drawCornerLabels([lowLightText], in: context, size: size, corner: .bottomTrailing)
-        drawCornerLabels([stabilizationText], in: context, size: size, corner: .topTrailing)
-        drawCornerLabels([twoPassText], in: context, size: size, corner: .topLeading)
+
+        drawCornerLabels([(thermalText, thermalColor)], in: context, size: size, corner: .topLeading)
+        drawCornerLabels([(twoPassText, defaultColor), (modelLabel, defaultColor)], in: context, size: size, corner: .bottomLeading)
+        drawCornerLabels([(lowLightText, defaultColor)], in: context, size: size, corner: .bottomTrailing)
+        drawCornerLabels([(stabilizationText, defaultColor)], in: context, size: size, corner: .topTrailing)
     }
 
-    /// Draws one or more lines stacked at a screen corner (top corners stack
-    /// downward from the margin; bottom corners stack upward so the last line sits
-    /// at the margin), mirroring the `VStack` layout of the live HUD in `ContentView`.
-    private static func drawCornerLabels(_ lines: [String], in context: CGContext, size: CGSize, corner: Corner) {
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 36, weight: .medium),
-            .foregroundColor: UIColor.white.withAlphaComponent(0.75)
-        ]
+    private static let defaultColor = UIColor.white.withAlphaComponent(0.75)
+
+    /// Draws one or more (text, color) lines stacked at a screen corner (top corners
+    /// stack downward from the margin; bottom corners stack upward so the last line
+    /// sits at the margin), mirroring the `VStack` layout of the live HUD in `ContentView`.
+    private static func drawCornerLabels(_ lines: [(text: String, color: UIColor)], in context: CGContext, size: CGSize, corner: Corner) {
+        let font = UIFont.systemFont(ofSize: 36, weight: .medium)
         let margin: CGFloat = 12
         let lineSpacing: CGFloat = 4
-        let sizes = lines.map { ($0 as NSString).size(withAttributes: attributes) }
+        let sizes = lines.map { ($0.text as NSString).size(withAttributes: [.font: font]) }
 
         var y: CGFloat
         switch corner {
@@ -115,7 +117,8 @@ enum OverlayRenderer {
             case .topTrailing, .bottomTrailing:
                 x = size.width - textSize.width - margin
             }
-            (line as NSString).draw(at: CGPoint(x: x, y: y), withAttributes: attributes)
+            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: line.color]
+            (line.text as NSString).draw(at: CGPoint(x: x, y: y), withAttributes: attributes)
             y += textSize.height + lineSpacing
         }
 

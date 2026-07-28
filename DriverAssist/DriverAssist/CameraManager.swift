@@ -46,6 +46,15 @@ final class CameraManager: NSObject, ObservableObject {
     /// below for the recording bake.
     @Published private(set) var isStabilizationEnabled = false
 
+    /// Current system thermal state. Published so the HUD can warn when the device
+    /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
+    /// sustained heat with no other visible symptom, so this is the only in-the-moment
+    /// signal that it's happening. Updates also mirror to `currentThermalState` below
+    /// for the recording bake, and are always logged (`DebugFileLogger`) regardless of
+    /// HUD visibility, to confirm after a long drive whether the current capture
+    /// settings (1080p/15fps) actually stayed sustainable.
+    @Published private(set) var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+
     /// Latest detections to bake into recorded frames. Written from the main actor
     /// (as inference results arrive) and read from `sessionQueue` (as frames are
     /// appended to the recording), so access is guarded by `overlayLock`.
@@ -91,6 +100,13 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentStabilizationEnabled = newValue; overlayLock.unlock() }
     }
 
+    /// Nonisolated mirror of `thermalState`, readable from `sessionQueue` while
+    /// baking the recording overlay.
+    nonisolated var currentThermalState: ProcessInfo.ThermalState {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentThermalState }
+        set { overlayLock.lock(); _currentThermalState = newValue; overlayLock.unlock() }
+    }
+
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentDetections: [Detection] = []
     private nonisolated(unsafe) var _currentModelLabel: String = ""
@@ -98,6 +114,7 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
     private nonisolated(unsafe) var _currentTwoPassEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
+    private nonisolated(unsafe) var _currentThermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -109,6 +126,30 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
     private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
     private nonisolated(unsafe) var focusSettleObservation: NSKeyValueObservation?
+
+    // Periodic focus recalibration (see `recalibrateFocusIfDue`): a one-shot
+    // settle-then-lock calibration can catch a bad moment — a dark scene, a close
+    // object, still sitting in a driveway — and then stay wrong for an entire drive
+    // with no way to recover, which is what happened on a real night drive. Bounding
+    // how long a bad calibration can last by periodically re-running the same cycle,
+    // the same principle as the low-light auto-detector re-sampling instead of
+    // deciding once and never revisiting it.
+    private nonisolated(unsafe) var lastFocusCalibrationTime: CFAbsoluteTime = 0
+    private nonisolated static let focusRecalibrationInterval: CFAbsoluteTime = 60
+    private nonisolated static let maxFocusSettleWait: CFAbsoluteTime = 5
+
+    /// The last lens position a calibration actually settled on with confidence.
+    /// A timed-out (unsettled) recalibration re-locks to this instead of committing
+    /// to whatever uncertain position the lens happened to be hunting through —
+    /// otherwise an indoor/close-range recalibration with nothing confident to focus
+    /// on progressively drifts the lock worse with every retry.
+    private nonisolated(unsafe) var lastGoodLensPosition: Float?
+
+    // Gate on the "Go" button (pressed once the phone is mounted in its final dash
+    // position) so the very first focus calibration never runs while the phone is
+    // still being handled/positioned, which would settle on the wrong distance.
+    private nonisolated(unsafe) var isReadyForFocusCalibration = false
+    private nonisolated(unsafe) var hasBegunFocusCalibration = false
 
     /// The exposure bias (in EV) the boost is currently applying, so it can be
     /// restored after a probe. Written and read only on `sessionQueue` — no lock
@@ -266,7 +307,17 @@ final class CameraManager: NSObject, ObservableObject {
     /// true infinity focus aren't always the same point) — that's what produced
     /// permanently blurry recordings before — but the position autofocus itself
     /// converges on has actually been verified sharp.
-    private nonisolated func restrictFocusToFarRange(for device: AVCaptureDevice) {
+    ///
+    /// This one-shot calibration was confirmed on a real night drive to sometimes
+    /// still come out permanently blurry — most likely it locked onto a bad moment
+    /// (low contrast in the dark, a close object, still sitting in a driveway) with
+    /// no way to ever correct itself for the rest of the drive. Logged persistently
+    /// (`DebugFileLogger`, not just live console) so the next occurrence is actually
+    /// diagnosable, and re-run periodically (`recalibrateFocusIfDue`) rather than once,
+    /// so a bad calibration is wrong for at most `focusRecalibrationInterval`, not the
+    /// whole drive.
+    private nonisolated func beginFocusCalibration(for device: AVCaptureDevice) {
+        lastFocusCalibrationTime = CFAbsoluteTimeGetCurrent()
         guard
             device.isFocusModeSupported(.continuousAutoFocus),
             device.isAutoFocusRangeRestrictionSupported,
@@ -281,18 +332,70 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
 
+        DebugFileLogger.log("focus: calibration started")
+        let calibrationStart = CFAbsoluteTimeGetCurrent()
+
         focusSettleObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] device, change in
             guard change.newValue == false else { return }
             self?.focusSettleObservation = nil
-            self?.lockFocus(at: device)
+            let elapsed = CFAbsoluteTimeGetCurrent() - calibrationStart
+            DebugFileLogger.log(String(format: "focus: settled after %.2fs at lensPosition=%.3f", elapsed, device.lensPosition))
+            self?.lockFocus(at: device, lensPosition: device.lensPosition)
+        }
+
+        // Night-time autofocus is inherently less confident (low contrast) and may
+        // never cleanly settle — don't wait forever, or this drive's recalibration
+        // effectively never happens and we're back to the original bug. A timeout
+        // here means this attempt never confirmed anything, so re-lock to the last
+        // position that DID settle confidently rather than committing to whatever
+        // uncertain position the lens happened to be at (falling back to the current
+        // position only on the very first calibration, with no prior good lock yet).
+        sessionQueue.asyncAfter(deadline: .now() + Self.maxFocusSettleWait) { [weak self] in
+            guard let self, self.focusSettleObservation != nil else { return }
+            self.focusSettleObservation = nil
+            if let goodPosition = self.lastGoodLensPosition {
+                DebugFileLogger.log(String(format: "focus: settle timed out after %.0fs, keeping previous good lensPosition=%.3f instead of unconfirmed=%.3f", Self.maxFocusSettleWait, goodPosition, device.lensPosition))
+                self.lockFocus(at: device, lensPosition: goodPosition)
+            } else {
+                DebugFileLogger.log(String(format: "focus: settle timed out after %.0fs, no prior good lock, locking at lensPosition=%.3f anyway", Self.maxFocusSettleWait, device.lensPosition))
+                self.lockFocus(at: device, lensPosition: device.lensPosition)
+            }
         }
     }
 
-    private nonisolated func lockFocus(at device: AVCaptureDevice) {
+    /// Re-runs the settle-then-lock calibration roughly every
+    /// `focusRecalibrationInterval` — called from every captured frame, matching how
+    /// `sampleAutoLowLightIfDue` self-throttles instead of needing its own timer.
+    private nonisolated func recalibrateFocusIfDue() {
+        guard
+            hasBegunFocusCalibration,
+            let device = captureDevice,
+            focusSettleObservation == nil,
+            CFAbsoluteTimeGetCurrent() - lastFocusCalibrationTime >= Self.focusRecalibrationInterval
+        else { return }
+        beginFocusCalibration(for: device)
+    }
+
+    /// Called when the user presses "Go" after mounting the phone in its final dash
+    /// position. Safe to call before or after `configure()` has run: if the capture
+    /// device isn't ready yet, `configure()` itself checks `isReadyForFocusCalibration`
+    /// and starts calibration as soon as the device is available.
+    func markReadyForFocusCalibration() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.isReadyForFocusCalibration = true
+            guard let device = self.captureDevice, !self.hasBegunFocusCalibration else { return }
+            self.hasBegunFocusCalibration = true
+            self.beginFocusCalibration(for: device)
+        }
+    }
+
+    private nonisolated func lockFocus(at device: AVCaptureDevice, lensPosition: Float) {
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
-            device.setFocusModeLocked(lensPosition: device.lensPosition, completionHandler: nil)
+            device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+            lastGoodLensPosition = lensPosition
         } catch {
             // Device may be mid-reconfiguration; focus stays continuous (still far-restricted).
         }
@@ -320,6 +423,26 @@ final class CameraManager: NSObject, ObservableObject {
             device.activeMaxExposureDuration = maxDuration
         } catch {
             // Device may be mid-reconfiguration; AE keeps its wider default range this time.
+        }
+    }
+
+    /// Locks capture to a fixed, lower frame rate — half the ISP/encode work of the
+    /// default 30fps, on top of the 4x cut from dropping to 1080p (see `configure`).
+    /// The `isBusy` gate already discards most frames at 30fps anyway once inference
+    /// can't keep up, so this mostly stops paying full capture/encode cost for frames
+    /// that would've been dropped regardless.
+    private nonisolated func restrictFrameRate(for device: AVCaptureDevice, to fps: Double) {
+        let desiredDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
+        guard device.activeFormat.videoSupportedFrameRateRanges.contains(where: {
+            desiredDuration >= $0.minFrameDuration && desiredDuration <= $0.maxFrameDuration
+        }) else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.activeVideoMinFrameDuration = desiredDuration
+            device.activeVideoMaxFrameDuration = desiredDuration
+        } catch {
+            // Device may be mid-reconfiguration; frame rate stays at its previous default.
         }
     }
 
@@ -427,8 +550,15 @@ final class CameraManager: NSObject, ObservableObject {
         registerSessionObservers()
         recoverOrphanedRecordings()
 
+        // 4K/30fps was confirmed on a real 23-minute drive to thermally throttle the
+        // device 10-15x — even at the cheapest inference settings (nano, two-pass
+        // off), meaning ML load wasn't the dominant heat source. The sustained 4K
+        // ISP+encode pipeline runs regardless of model choice, so that's the actual
+        // target: 1080p is 1/4 the pixels of 4K and 15fps is half of 30fps, an ~8x
+        // cut to that fixed cost. See `logThermalState` for the telemetry that
+        // confirms whether this is actually sustainable on a real long drive.
         session.beginConfiguration()
-        session.sessionPreset = session.canSetSessionPreset(.hd4K3840x2160) ? .hd4K3840x2160 : .hd1280x720
+        session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .hd1280x720
 
         guard
             let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -440,9 +570,12 @@ final class CameraManager: NSObject, ObservableObject {
         }
         session.addInput(input)
         captureDevice = device
-        restrictFocusToFarRange(for: device)
+        if isReadyForFocusCalibration {
+            hasBegunFocusCalibration = true
+            beginFocusCalibration(for: device)
+        }
         restrictMaxExposureDuration(for: device)
-        restrictMaxExposureDuration(for: device)
+        restrictFrameRate(for: device, to: 15)
 
         // Apply a persisted (non-auto) low-light boost to the newly configured
         // device — loaded into the published/mirrored state in init(), before a
@@ -524,6 +657,57 @@ final class CameraManager: NSObject, ObservableObject {
             forName: UIApplication.willTerminateNotification, object: nil, queue: nil
         ) { [weak self] _ in
             self?.beginBackgroundFlush()
+        }
+
+        // No automatic response — this is what actually confirms whether 1080p/15fps
+        // holds in `.nominal`/`.fair` for a whole real drive, or still climbs into
+        // `.serious`/`.critical` the way 4K/30fps did. Also drives the on-screen/baked
+        // HUD warning so a climbing state is visible in the moment, not just after
+        // the fact in the debug log.
+        handleThermalStateChange(ProcessInfo.processInfo.thermalState, context: "initial")
+        NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.handleThermalStateChange(ProcessInfo.processInfo.thermalState, context: "changed")
+        }
+    }
+
+    private nonisolated func handleThermalStateChange(_ state: ProcessInfo.ThermalState, context: String) {
+        currentThermalState = state
+        DebugFileLogger.log("thermal: \(context) state=\(Self.thermalStateName(state))")
+        Task { @MainActor [weak self] in
+            self?.thermalState = state
+        }
+    }
+
+    nonisolated static func thermalStateName(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal:  return "nominal"
+        case .fair:     return "fair"
+        case .serious:  return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown(\(state.rawValue))"
+        }
+    }
+
+    /// Toggles roughly twice a second, off wall-clock time rather than a running
+    /// timer, so live HUD and baked-recording overlay (rendered on separate
+    /// pipelines/frame cadences) blink in sync without needing to share state.
+    nonisolated static func thermalBlinkOn(at time: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) -> Bool {
+        Int(time / 0.5) % 2 == 0
+    }
+
+    /// Color for the always-on thermal readout: nominal reads the same as other
+    /// HUD text, fair is a yellow caution (not yet a real problem), serious is a
+    /// steady red, and critical blinks red/dim since that's the state where the
+    /// 10-15x thermal slowdown is actually happening.
+    nonisolated static func thermalColor(for state: ProcessInfo.ThermalState, blinkOn: Bool) -> UIColor {
+        switch state {
+        case .nominal:  return UIColor.white.withAlphaComponent(0.75)
+        case .fair:     return UIColor.systemYellow
+        case .serious:  return UIColor.systemRed
+        case .critical: return blinkOn ? UIColor.systemRed : UIColor.white.withAlphaComponent(0.3)
+        @unknown default: return UIColor.systemRed
         }
     }
 
@@ -890,7 +1074,8 @@ final class CameraManager: NSObject, ObservableObject {
             lowLightEnabled: currentLowLightEnabled,
             autoLowLightEnabled: currentAutoLowLightEnabled,
             twoPassEnabled: currentTwoPassEnabled,
-            stabilizationEnabled: currentStabilizationEnabled
+            stabilizationEnabled: currentStabilizationEnabled,
+            thermalState: currentThermalState
         )
         adaptor.append(outputBuffer, withPresentationTime: presentationTime)
     }
@@ -903,7 +1088,8 @@ final class CameraManager: NSObject, ObservableObject {
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         twoPassEnabled: Bool,
-        stabilizationEnabled: Bool
+        stabilizationEnabled: Bool,
+        thermalState: ProcessInfo.ThermalState
     ) {
         CVPixelBufferLockBaseAddress(source, .readOnly)
         CVPixelBufferLockBaseAddress(destination, [])
@@ -961,12 +1147,16 @@ final class CameraManager: NSObject, ObservableObject {
 
         let size = CGSize(width: width, height: height)
         OverlayRenderer.draw(detections, in: context, size: size)
+        let blinkOn = Self.thermalBlinkOn()
+        let thermalText = "thermal: \(thermalState == .nominal ? "OK" : Self.thermalStateName(thermalState).uppercased())"
         OverlayRenderer.drawHUD(
             modelLabel: modelLabel,
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
             twoPassEnabled: twoPassEnabled,
             stabilizationEnabled: stabilizationEnabled,
+            thermalText: thermalText,
+            thermalColor: Self.thermalColor(for: thermalState, blinkOn: blinkOn),
             in: context,
             size: size
         )
@@ -984,6 +1174,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         sampleAutoLowLightIfDue(pixelBuffer)
+        recalibrateFocusIfDue()
         appendRecordingFrame(pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
 
         let box = UncheckedSendableBox(value: pixelBuffer)

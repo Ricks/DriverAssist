@@ -46,10 +46,17 @@ struct YOLODecoder: Sendable {
     private let confidenceThreshold: Float = 0.25
 
     /// Centered region (top-left-origin normalized, matching `Detection.boundingBox`'s
-    /// convention) used for the second "zoom" pass in two-pass mode — a 2x digital
-    /// zoom on the road ahead. Cropped symmetrically so it keeps the source's 16:9
-    /// aspect ratio and doesn't reintroduce distortion when scaled to the model input.
-    private let zoomRegion = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+    /// convention) used for the second "zoom" pass in two-pass mode — a digital zoom
+    /// on the road ahead. Cropped symmetrically so it keeps the source's 16:9 aspect
+    /// ratio and doesn't reintroduce distortion when scaled to the model input.
+    ///
+    /// 0.6 rather than the original 0.5: at 1080p capture, a 0.5 crop's native
+    /// resolution (960x540) is *smaller* than the model's 1152x640 input, so the zoom
+    /// pass would upscale (interpolating, no real added detail) rather than downscale.
+    /// 0.6 (1920x0.6=1152, 1080x0.6=648) is the threshold where the crop's native
+    /// resolution just meets the model's input size — a ~1.67x zoom instead of 2x, but
+    /// a genuine one, with real detail preserved rather than interpolated.
+    private let zoomRegion = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
 
     /// Runs the model once on the full frame and, when `twoPass` is on, a second time
     /// on a cropped/zoomed center region — a distant object occupies far more of the
