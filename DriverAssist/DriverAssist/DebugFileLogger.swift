@@ -17,8 +17,19 @@ enum DebugFileLogger {
 
     private static let queue = DispatchQueue(label: "DebugFileLogger")
 
+    /// Archives (never deletes) the previous run's log before starting a fresh one.
+    /// Deleting outright is exactly what lost a real drive's log this session — a
+    /// later, unrelated app launch (e.g. installing a test build) reset the file
+    /// before the drive's data had been pulled off the device. Archived files are
+    /// timestamped so a specific drive's log can still be found afterward.
     static func reset() {
-        queue.async { try? FileManager.default.removeItem(at: url) }
+        queue.async {
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: url.path) else { return }
+            let archiveURL = url.deletingLastPathComponent()
+                .appendingPathComponent("overlay-debug-\(Int(Date().timeIntervalSince1970)).log")
+            try? fm.moveItem(at: url, to: archiveURL)
+        }
     }
 
     static func log(_ message: String) {

@@ -764,6 +764,16 @@ final class CameraManager: NSObject, ObservableObject {
         let percent = min(100, max(0, Int((baseline / current * 100).rounded())))
         thermalSpeedPercent = percent
         currentThermalSpeedPercent = percent
+
+        // Logged at the same throttled cadence as the publish itself (not every
+        // frame) so a multi-minute drive doesn't flood the file — but with the raw
+        // inputs (not just the rounded percent) so a suspiciously-flat reading can
+        // actually be checked against real numbers afterward, instead of just
+        // re-trusting the same computed value.
+        DebugFileLogger.log(String(
+            format: "thermal-speed: state=%@ elapsedMs=%.1f smoothedMs=%.1f baselineMs=%.1f percent=%d",
+            Self.thermalStateName(thermalState), elapsedMs, current, baseline, percent
+        ))
     }
 
     nonisolated static func thermalStateName(_ state: ProcessInfo.ThermalState) -> String {
