@@ -242,7 +242,12 @@ final class InferenceEngine: ObservableObject {
         setTwoPassEnabled(!isTwoPassEnabled)
     }
 
-    func process(pixelBuffer: CVPixelBuffer) {
+    func process(
+        pixelBuffer: CVPixelBuffer,
+        lowLightEnabled: Bool,
+        autoLowLightEnabled: Bool,
+        stabilizationEnabled: Bool
+    ) {
         sourceSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         DebugFileLogger.log("process() called, sourceSize set to \(sourceSize)")
         guard !isBusy else { return }
@@ -271,7 +276,15 @@ final class InferenceEngine: ObservableObject {
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
 
                 Task { @MainActor [weak self] in
-                    self?.finishSuccess(detections, elapsedMs: elapsedMs, modelLabel: modelLabel, twoPass: twoPass)
+                    self?.finishSuccess(
+                        detections,
+                        elapsedMs: elapsedMs,
+                        modelLabel: modelLabel,
+                        twoPass: twoPass,
+                        lowLightEnabled: lowLightEnabled,
+                        autoLowLightEnabled: autoLowLightEnabled,
+                        stabilizationEnabled: stabilizationEnabled
+                    )
                 }
             } catch {
                 Task { @MainActor [weak self] in
@@ -281,11 +294,29 @@ final class InferenceEngine: ObservableObject {
         }
     }
 
-    private func finishSuccess(_ detections: [Detection], elapsedMs: Double, modelLabel: String, twoPass: Bool) {
+    private func finishSuccess(
+        _ detections: [Detection],
+        elapsedMs: Double,
+        modelLabel: String,
+        twoPass: Bool,
+        lowLightEnabled: Bool,
+        autoLowLightEnabled: Bool,
+        stabilizationEnabled: Bool
+    ) {
         self.detections = detections
         self.lastError = nil
         self.isBusy = false
         self.lastFrameElapsedMs = elapsedMs
+        DetectionLogger.log(
+            timestamp: Date().timeIntervalSince1970,
+            model: modelLabel,
+            twoPass: twoPass,
+            elapsedMs: elapsedMs,
+            lowLightEnabled: lowLightEnabled,
+            autoLowLightEnabled: autoLowLightEnabled,
+            stabilizationEnabled: stabilizationEnabled,
+            detections: detections
+        )
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {
             print(String(format: "[InferenceEngine] frame %d: %.0fms model=%@ twoPass=%@ detections=%d",

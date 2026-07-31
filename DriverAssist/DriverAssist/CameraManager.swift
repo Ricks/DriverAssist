@@ -5,7 +5,7 @@
 //  Created by Rick Clark on 7/20/26.
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreVideo
 import os
 import Photos
@@ -43,14 +43,13 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// Whether `.standard` video stabilization is applied to the capture connection.
     /// Published for the HUD text; toggling also updates `currentStabilizationEnabled`
-    /// below for the recording bake.
+    /// below for applying the mode to the capture connection.
     @Published private(set) var isStabilizationEnabled = false
 
     /// Current system thermal state. Published so the HUD can warn when the device
     /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
     /// sustained heat with no other visible symptom, so this is the only in-the-moment
-    /// signal that it's happening. Updates also mirror to `currentThermalState` below
-    /// for the recording bake, and are always logged (`DebugFileLogger`) regardless of
+    /// signal that it's happening. Always logged (`DebugFileLogger`) regardless of
     /// HUD visibility, to confirm after a long drive whether the current capture
     /// settings (1080p/15fps) actually stayed sustainable.
     @Published private(set) var thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
@@ -79,74 +78,32 @@ final class CameraManager: NSObject, ObservableObject {
     private var lastThermalPercentPublishTime: CFAbsoluteTime = 0
     private static let thermalPercentPublishInterval: CFAbsoluteTime = 5
 
-    /// Latest detections to bake into recorded frames. Written from the main actor
-    /// (as inference results arrive) and read from `sessionQueue` (as frames are
-    /// appended to the recording), so access is guarded by `overlayLock`.
-    nonisolated var currentDetections: [Detection] {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentDetections }
-        set { overlayLock.lock(); _currentDetections = newValue; overlayLock.unlock() }
-    }
-
-    /// Current model label ("small"/"nano") to bake into recorded frames, mirroring
-    /// `ModelManager.selectedModel` (owned there, synced in from the main actor).
-    nonisolated var currentModelLabel: String {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentModelLabel }
-        set { overlayLock.lock(); _currentModelLabel = newValue; overlayLock.unlock() }
-    }
-
     /// Nonisolated mirror of `isLowLightBoostEnabled`, readable from `sessionQueue`
-    /// while baking the recording overlay.
+    /// while sampling ambient luminance for auto low-light.
     private nonisolated var currentLowLightEnabled: Bool {
         get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentLowLightEnabled }
         set { overlayLock.lock(); _currentLowLightEnabled = newValue; overlayLock.unlock() }
     }
 
     /// Nonisolated mirror of `isAutoLowLightEnabled`, readable from `sessionQueue`
-    /// while baking the recording overlay.
+    /// while sampling ambient luminance for auto low-light.
     private nonisolated var currentAutoLowLightEnabled: Bool {
         get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentAutoLowLightEnabled }
         set { overlayLock.lock(); _currentAutoLowLightEnabled = newValue; overlayLock.unlock() }
     }
 
-    /// Current two-pass-detection state ("two-pass on/off") to bake into recorded
-    /// frames, mirroring `InferenceEngine.isTwoPassEnabled` (owned there, synced in
-    /// from the main actor).
-    nonisolated var currentTwoPassEnabled: Bool {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentTwoPassEnabled }
-        set { overlayLock.lock(); _currentTwoPassEnabled = newValue; overlayLock.unlock() }
-    }
-
     /// Nonisolated mirror of `isStabilizationEnabled`, readable from `sessionQueue`
-    /// while baking the recording overlay (and while applying the mode to the
-    /// capture connection in `configure()`/`applyStabilizationMode`).
+    /// while applying the mode to the capture connection in
+    /// `configure()`/`applyStabilizationMode`.
     nonisolated var currentStabilizationEnabled: Bool {
         get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentStabilizationEnabled }
         set { overlayLock.lock(); _currentStabilizationEnabled = newValue; overlayLock.unlock() }
     }
 
-    /// Nonisolated mirror of `thermalState`, readable from `sessionQueue` while
-    /// baking the recording overlay.
-    nonisolated var currentThermalState: ProcessInfo.ThermalState {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentThermalState }
-        set { overlayLock.lock(); _currentThermalState = newValue; overlayLock.unlock() }
-    }
-
-    /// Nonisolated mirror of `thermalSpeedPercent`, readable from `sessionQueue`
-    /// while baking the recording overlay.
-    nonisolated var currentThermalSpeedPercent: Int {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentThermalSpeedPercent }
-        set { overlayLock.lock(); _currentThermalSpeedPercent = newValue; overlayLock.unlock() }
-    }
-
     private let overlayLock = NSLock()
-    private nonisolated(unsafe) var _currentDetections: [Detection] = []
-    private nonisolated(unsafe) var _currentModelLabel: String = ""
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
-    private nonisolated(unsafe) var _currentTwoPassEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
-    private nonisolated(unsafe) var _currentThermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
-    private nonisolated(unsafe) var _currentThermalSpeedPercent: Int = 100
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -543,8 +500,8 @@ final class CameraManager: NSObject, ObservableObject {
             let rowStart = y * bytesPerRow
             var x = 0
             while x < width {
-                // BGRA byte order in memory (premultipliedFirst + byteOrder32Little),
-                // matching the convention used throughout compositeOverlay.
+                // BGRA byte order in memory (premultipliedFirst + byteOrder32Little) —
+                // matches the pixel format requested for the video output.
                 let offset = rowStart + x * 4
                 total += Int(buffer[offset]) + Int(buffer[offset + 1]) + Int(buffer[offset + 2])
                 count += 1
@@ -705,7 +662,6 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private nonisolated func handleThermalStateChange(_ state: ProcessInfo.ThermalState, context: String) {
-        currentThermalState = state
         DebugFileLogger.log("thermal: \(context) state=\(Self.thermalStateName(state))")
         Task { @MainActor [weak self] in
             self?.thermalState = state
@@ -721,8 +677,18 @@ final class CameraManager: NSObject, ObservableObject {
 
         if thermalBaselineConfigKey != configKey {
             thermalBaselineConfigKey = configKey
-            thermalBaselineElapsedMs = nil
-            thermalCurrentElapsedMs = nil
+            // Seed immediately instead of clearing to nil — a config change made
+            // while already non-nominal must not strand the baseline forever,
+            // since it can only refill below while `.nominal`, and a real drive
+            // proved thermal state can climb straight to `.critical` and never
+            // come back down. That drive's percent froze at a stale, falsely
+            // reassuring reading for the rest of the trip because of exactly
+            // this gap. A baseline seeded mid-throttle is provisional (it'll
+            // read closer to 100% than it should until real `.nominal` samples
+            // refine it below), but a provisional number that keeps updating
+            // beats one that's frozen and wrong.
+            thermalBaselineElapsedMs = elapsedMs
+            thermalCurrentElapsedMs = elapsedMs
             // Force the next available reading to publish immediately rather than
             // waiting up to 5s under what's now a stale reading for the old config.
             lastThermalPercentPublishTime = 0
@@ -763,7 +729,6 @@ final class CameraManager: NSObject, ObservableObject {
 
         let percent = min(100, max(0, Int((baseline / current * 100).rounded())))
         thermalSpeedPercent = percent
-        currentThermalSpeedPercent = percent
 
         // Logged at the same throttled cadence as the publish itself (not every
         // frame) so a multi-minute drive doesn't flood the file — but with the raw
@@ -1149,114 +1114,29 @@ final class CameraManager: NSObject, ObservableObject {
             }
             writer.startSession(atSourceTime: presentationTime)
             setRecordingActive(true)
+            // Precise anchor between this recording's internal (session-relative)
+            // frame timestamps and wall-clock epoch time — `presentationTime`
+            // becomes the movie's own t=0, so any frame's later PTS (as read back
+            // from the file) plus this logged epoch gives that frame's real epoch
+            // time. Offline reconstruction uses this instead of the recording
+            // filename's whole-second precision, and instead of assuming a
+            // constant frame rate (which would drift under dropped frames).
+            DebugFileLogger.log("recording-start: file=\(writer.outputURL.lastPathComponent) epoch=\(Date().timeIntervalSince1970)")
         }
 
         guard
             let input = assetWriterInput,
             let adaptor = pixelBufferAdaptor,
-            input.isReadyForMoreMediaData,
-            let pool = adaptor.pixelBufferPool
+            input.isReadyForMoreMediaData
         else { return }
 
-        var outputBuffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outputBuffer)
-        guard let outputBuffer else { return }
-
-        compositeOverlay(
-            from: pixelBuffer,
-            into: outputBuffer,
-            detections: currentDetections,
-            modelLabel: currentModelLabel,
-            lowLightEnabled: currentLowLightEnabled,
-            autoLowLightEnabled: currentAutoLowLightEnabled,
-            twoPassEnabled: currentTwoPassEnabled,
-            stabilizationEnabled: currentStabilizationEnabled,
-            thermalState: currentThermalState
-        )
-        adaptor.append(outputBuffer, withPresentationTime: presentationTime)
-    }
-
-    private nonisolated func compositeOverlay(
-        from source: CVPixelBuffer,
-        into destination: CVPixelBuffer,
-        detections: [Detection],
-        modelLabel: String,
-        lowLightEnabled: Bool,
-        autoLowLightEnabled: Bool,
-        twoPassEnabled: Bool,
-        stabilizationEnabled: Bool,
-        thermalState: ProcessInfo.ThermalState
-    ) {
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(destination, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(source, .readOnly)
-            CVPixelBufferUnlockBaseAddress(destination, [])
-        }
-
-        guard
-            let srcBase = CVPixelBufferGetBaseAddress(source),
-            let dstBase = CVPixelBufferGetBaseAddress(destination)
-        else { return }
-
-        let width          = CVPixelBufferGetWidth(destination)
-        let dstHeight      = CVPixelBufferGetHeight(destination)
-        let srcHeight      = CVPixelBufferGetHeight(source)
-        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
-        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)
-
-        // `source` and `destination` come from independent allocations (the live
-        // camera frame vs. the writer's pixel buffer pool) and aren't guaranteed to
-        // match — e.g. right after backgrounding starts a fresh writer/pool, its
-        // buffer can differ slightly from the incoming frame. When they don't match,
-        // clear the destination first: `destination` comes from a recycled pool, so
-        // otherwise the copy below (clamped to the smaller of the two, to avoid
-        // reading past the end of whichever buffer is shorter) only overwrites part
-        // of it and leaves a previous frame's pixels — HUD and all — sitting in the
-        // rest, which is what made a recording look like it had split into two
-        // frames stacked on top of each other.
-        if srcHeight != dstHeight || srcBytesPerRow != dstBytesPerRow {
-            memset(dstBase, 0, dstBytesPerRow * dstHeight)
-        }
-
-        let height   = min(srcHeight, dstHeight)
-        let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
-
-        for row in 0..<height {
-            memcpy(dstBase.advanced(by: row * dstBytesPerRow), srcBase.advanced(by: row * srcBytesPerRow), rowBytes)
-        }
-
-        guard let context = CGContext(
-            data: dstBase,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: dstBytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        ) else { return }
-
-        // Flip to a top-left origin so it matches Detection.boundingBox's convention
-        // (and matches UIKit's coordinate space for the label text drawn below).
-        context.translateBy(x: 0, y: CGFloat(height))
-        context.scaleBy(x: 1, y: -1)
-
-        let size = CGSize(width: width, height: height)
-        OverlayRenderer.draw(detections, in: context, size: size)
-        let blinkOn = Self.thermalBlinkOn()
-        let thermalStateText = thermalState == .nominal ? "OK" : Self.thermalStateName(thermalState).uppercased()
-        let thermalText = "thermal: \(thermalStateText) \(currentThermalSpeedPercent)%"
-        OverlayRenderer.drawHUD(
-            modelLabel: modelLabel,
-            lowLightEnabled: lowLightEnabled,
-            autoLowLightEnabled: autoLowLightEnabled,
-            twoPassEnabled: twoPassEnabled,
-            stabilizationEnabled: stabilizationEnabled,
-            thermalText: thermalText,
-            thermalColor: Self.thermalColor(for: thermalState, blinkOn: blinkOn),
-            in: context,
-            size: size
-        )
+        // Recorded straight from the camera with no compositing step — the overlay
+        // is now reconstructed offline (from `detections.jsonl` + the debug log)
+        // rather than baked in, so recordings can be compared directly against a
+        // reference model without the drawn boxes/HUD contaminating that frame.
+        // This also means one fewer pixel-buffer-pool allocation and CGContext
+        // draw per frame versus the old bake-in-place approach.
+        adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
     }
 }
 

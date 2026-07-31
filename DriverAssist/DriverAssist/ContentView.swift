@@ -125,15 +125,6 @@ struct InferenceView: View {
                     }
                 }
         )
-        .onChange(of: inferenceEngine.detections) { _, newDetections in
-            cameraManager.currentDetections = newDetections
-        }
-        .onChange(of: modelManager.selectedModel) { _, _ in
-            cameraManager.currentModelLabel = modelLabel
-        }
-        .onChange(of: inferenceEngine.isTwoPassEnabled) { _, newValue in
-            cameraManager.currentTwoPassEnabled = newValue
-        }
         .onChange(of: inferenceEngine.lastFrameElapsedMs) { _, newValue in
             let configKey = "\(modelManager.selectedModel.rawValue)|\(inferenceEngine.isTwoPassEnabled)"
             cameraManager.recordInferenceLatency(newValue, configKey: configKey)
@@ -149,6 +140,7 @@ struct InferenceView: View {
         }
         .onAppear {
             DebugFileLogger.reset()
+            DetectionLogger.reset()
             // Keeps the screen (and thus the camera/recording) awake for the whole
             // drive instead of auto-locking after the idle timeout.
             UIApplication.shared.isIdleTimerDisabled = true
@@ -158,10 +150,13 @@ struct InferenceView: View {
             batteryLevel = UIDevice.current.batteryLevel
             batteryState = UIDevice.current.batteryState
             modelManager.loadInitialModel()
-            cameraManager.currentModelLabel = modelLabel
-            cameraManager.currentTwoPassEnabled = inferenceEngine.isTwoPassEnabled
-            cameraManager.onFrame = { [weak inferenceEngine] pixelBuffer in
-                inferenceEngine?.process(pixelBuffer: pixelBuffer)
+            cameraManager.onFrame = { [weak inferenceEngine, weak cameraManager] pixelBuffer in
+                inferenceEngine?.process(
+                    pixelBuffer: pixelBuffer,
+                    lowLightEnabled: cameraManager?.isLowLightBoostEnabled ?? false,
+                    autoLowLightEnabled: cameraManager?.isAutoLowLightEnabled ?? true,
+                    stabilizationEnabled: cameraManager?.isStabilizationEnabled ?? false
+                )
             }
             cameraManager.start()
             voiceCommandManager.onCommand = { [weak modelManager, weak cameraManager, weak inferenceEngine] command in

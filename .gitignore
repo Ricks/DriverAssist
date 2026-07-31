@@ -39,3 +39,9 @@ runs/
 
 # Recorded video clips (dev testing / dashcam output) — large binaries, not code
 *.mov
+
+# Packaged session data (raw + annotated recordings, detections/logs, benchmarks)
+/data/
+
+# Pulled device logs (regenerable via tools/pull_logs.sh)
+/logs/
