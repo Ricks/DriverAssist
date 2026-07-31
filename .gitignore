@@ -45,3 +45,8 @@ runs/
 
 # Pulled device logs (regenerable via tools/pull_logs.sh)
 /logs/
+
+# Stock pretrained YOLO checkpoints (unused .pt originals + benchmark.py's reference
+# model) -- not referenced by the app (which bundles the converted .mlpackage files
+# instead) or any checked-in conversion script; auto-downloadable via ultralytics
+/*.pt
