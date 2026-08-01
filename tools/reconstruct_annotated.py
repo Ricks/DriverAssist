@@ -37,6 +37,7 @@ from driverassist_sync import (
     nearest_at_or_before,
     resolve_start_epoch,
 )
+from tracker import DEFAULT_REID_MODEL, ByteTracker, build_reid_encoder
 
 # BGR (OpenCV convention) approximations of the on-device box colors — these
 # don't need to be pixel-identical to iOS's system colors, just visually
@@ -60,13 +61,14 @@ HUD_RED_BGR = (0, 0, 255)
 TOP_ROW_Y = 70
 
 
-def draw_box(frame, det: dict) -> None:
+def draw_box(frame, det: dict, track_id=None) -> None:
     h, w = frame.shape[:2]
     x, y = int(det["x"] * w), int(det["y"] * h)
     bw, bh = int(det["w"] * w), int(det["h"] * h)
     color = BOX_COLORS_BGR.get(det["label"], DEFAULT_BOX_COLOR_BGR)
     cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-    label = f"{det['label']} {int(det['confidence'] * 100)}%"
+    id_prefix = f"#{track_id} " if track_id is not None else ""
+    label = f"{id_prefix}{det['label']} {int(det['confidence'] * 100)}%"
     cv2.putText(frame, label, (x + 4, y + 18), cv2.FONT_HERSHEY_DUPLEX, 0.6, color, 1, cv2.LINE_AA)
 
 
@@ -118,6 +120,18 @@ def main() -> None:
         help=f"overlay-debug.log, or a directory of them, for sync + the thermal HUD line (default: {DEFAULT_LOGS_DIR})",
     )
     parser.add_argument("--output", type=Path, default=None, help="Defaults to <video>-annotated.mp4")
+    parser.add_argument(
+        "--reid", dest="reid", action="store_true", default=True,
+        help="Use appearance/ReID matching in the tracker, in addition to motion/IoU (default: on)",
+    )
+    parser.add_argument("--no-reid", dest="reid", action="store_false", help="Geometry-only tracking")
+    parser.add_argument("--reid-model", default=DEFAULT_REID_MODEL)
+    parser.add_argument("--reid-device", default="mps")
+    parser.add_argument(
+        "--gmc", dest="gmc", action="store_true", default=False,
+        help="Compensate track predictions for estimated camera motion (see gmc.py). Off by default -- experimental.",
+    )
+    parser.add_argument("--no-gmc", dest="gmc", action="store_false")
     args = parser.parse_args()
 
     output = args.output or args.video.with_name(args.video.stem + "-annotated.mp4")
@@ -126,7 +140,10 @@ def main() -> None:
 
     start_epoch, thermal_log_path = resolve_start_epoch(args.video, args.debug_log)
     detections = load_detections(args.detections)
-    det_keys = build_key_index(detections, lambda e: e["t"])
+
+    reid_encoder = build_reid_encoder(args.reid_model, device=args.reid_device) if args.reid else None
+    tracker = ByteTracker(reid_encoder=reid_encoder, use_gmc=args.gmc)
+
     thermal = load_thermal(thermal_log_path)
     thermal_keys = build_key_index(thermal, lambda e: e[0])
 
@@ -141,6 +158,19 @@ def main() -> None:
     if not writer.isOpened():
         sys.exit(f"Couldn't open {output} for writing")
 
+    # Tracking runs inline with this same sequential decode, not as a separate
+    # seek-based pre-pass -- a pre-pass that re-seeks the video once per
+    # detection entry (rather than once per raw frame here) turned out to
+    # cost 30-40x more per lookup than a plain sequential read (measured: a
+    # 5-6x slowdown overall on a real session), because OpenCV/ffmpeg must
+    # decode forward from the nearest keyframe on every arbitrary seek. Each
+    # entry is instead fed to the tracker using whichever already-decoded
+    # frame is current when that entry's own timestamp is first reached --
+    # entries land close enough to this video's own frame rate that this is
+    # a fine approximation of the frame the entry actually corresponds to.
+    next_idx = 0
+    current_entry, current_track_ids = None, []
+
     i = 0
     while True:
         ok, frame = cap.read()
@@ -152,12 +182,16 @@ def main() -> None:
         # any frames were ever dropped or timing wasn't perfectly steady.
         frame_epoch = start_epoch + cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
 
-        entry = nearest_at_or_before(detections, det_keys, frame_epoch)
-        if entry is not None:
-            for det in entry["detections"]:
-                draw_box(frame, det)
+        while next_idx < len(detections) and detections[next_idx]["t"] <= frame_epoch:
+            current_entry = detections[next_idx]
+            current_track_ids = tracker.update(current_entry["detections"], frame=frame)
+            next_idx += 1
+
+        if current_entry is not None:
+            for det, track_id in zip(current_entry["detections"], current_track_ids):
+                draw_box(frame, det, track_id)
             thermal_entry = nearest_at_or_before(thermal, thermal_keys, frame_epoch)
-            draw_hud(frame, entry, thermal_entry)
+            draw_hud(frame, current_entry, thermal_entry)
 
         writer.write(frame)
         i += 1

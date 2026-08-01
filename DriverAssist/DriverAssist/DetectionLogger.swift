@@ -20,6 +20,14 @@ struct DetectionLogEntry: Codable {
         let y: Double
         let w: Double
         let h: Double
+        // The on-device ByteTracker's actual live-assigned identity for this
+        // box (nil for a low-confidence detection that matched nothing) —
+        // logged so a drive's *real* tracking output can be compared offline
+        // against tools/tracker.py's from-scratch recomputation on the same
+        // raw detections, not just assumed to match it. Not comparable
+        // across drives/app launches — IDs are only stable within one
+        // continuous run of the tracker.
+        let trackID: Int?
     }
 
     let t: Double
@@ -29,6 +37,22 @@ struct DetectionLogEntry: Codable {
     let lowLightEnabled: Bool
     let autoLowLightEnabled: Bool
     let stabilizationEnabled: Bool
+    // Which TrackingLevel was active for this entry -- mirrors `model`/
+    // `twoPass` in being per-entry, since this can change mid-drive too.
+    let trackingLevel: String
+    // Wall-clock cost of trackingManager.track(...) (Kalman predict/update,
+    // GMC, Hungarian assignment) -- NOT included in elapsedMs above, which is
+    // captured before tracking runs. Logged separately since this is the
+    // number that actually answers "what does tracking/GMC cost", which
+    // elapsedMs alone can't.
+    let trackingElapsedMs: Double
+    // GMC's per-frame quality signal (see GMCStats) -- nil when GMC didn't
+    // run this frame (disabled, no live tracks yet, or the very first frame).
+    // Logged so degraded correspondence/inlier counts on low-texture footage
+    // (e.g. at night) show up as data instead of a visual guess from playback.
+    let gmcCorrespondenceCount: Int?
+    let gmcInlierCount: Int?
+    let gmcElapsedMs: Double?
     let detections: [Box]
 }
 
@@ -62,6 +86,9 @@ enum DetectionLogger {
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         stabilizationEnabled: Bool,
+        trackingLevel: String,
+        trackingElapsedMs: Double,
+        gmcStats: GMCStats?,
         detections: [Detection]
     ) {
         let entry = DetectionLogEntry(
@@ -72,6 +99,11 @@ enum DetectionLogger {
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
             stabilizationEnabled: stabilizationEnabled,
+            trackingLevel: trackingLevel,
+            trackingElapsedMs: trackingElapsedMs,
+            gmcCorrespondenceCount: gmcStats?.correspondenceCount,
+            gmcInlierCount: gmcStats?.inlierCount,
+            gmcElapsedMs: gmcStats?.elapsedMs,
             detections: detections.map {
                 DetectionLogEntry.Box(
                     label: $0.label,
@@ -79,7 +111,8 @@ enum DetectionLogger {
                     x: $0.boundingBox.minX,
                     y: $0.boundingBox.minY,
                     w: $0.boundingBox.width,
-                    h: $0.boundingBox.height
+                    h: $0.boundingBox.height,
+                    trackID: $0.trackID
                 )
             }
         )

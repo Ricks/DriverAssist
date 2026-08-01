@@ -212,12 +212,15 @@ final class InferenceEngine: ObservableObject {
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
     @Published private(set) var isTwoPassEnabled = true
-    /// Wall-clock time the most recently completed frame took to run through the
-    /// decoder, in ms — feeds `CameraManager.recordInferenceLatency` for the
-    /// thermal "% of full speed" metric.
+    /// Wall-clock time the most recently completed frame took end to end --
+    /// decoder inference plus tracking/GMC (see `finishSuccess`), in ms —
+    /// feeds `CameraManager.recordInferenceLatency` for the thermal "% of
+    /// full speed" metric. Includes tracking so GMC's real cost shows up in
+    /// that number instead of silently going uncounted.
     @Published private(set) var lastFrameElapsedMs: Double = 0
 
     private let modelManager: ModelManager
+    let trackingManager: TrackingManager
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
     private var isBusy = false
@@ -225,8 +228,9 @@ final class InferenceEngine: ObservableObject {
 
     private static let twoPassDefaultsKey = "settings.twoPassEnabled"
 
-    init(modelManager: ModelManager) {
+    init(modelManager: ModelManager, trackingManager: TrackingManager) {
         self.modelManager = modelManager
+        self.trackingManager = trackingManager
         let defaults = UserDefaults.standard
         if defaults.object(forKey: Self.twoPassDefaultsKey) != nil {
             isTwoPassEnabled = defaults.bool(forKey: Self.twoPassDefaultsKey)
@@ -278,6 +282,7 @@ final class InferenceEngine: ObservableObject {
                 Task { @MainActor [weak self] in
                     self?.finishSuccess(
                         detections,
+                        pixelBuffer: pixelBufferBox.value,
                         elapsedMs: elapsedMs,
                         modelLabel: modelLabel,
                         twoPass: twoPass,
@@ -296,6 +301,7 @@ final class InferenceEngine: ObservableObject {
 
     private func finishSuccess(
         _ detections: [Detection],
+        pixelBuffer: CVPixelBuffer,
         elapsedMs: Double,
         modelLabel: String,
         twoPass: Bool,
@@ -303,10 +309,13 @@ final class InferenceEngine: ObservableObject {
         autoLowLightEnabled: Bool,
         stabilizationEnabled: Bool
     ) {
-        self.detections = detections
+        let trackingStart = CFAbsoluteTimeGetCurrent()
+        let result = trackingManager.track(detections, pixelBuffer: pixelBuffer)
+        let trackingElapsedMs = (CFAbsoluteTimeGetCurrent() - trackingStart) * 1000
+        self.detections = result.detections
         self.lastError = nil
         self.isBusy = false
-        self.lastFrameElapsedMs = elapsedMs
+        self.lastFrameElapsedMs = elapsedMs + trackingElapsedMs
         DetectionLogger.log(
             timestamp: Date().timeIntervalSince1970,
             model: modelLabel,
@@ -315,7 +324,10 @@ final class InferenceEngine: ObservableObject {
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
             stabilizationEnabled: stabilizationEnabled,
-            detections: detections
+            trackingLevel: trackingManager.trackingLevel.rawValue,
+            trackingElapsedMs: trackingElapsedMs,
+            gmcStats: result.gmcStats,
+            detections: result.detections
         )
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {

@@ -46,7 +46,9 @@ struct InferenceView: View {
 
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
-        _inferenceEngine  = StateObject(wrappedValue: InferenceEngine(modelManager: modelManager))
+        _inferenceEngine  = StateObject(
+            wrappedValue: InferenceEngine(modelManager: modelManager, trackingManager: TrackingManager())
+        )
     }
 
     var body: some View {

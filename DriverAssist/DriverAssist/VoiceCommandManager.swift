@@ -12,6 +12,13 @@ import UIKit
 /// Listens continuously for a fixed set of spoken commands ("small", "nano", "medium",
 /// "low light on", "low light off", "low light auto", "two pass on", "two pass off",
 /// "stabilization on", "stabilization off") and reports them via `onCommand`.
+///
+/// No tracking-level command (e.g. "tracking normal"/"tracking high") for now --
+/// TrackingLevel.appearance is a no-op stub until a real on-device ReID model is
+/// integrated (see AppearanceEmbedder.swift), so exposing a choice between it and
+/// .recovery would present a fake distinction as a real one. The app always runs
+/// .recovery; TrackingManager's setTrackingLevel(_:) stays available in code for
+/// whenever that changes.
 @MainActor
 final class VoiceCommandManager: NSObject, ObservableObject {
     enum Command: Equatable {

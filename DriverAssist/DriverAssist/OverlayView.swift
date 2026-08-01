@@ -40,8 +40,9 @@ struct OverlayView: View {
         path.addRect(box)
         context.stroke(path, with: .color(color), lineWidth: 2)
 
-        let pct   = Int(detection.confidence * 100)
-        let label = Text("\(detection.label) \(pct)%")
+        let pct = Int(detection.confidence * 100)
+        let idPrefix = detection.trackID.map { "#\($0) " } ?? ""
+        let label = Text("\(idPrefix)\(detection.label) \(pct)%")
             .font(.system(size: 18, weight: .bold))
             .foregroundStyle(color)
         context.draw(label, at: CGPoint(x: box.minX + 4, y: box.minY + 2), anchor: .topLeading)
