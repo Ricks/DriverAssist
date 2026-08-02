@@ -221,6 +221,8 @@ final class InferenceEngine: ObservableObject {
 
     private let modelManager: ModelManager
     let trackingManager: TrackingManager
+    let egoSpeedManager: EgoSpeedManager
+    let pitchSensor: PitchSensor
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
     private var isBusy = false
@@ -228,9 +230,11 @@ final class InferenceEngine: ObservableObject {
 
     private static let twoPassDefaultsKey = "settings.twoPassEnabled"
 
-    init(modelManager: ModelManager, trackingManager: TrackingManager) {
+    init(modelManager: ModelManager, trackingManager: TrackingManager, egoSpeedManager: EgoSpeedManager, pitchSensor: PitchSensor) {
         self.modelManager = modelManager
         self.trackingManager = trackingManager
+        self.egoSpeedManager = egoSpeedManager
+        self.pitchSensor = pitchSensor
         let defaults = UserDefaults.standard
         if defaults.object(forKey: Self.twoPassDefaultsKey) != nil {
             isTwoPassEnabled = defaults.bool(forKey: Self.twoPassDefaultsKey)
@@ -327,6 +331,10 @@ final class InferenceEngine: ObservableObject {
             trackingLevel: trackingManager.trackingLevel.rawValue,
             trackingElapsedMs: trackingElapsedMs,
             gmcStats: result.gmcStats,
+            egoSpeedMps: egoSpeedManager.speedMps,
+            egoSpeedAccuracyMps: egoSpeedManager.speedAccuracyMps,
+            pitchDegrees: pitchSensor.pitchDegrees,
+            pitchDriftDegrees: pitchSensor.pitchDriftDegrees,
             detections: result.detections
         )
         frameCount += 1

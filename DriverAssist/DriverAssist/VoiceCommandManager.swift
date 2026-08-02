@@ -11,7 +11,8 @@ import UIKit
 
 /// Listens continuously for a fixed set of spoken commands ("small", "nano", "medium",
 /// "low light on", "low light off", "low light auto", "two pass on", "two pass off",
-/// "stabilization on", "stabilization off") and reports them via `onCommand`.
+/// "stabilization on", "stabilization off", "calibrate pitch") and reports them via
+/// `onCommand`.
 ///
 /// No tracking-level command (e.g. "tracking normal"/"tracking high") for now --
 /// TrackingLevel.appearance is a no-op stub until a real on-device ReID model is
@@ -27,6 +28,7 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         case lowLightAuto
         case twoPass(Bool)
         case stabilization(Bool)
+        case calibratePitch
     }
 
     var onCommand: ((Command) -> Void)?
@@ -232,6 +234,8 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             command = .stabilization(true)
         } else if lowered.contains("stabilization off") {
             command = .stabilization(false)
+        } else if lowered.contains("calibrate pitch") {
+            command = .calibratePitch
         } else if lowered.contains("nano") {
             command = .selectModel(.nano)
         } else if lowered.contains("medium") {

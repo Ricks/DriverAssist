@@ -47,7 +47,12 @@ struct InferenceView: View {
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         _inferenceEngine  = StateObject(
-            wrappedValue: InferenceEngine(modelManager: modelManager, trackingManager: TrackingManager())
+            wrappedValue: InferenceEngine(
+                modelManager: modelManager,
+                trackingManager: TrackingManager(),
+                egoSpeedManager: EgoSpeedManager(),
+                pitchSensor: PitchSensor()
+            )
         )
     }
 
@@ -161,6 +166,8 @@ struct InferenceView: View {
                 )
             }
             cameraManager.start()
+            inferenceEngine.egoSpeedManager.start()
+            inferenceEngine.pitchSensor.start()
             voiceCommandManager.onCommand = { [weak modelManager, weak cameraManager, weak inferenceEngine] command in
                 switch command {
                 case .selectModel(let model):
@@ -173,6 +180,8 @@ struct InferenceView: View {
                     inferenceEngine?.setTwoPassEnabled(enabled)
                 case .stabilization(let enabled):
                     cameraManager?.setStabilizationEnabled(enabled)
+                case .calibratePitch:
+                    inferenceEngine?.pitchSensor.captureReferencePitch()
                 }
             }
             voiceCommandManager.start()
@@ -183,6 +192,8 @@ struct InferenceView: View {
             UIDevice.current.isBatteryMonitoringEnabled = false
             cameraManager.stop()
             voiceCommandManager.stop()
+            inferenceEngine.egoSpeedManager.stop()
+            inferenceEngine.pitchSensor.stop()
         }
     }
 

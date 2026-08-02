@@ -24,6 +24,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>DriverAssist uses the camera to detect vehicles, pedestrians, and cyclists in the live view.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>DriverAssist uses your speed to tell whether you're actually driving, so it can avoid false alerts when you're stopped.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>DriverAssist listens for voice commands ("small", "nano", "low light on", "low light off") to control detection hands-free.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

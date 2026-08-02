@@ -53,6 +53,16 @@ struct DetectionLogEntry: Codable {
     let gmcCorrespondenceCount: Int?
     let gmcInlierCount: Int?
     let gmcElapsedMs: Double?
+    // Ego speed (GPS, m/s) and phone pitch (degrees) -- see EgoSpeedManager.swift
+    // and PitchSensor.swift. Neither is consumed by anything yet; logged now so
+    // real drive data exists once the leading-vehicle classifier and distance
+    // work actually need it. nil whenever no reading is available yet (no GPS
+    // fix, or device motion unavailable) -- not defaulted to 0, which would
+    // misrepresent "no data" as "stationary"/"level".
+    let egoSpeedMps: Double?
+    let egoSpeedAccuracyMps: Double?
+    let pitchDegrees: Double?
+    let pitchDriftDegrees: Double?
     let detections: [Box]
 }
 
@@ -89,6 +99,10 @@ enum DetectionLogger {
         trackingLevel: String,
         trackingElapsedMs: Double,
         gmcStats: GMCStats?,
+        egoSpeedMps: Double?,
+        egoSpeedAccuracyMps: Double?,
+        pitchDegrees: Double?,
+        pitchDriftDegrees: Double?,
         detections: [Detection]
     ) {
         let entry = DetectionLogEntry(
@@ -104,6 +118,10 @@ enum DetectionLogger {
             gmcCorrespondenceCount: gmcStats?.correspondenceCount,
             gmcInlierCount: gmcStats?.inlierCount,
             gmcElapsedMs: gmcStats?.elapsedMs,
+            egoSpeedMps: egoSpeedMps,
+            egoSpeedAccuracyMps: egoSpeedAccuracyMps,
+            pitchDegrees: pitchDegrees,
+            pitchDriftDegrees: pitchDriftDegrees,
             detections: detections.map {
                 DetectionLogEntry.Box(
                     label: $0.label,

@@ -1,0 +1,410 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Leading Vehicle Ground Truth Labeling</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #14161a; color: #e6e6e6;
+    font-family: -apple-system, "SF Mono", Menlo, monospace;
+    display: flex; flex-direction: column; align-items: center; padding: 16px;
+  }
+  #stage {
+    position: relative; max-width: 100%;
+  }
+  #video { display: block; max-width: 100%; background: #000; }
+  #overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
+  #controls {
+    width: 100%; max-width: 1400px; margin-top: 10px;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  }
+  button, select, input[type=number] {
+    background: #23262d; color: #e6e6e6; border: 1px solid #3a3f4a;
+    border-radius: 4px; padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { background: #2d323b; }
+  button.active { background: #5a3a7a; border-color: #8a5ac0; }
+  #status {
+    width: 100%; max-width: 1400px; margin-top: 8px;
+    display: flex; gap: 20px; font-size: 13px; color: #9aa; flex-wrap: wrap;
+  }
+  #status b { color: #e6e6e6; }
+  #timeline {
+    width: 100%; max-width: 1400px; height: 28px; margin-top: 10px;
+    background: #23262d; position: relative; border-radius: 4px; cursor: pointer;
+    border: 1px solid #3a3f4a;
+  }
+  .seg {
+    position: absolute; top: 3px; bottom: 3px; background: #cc44cc;
+    border-radius: 2px; opacity: 0.85; min-width: 2px;
+  }
+  .seg:hover { opacity: 1; outline: 1px solid #fff; }
+  .playhead {
+    position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none;
+  }
+  #saveState { transition: color 0.3s; }
+  .hint { color: #667; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="video" preload="auto"></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="controls">
+  <button id="stepBack">&larr; frame</button>
+  <button id="playRev">&#9664; reverse</button>
+  <button id="playPause">&#9654; play</button>
+  <button id="stepFwd">frame &rarr;</button>
+  <span class="hint">speed</span>
+  <select id="speed">
+    <option value="0.1">0.1x</option>
+    <option value="0.25">0.25x</option>
+    <option value="0.5">0.5x</option>
+    <option value="1" selected>1x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+    <option value="8">8x</option>
+    <option value="16">16x</option>
+  </select>
+  <span class="hint">step size (s)</span>
+  <input type="number" id="stepSize" value="0.067" step="0.001" min="0.001" style="width:70px">
+  <span class="hint">| click a box to follow it &middot; click the highlighted box to trim start/end here &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu</span>
+</div>
+
+<div id="status">
+  <span>t = <b id="curTime">0.00</b>s</span>
+  <span>frame dets: <b id="detCount">0</b></span>
+  <span>active label: <b id="activeLabel">none</b></span>
+  <span>segments: <b id="segCount">0</b></span>
+  <span id="saveState">saved</span>
+</div>
+
+<div id="timeline"></div>
+
+<script>
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const timeline = document.getElementById('timeline');
+
+let frames = [];       // [{t, detections:[{trackID,label,confidence,x,y,w,h}]}]
+let groundTruth = [];  // [{start_t, end_t|null, trackID}]
+let duration = 0;
+let saveTimer = null;
+let reverseTimer = null;
+
+const LABEL_COLORS = {
+  person: '#ffff00', bicycle: '#00ffff', motorcycle: '#00ffff',
+  car: '#00ff00', bus: '#ff3333', truck: '#ff3333',
+};
+const HIGHLIGHT_COLOR = '#ff33ff';
+
+video.src = '/video';
+
+Promise.all([
+  fetch('/api/detections').then(r => r.json()),
+  fetch('/api/ground_truth').then(r => r.json()),
+]).then(([detData, gt]) => {
+  frames = detData.frames;
+  groundTruth = gt;
+  updateStatus();
+  renderTimeline();
+});
+
+video.addEventListener('loadedmetadata', () => {
+  duration = video.duration;
+  resizeCanvas();
+  renderTimeline();
+});
+window.addEventListener('resize', resizeCanvas);
+
+function resizeCanvas() {
+  const r = video.getBoundingClientRect();
+  overlay.style.width = r.width + 'px';
+  overlay.style.height = r.height + 'px';
+  overlay.width = r.width;
+  overlay.height = r.height;
+  overlay.style.top = video.offsetTop + 'px';
+  overlay.style.left = video.offsetLeft + 'px';
+  draw();
+}
+
+// --- Binary search for the last frame with t <= currentTime ---
+function frameAt(t) {
+  if (frames.length === 0) return null;
+  let lo = 0, hi = frames.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].t <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return frames[ans];
+}
+
+function activeAssignmentAt(t) {
+  // Prefer the LATEST-starting match, not the first one found by array
+  // order -- array insertion order doesn't reliably track timeline order
+  // once assignments get created out of sequence (going back to trim/edit
+  // an earlier segment after later ones already exist), so a stale open
+  // assignment from much earlier in the video could otherwise permanently
+  // shadow every correct, newer assignment covering the same later time --
+  // the root cause of clicks appearing to silently do nothing.
+  let best = null;
+  for (const a of groundTruth) {
+    if (a.start_t <= t && (a.end_t === null || t < a.end_t)) {
+      // >= (not >): among ties on start_t, the array's later entry is the
+      // more-recently-created one (new assignments are always appended),
+      // so it should win, not lose to whichever happened to be visited first.
+      if (!best || a.start_t >= best.start_t) best = a;
+    }
+  }
+  return best;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  const f = frameAt(video.currentTime);
+  if (!f) { updateStatus(f); return; }
+  const active = activeAssignmentAt(video.currentTime);
+  const w = overlay.width, h = overlay.height;
+
+  for (const d of f.detections) {
+    const isActive = active && d.trackID === active.trackID;
+    const color = isActive ? HIGHLIGHT_COLOR : (LABEL_COLORS[d.label] || '#ffffff');
+    const x = d.x * w, y = d.y * h, bw = d.w * w, bh = d.h * h;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isActive ? 4 : 2;
+    ctx.strokeRect(x, y, bw, bh);
+    if (isActive) {
+      ctx.fillStyle = HIGHLIGHT_COLOR + '55';
+      ctx.fillRect(x, y, bw, bh);
+    }
+    ctx.fillStyle = color;
+    ctx.font = '13px monospace';
+    ctx.fillText(`#${d.trackID} ${d.label} ${Math.round(d.confidence*100)}%`, x + 3, y > 14 ? y - 4 : y + bh + 14);
+  }
+  updateStatus(f, active);
+  renderPlayhead();
+}
+
+function updateStatus(f, active) {
+  document.getElementById('curTime').textContent = video.currentTime.toFixed(2);
+  document.getElementById('detCount').textContent = f ? f.detections.length : 0;
+  document.getElementById('activeLabel').textContent = active ? ('#' + active.trackID) : 'none';
+  document.getElementById('segCount').textContent = groundTruth.length;
+}
+
+// --- Click to add / trim / delete ---
+overlay.addEventListener('click', (e) => {
+  // Dismiss any stale trim menu, but don't swallow the click -- it should
+  // still act on whatever box is under the cursor in the same click. (The
+  // menu's own buttons live outside #overlay in the DOM, so clicks on them
+  // never reach this listener at all -- this only ever fires for clicks on
+  // the video/overlay itself.) Previously this returned early on any click
+  // while a menu was open, which meant a leftover menu silently ate the
+  // next click entirely -- the real cause of "takes two clicks" reports.
+  hideTrimMenu();
+
+  const rect = overlay.getBoundingClientRect();
+  // Pixel space, not normalized -- a fixed padding/tolerance in normalized
+  // coordinates shrinks to almost nothing on screen for small/distant
+  // vehicles (found via real failure reports: a 1.3%x1.6%-of-frame box was
+  // simply too small a target to hit at the old 0.03 normalized tolerance).
+  // Padding in actual pixels keeps small boxes comfortably clickable
+  // regardless of the video's displayed zoom level.
+  const px = e.clientX - rect.left, py = e.clientY - rect.top;
+  const PAD_PX = 10, FALLBACK_PX = 25;
+  const f = frameAt(video.currentTime);
+  if (!f) return;
+
+  // Prefer smallest-area box (padded) containing the click; fall back to
+  // nearest center within a pixel-space tolerance.
+  let best = null, bestArea = Infinity;
+  for (const d of f.detections) {
+    const bx = d.x * rect.width, by = d.y * rect.height;
+    const bw = d.w * rect.width, bh = d.h * rect.height;
+    if (px >= bx - PAD_PX && px <= bx + bw + PAD_PX && py >= by - PAD_PX && py <= by + bh + PAD_PX) {
+      const area = bw * bh;
+      if (area < bestArea) { bestArea = area; best = d; }
+    }
+  }
+  if (!best) {
+    let bestDist = FALLBACK_PX;
+    for (const d of f.detections) {
+      const cx = (d.x + d.w / 2) * rect.width, cy = (d.y + d.h / 2) * rect.height;
+      const dist = Math.hypot(px - cx, py - cy);
+      if (dist < bestDist) { bestDist = dist; best = d; }
+    }
+  }
+  if (!best) return;
+
+  const t = video.currentTime;
+  const active = activeAssignmentAt(t);
+
+  if (active && active.trackID === best.trackID) {
+    // Clicked the currently-highlighted box: offer to trim from either end,
+    // frame-by-frame -- "this car's now too far / changed lanes" (trim end)
+    // or "I started following it too early" (trim start).
+    showTrimMenu(e.clientX, e.clientY, active, t);
+  } else {
+    // Clicked a different box: implicitly end any open assignment now, start a new one.
+    if (active && active.end_t === null) active.end_t = t;
+    groundTruth.push({ start_t: t, end_t: null, trackID: best.trackID });
+    scheduleSave();
+    draw();
+    renderTimeline();
+  }
+});
+
+// --- Trim menu: appears at the click point when clicking the currently-
+// highlighted box, offering to cut the segment from either end at the
+// current frame. Snipping a boundary past the other one removes the
+// segment entirely rather than leaving something inverted/empty.
+let trimMenuEl = null;
+
+function showTrimMenu(clientX, clientY, assignment, t) {
+  hideTrimMenu();
+  trimMenuEl = document.createElement('div');
+  trimMenuEl.style.cssText = `position:fixed; left:${clientX}px; top:${clientY}px; ` +
+    `background:#23262d; border:1px solid #8a5ac0; border-radius:6px; padding:6px; ` +
+    `z-index:1000; display:flex; gap:6px; font:13px monospace;`;
+
+  const mkBtn = (label, fn) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.style.cssText = 'background:#2d323b; color:#e6e6e6; border:1px solid #3a3f4a; border-radius:4px; padding:5px 8px; cursor:pointer; font:inherit;';
+    b.onclick = () => { fn(); hideTrimMenu(); };
+    return b;
+  };
+
+  trimMenuEl.appendChild(mkBtn('◀ trim start', () => {
+    if (assignment.end_t !== null && t >= assignment.end_t) {
+      groundTruth = groundTruth.filter(a => a !== assignment);
+    } else {
+      assignment.start_t = t;
+    }
+    scheduleSave(); draw(); renderTimeline();
+  }));
+  trimMenuEl.appendChild(mkBtn('trim end ▶', () => {
+    if (t <= assignment.start_t) {
+      groundTruth = groundTruth.filter(a => a !== assignment);
+    } else {
+      assignment.end_t = t;
+    }
+    scheduleSave(); draw(); renderTimeline();
+  }));
+
+  document.body.appendChild(trimMenuEl);
+}
+
+function hideTrimMenu() {
+  if (trimMenuEl) { trimMenuEl.remove(); trimMenuEl = null; }
+}
+
+function scheduleSave() {
+  document.getElementById('saveState').textContent = 'saving...';
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fetch('/api/ground_truth', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(groundTruth),
+    }).then(() => { document.getElementById('saveState').textContent = 'saved'; });
+  }, 400);
+}
+
+// --- Timeline strip ---
+function renderTimeline() {
+  timeline.querySelectorAll('.seg').forEach(el => el.remove());
+  if (!duration) return;
+  for (const a of groundTruth) {
+    const end = a.end_t === null ? duration : a.end_t;
+    const el = document.createElement('div');
+    el.className = 'seg';
+    el.style.left = (a.start_t / duration * 100) + '%';
+    el.style.width = Math.max(0.15, (end - a.start_t) / duration * 100) + '%';
+    el.title = `#${a.trackID}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}`;
+    timeline.appendChild(el);
+  }
+}
+let playhead = null;
+function renderPlayhead() {
+  if (!duration) return;
+  if (!playhead) { playhead = document.createElement('div'); playhead.className = 'playhead'; timeline.appendChild(playhead); }
+  playhead.style.left = (video.currentTime / duration * 100) + '%';
+}
+timeline.addEventListener('click', (e) => {
+  if (!duration) return;
+  const rect = timeline.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  seekTo(frac * duration);
+});
+
+// --- Playback / stepping ---
+function seekTo(t) {
+  video.currentTime = Math.max(0, Math.min(duration || Infinity, t));
+}
+video.addEventListener('timeupdate', draw);
+video.addEventListener('seeked', draw);
+
+document.getElementById('stepSize').addEventListener('change', () => {});
+function stepSize() { return parseFloat(document.getElementById('stepSize').value) || 0.067; }
+
+document.getElementById('stepFwd').addEventListener('click', () => {
+  video.pause(); stopReverse(); setPlayPauseLabel();
+  seekTo(video.currentTime + stepSize());
+});
+document.getElementById('stepBack').addEventListener('click', () => {
+  video.pause(); stopReverse(); setPlayPauseLabel();
+  seekTo(video.currentTime - stepSize());
+});
+
+document.getElementById('speed').addEventListener('change', (e) => {
+  video.playbackRate = parseFloat(e.target.value);
+});
+
+const playPauseBtn = document.getElementById('playPause');
+playPauseBtn.addEventListener('click', () => {
+  stopReverse();
+  if (video.paused) { video.play(); } else { video.pause(); }
+  setPlayPauseLabel();
+});
+video.addEventListener('play', setPlayPauseLabel);
+video.addEventListener('pause', setPlayPauseLabel);
+function setPlayPauseLabel() {
+  playPauseBtn.textContent = video.paused ? '▶ play' : '⏸ pause';
+}
+
+// Reverse playback: browsers don't support negative playbackRate reliably,
+// so this simulates it with a timer decrementing currentTime -- not
+// hardware-decoded reverse, but smooth enough for scrubbing back through footage.
+const reverseBtn = document.getElementById('playRev');
+reverseBtn.addEventListener('click', () => {
+  if (reverseTimer) { stopReverse(); return; }
+  video.pause();
+  const rate = parseFloat(document.getElementById('speed').value);
+  reverseBtn.classList.add('active');
+  reverseTimer = setInterval(() => {
+    const next = video.currentTime - rate * 0.05;
+    if (next <= 0) { seekTo(0); stopReverse(); return; }
+    seekTo(next);
+  }, 50);
+});
+function stopReverse() {
+  if (reverseTimer) { clearInterval(reverseTimer); reverseTimer = null; }
+  reverseBtn.classList.remove('active');
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape') { hideTrimMenu(); return; }
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space') { e.preventDefault(); playPauseBtn.click(); }
+  else if (e.code === 'ArrowRight') { e.preventDefault(); document.getElementById('stepFwd').click(); }
+  else if (e.code === 'ArrowLeft') { e.preventDefault(); document.getElementById('stepBack').click(); }
+});
+</script>
+</body>
+</html>

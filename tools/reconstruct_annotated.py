@@ -37,6 +37,16 @@ from driverassist_sync import (
     nearest_at_or_before,
     resolve_start_epoch,
 )
+from leading_vehicle import (
+    DEFAULT_BAND_HALF_WIDTH,
+    DEFAULT_CENTER_X,
+    DEFAULT_CONFIRM_FRAMES,
+    DEFAULT_GRACE_FRAMES,
+    DEFAULT_THRESHOLD,
+    LeadingVehicleLock,
+    VelocityEstimator,
+    classify_leading,
+)
 from tracker import DEFAULT_REID_MODEL, ByteTracker, build_reid_encoder
 
 # BGR (OpenCV convention) approximations of the on-device box colors — these
@@ -55,6 +65,11 @@ HUD_DEFAULT_COLOR_BGR = (191, 191, 191)  # ~white @ 75% opacity, matches on-devi
 HUD_YELLOW_BGR = (0, 215, 255)
 HUD_RED_BGR = (0, 0, 255)
 
+# Magenta -- doesn't collide with any BOX_COLORS_BGR value, so the tint reads
+# unambiguously as "this is the followed vehicle" regardless of its class.
+LEADING_TINT_BGR = (255, 0, 255)
+LEADING_TINT_ALPHA = 0.35
+
 # Top-row text baseline — nudged down from a bare margin so QuickTime
 # Player's title bar/menu chrome doesn't sit directly on top of it when
 # reviewing a reconstructed clip.
@@ -70,6 +85,28 @@ def draw_box(frame, det: dict, track_id=None) -> None:
     id_prefix = f"#{track_id} " if track_id is not None else ""
     label = f"{id_prefix}{det['label']} {int(det['confidence'] * 100)}%"
     cv2.putText(frame, label, (x + 4, y + 18), cv2.FONT_HERSHEY_DUPLEX, 0.6, color, 1, cv2.LINE_AA)
+
+
+def draw_leading_tint(frame, det: dict) -> None:
+    """Fills the followed vehicle's box with a translucent tint, on top of
+    its already-drawn class-colored box/label -- see leading_vehicle.py for
+    the classifier that picks this detection. Alpha-blended (not a solid
+    fill) so the vehicle itself stays visible underneath, and drawn as a
+    thick outline too so the highlight still reads even on a very thin/
+    distant box where the fill area is tiny."""
+    h, w = frame.shape[:2]
+    x, y = int(det["x"] * w), int(det["y"] * h)
+    bw, bh = int(det["w"] * w), int(det["h"] * h)
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + bw, y + bh), LEADING_TINT_BGR, -1)
+    cv2.addWeighted(overlay, LEADING_TINT_ALPHA, frame, 1 - LEADING_TINT_ALPHA, 0, dst=frame)
+    cv2.rectangle(frame, (x, y), (x + bw, y + bh), LEADING_TINT_BGR, 3)
+
+    label = "FOLLOWING"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.6, 2)
+    label_y = y - 8 if y - 8 - th > 0 else y + bh + th + 8
+    cv2.putText(frame, label, (x + 4, label_y), cv2.FONT_HERSHEY_DUPLEX, 0.6, LEADING_TINT_BGR, 2, cv2.LINE_AA)
 
 
 def draw_hud(frame, entry: dict, thermal: Optional[tuple]) -> None:
@@ -132,6 +169,16 @@ def main() -> None:
         help="Compensate track predictions for estimated camera motion (see gmc.py). Off by default -- experimental.",
     )
     parser.add_argument("--no-gmc", dest="gmc", action="store_false")
+    parser.add_argument(
+        "--highlight-leading", dest="highlight_leading", action="store_true", default=True,
+        help="Tint the classified forward-leading vehicle (see leading_vehicle.py) (default: on)",
+    )
+    parser.add_argument("--no-highlight-leading", dest="highlight_leading", action="store_false")
+    parser.add_argument("--center-x", type=float, default=DEFAULT_CENTER_X)
+    parser.add_argument("--band-half-width", type=float, default=DEFAULT_BAND_HALF_WIDTH)
+    parser.add_argument("--leading-threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--leading-confirm-frames", type=int, default=DEFAULT_CONFIRM_FRAMES)
+    parser.add_argument("--leading-grace-frames", type=int, default=DEFAULT_GRACE_FRAMES)
     args = parser.parse_args()
 
     output = args.output or args.video.with_name(args.video.stem + "-annotated.mp4")
@@ -143,6 +190,8 @@ def main() -> None:
 
     reid_encoder = build_reid_encoder(args.reid_model, device=args.reid_device) if args.reid else None
     tracker = ByteTracker(reid_encoder=reid_encoder, use_gmc=args.gmc)
+    leading_lock = LeadingVehicleLock(args.leading_confirm_frames, args.leading_grace_frames)
+    leading_velocity = VelocityEstimator()
 
     thermal = load_thermal(thermal_log_path)
     thermal_keys = build_key_index(thermal, lambda e: e[0])
@@ -170,6 +219,10 @@ def main() -> None:
     # a fine approximation of the frame the entry actually corresponds to.
     next_idx = 0
     current_entry, current_track_ids = None, []
+    # Persists across video frames the same way current_entry does -- the
+    # lock is only updated when a *new* detection entry is processed below,
+    # at the detections.jsonl cadence, not once per rendered video frame.
+    current_locked_id = None
 
     i = 0
     while True:
@@ -185,11 +238,34 @@ def main() -> None:
         while next_idx < len(detections) and detections[next_idx]["t"] <= frame_epoch:
             current_entry = detections[next_idx]
             current_track_ids = tracker.update(current_entry["detections"], frame=frame)
+            if args.highlight_leading:
+                # classify_leading reads trackID off each det -- draw_box below
+                # only takes it as a separate zip'd arg, so stamp it on here too.
+                for det, track_id in zip(current_entry["detections"], current_track_ids):
+                    det["trackID"] = track_id
+                leading_velocity.update(current_entry["detections"], current_entry["t"])
+                raw_leading = classify_leading(
+                    current_entry["detections"], args.center_x, args.band_half_width, args.leading_threshold,
+                )
+                current_locked_id = leading_lock.update(
+                    raw_leading["trackID"] if raw_leading is not None else None
+                )
             next_idx += 1
 
         if current_entry is not None:
             for det, track_id in zip(current_entry["detections"], current_track_ids):
                 draw_box(frame, det, track_id)
+            if args.highlight_leading and current_locked_id is not None:
+                # The locked vehicle may not be this exact entry's raw
+                # classify_leading winner (grace-period stickiness) -- look
+                # it up by trackID among this entry's own detections instead.
+                # If it's not there at all (mid-gap, nothing detected for it
+                # this entry), skip drawing rather than fabricate a box.
+                locked_det = next(
+                    (d for d in current_entry["detections"] if d.get("trackID") == current_locked_id), None
+                )
+                if locked_det is not None:
+                    draw_leading_tint(frame, locked_det)
             thermal_entry = nearest_at_or_before(thermal, thermal_keys, frame_epoch)
             draw_hud(frame, current_entry, thermal_entry)
 
