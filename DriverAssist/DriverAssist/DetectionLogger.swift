@@ -63,6 +63,14 @@ struct DetectionLogEntry: Codable {
     let egoSpeedAccuracyMps: Double?
     let pitchDegrees: Double?
     let pitchDriftDegrees: Double?
+    // Raw gyro rotation rate (deg/s, device-local x/y/z axes) -- see
+    // PitchSensor.swift. Logged raw (not resolved to a single "yaw rate")
+    // since which axis is actually yaw depends on final mount orientation,
+    // not yet confirmed. Not consumed by anything yet; intended future use
+    // is guessing whether the car is in a curve/turn, for classify_leading.
+    let rotationRateXDegreesPerSecond: Double?
+    let rotationRateYDegreesPerSecond: Double?
+    let rotationRateZDegreesPerSecond: Double?
     let detections: [Box]
 }
 
@@ -103,6 +111,9 @@ enum DetectionLogger {
         egoSpeedAccuracyMps: Double?,
         pitchDegrees: Double?,
         pitchDriftDegrees: Double?,
+        rotationRateXDegreesPerSecond: Double?,
+        rotationRateYDegreesPerSecond: Double?,
+        rotationRateZDegreesPerSecond: Double?,
         detections: [Detection]
     ) {
         let entry = DetectionLogEntry(
@@ -122,6 +133,9 @@ enum DetectionLogger {
             egoSpeedAccuracyMps: egoSpeedAccuracyMps,
             pitchDegrees: pitchDegrees,
             pitchDriftDegrees: pitchDriftDegrees,
+            rotationRateXDegreesPerSecond: rotationRateXDegreesPerSecond,
+            rotationRateYDegreesPerSecond: rotationRateYDegreesPerSecond,
+            rotationRateZDegreesPerSecond: rotationRateZDegreesPerSecond,
             detections: detections.map {
                 DetectionLogEntry.Box(
                     label: $0.label,

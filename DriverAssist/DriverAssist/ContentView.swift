@@ -121,14 +121,19 @@ struct InferenceView: View {
         }
         .contentShape(Rectangle())
         .gesture(
+            // Two-axis grid: horizontal picks tier (nano/small), vertical picks
+            // input resolution (low/high) -- a direct set based on direction each
+            // time, not a cycle. Medium stays voice-only (see DetectorModel /
+            // ModelManager.highResTiers -- it has no high-res export, and isn't
+            // on this grid at all). Two-pass is also voice-only now.
             DragGesture(minimumDistance: 24)
                 .onEnded { value in
                     if abs(value.translation.width) > abs(value.translation.height) {
-                        // Left swipe (finger moves right-to-left) advances toward medium;
-                        // right swipe backs toward nano. Neither wraps around.
-                        cycleModel(forward: value.translation.width < 0)
+                        // Left swipe (finger moves right-to-left) selects nano; right selects small.
+                        modelManager.switchModel(to: value.translation.width < 0 ? .nano : .small)
                     } else {
-                        inferenceEngine.toggleTwoPass()
+                        // Swipe up sets high-res (1920x1088) input, swipe down sets standard (1152x640).
+                        modelManager.setHighResEnabled(value.translation.height < 0)
                     }
                 }
         )
@@ -180,6 +185,8 @@ struct InferenceView: View {
                     inferenceEngine?.setTwoPassEnabled(enabled)
                 case .stabilization(let enabled):
                     cameraManager?.setStabilizationEnabled(enabled)
+                case .highRes(let enabled):
+                    modelManager?.setHighResEnabled(enabled)
                 case .calibratePitch:
                     inferenceEngine?.pitchSensor.captureReferencePitch()
                 }
@@ -251,14 +258,6 @@ struct InferenceView: View {
         cameraManager.isRecording && !cameraManager.isStorageLow && !isBatteryLow
     }
 
-    /// Steps one position toward medium (`forward`) or toward nano, clamping at
-    /// whichever end it reaches rather than wrapping around.
-    private func cycleModel(forward: Bool) {
-        let models = DetectorModel.allCases
-        guard let index = models.firstIndex(of: modelManager.selectedModel) else { return }
-        let nextIndex = forward ? min(index + 1, models.count - 1) : max(index - 1, 0)
-        modelManager.switchModel(to: models[nextIndex])
-    }
 }
 
 #Preview {

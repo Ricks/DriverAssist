@@ -51,7 +51,7 @@ from tracker import ByteTracker
 FRONTEND_PATH = Path(__file__).parent / "label_leading_vehicle_frontend.html"
 
 
-def build_app(session_dir: Path, video: Path, detections_path: Path, debug_log: Path) -> Flask:
+def build_app(session_dir: Path, video: Path, detections_path: Path, debug_log: Path, ground_truth_name: str = "ground_truth.json") -> Flask:
     start_epoch, _ = resolve_start_epoch(video, debug_log if debug_log.exists() else DEFAULT_LOGS_DIR)
     entries = load_detections(detections_path)
 
@@ -76,7 +76,7 @@ def build_app(session_dir: Path, video: Path, detections_path: Path, debug_log: 
         })
     print("Done.", file=sys.stderr)
 
-    ground_truth_path = session_dir / "ground_truth.json"
+    ground_truth_path = session_dir / ground_truth_name
 
     app = Flask(__name__)
 
@@ -118,6 +118,11 @@ def main() -> None:
     parser.add_argument("--detections", type=Path, default=None, help="Defaults to <session_dir>/detections.jsonl")
     parser.add_argument("--debug-log", type=Path, default=None, help="Defaults to <session_dir>/overlay-debug.log")
     parser.add_argument("--port", type=int, default=5050)
+    parser.add_argument(
+        "--ground-truth-name", default="ground_truth.json",
+        help="Filename (within session_dir) to read/write labels from -- use a different name to "
+             "run a separate labeling pass (e.g. a pared-down subset) without touching the original.",
+    )
     args = parser.parse_args()
 
     detections_path = args.detections or (args.session_dir / "detections.jsonl")
@@ -127,7 +132,7 @@ def main() -> None:
     video = args.video or find_session_video(args.session_dir)
     debug_log = args.debug_log or (args.session_dir / "overlay-debug.log")
 
-    app = build_app(args.session_dir, video, detections_path, debug_log)
+    app = build_app(args.session_dir, video, detections_path, debug_log, args.ground_truth_name)
     print(f"\nOpen http://localhost:{args.port} in a browser.\n")
     app.run(port=args.port, debug=False)
 

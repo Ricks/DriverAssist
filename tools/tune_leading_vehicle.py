@@ -48,8 +48,10 @@ from leading_vehicle import (
     DEFAULT_CONFIRM_FRAMES,
     DEFAULT_GRACE_FRAMES,
     DEFAULT_MAX_ABS_VELOCITY,
+    DEFAULT_MAX_ASPECT_RATIO,
     DEFAULT_MAX_BOTTOM_Y,
     DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_SYMMETRY,
     DEFAULT_MIN_WIDTH,
     DEFAULT_THRESHOLD,
     VelocityEstimator,
@@ -61,6 +63,7 @@ from tracker import ByteTracker
 CLASSIFY_KEYS = [
     "center_x", "band_half_width", "threshold",
     "min_confidence", "min_width", "max_bottom_y", "max_abs_velocity",
+    "max_aspect_ratio", "min_symmetry",
 ]
 HYSTERESIS_KEYS = ["confirm_frames", "grace_frames"]
 
@@ -72,6 +75,8 @@ DEFAULT_PARAMS = {
     "min_width": DEFAULT_MIN_WIDTH,
     "max_bottom_y": DEFAULT_MAX_BOTTOM_Y,
     "max_abs_velocity": DEFAULT_MAX_ABS_VELOCITY,
+    "max_aspect_ratio": DEFAULT_MAX_ASPECT_RATIO,
+    "min_symmetry": DEFAULT_MIN_SYMMETRY,
     "confirm_frames": DEFAULT_CONFIRM_FRAMES,
     "grace_frames": DEFAULT_GRACE_FRAMES,
 }
@@ -87,6 +92,8 @@ SEARCH_RANGES = {
     "min_width": (0.005, 0.05),
     "max_bottom_y": (0.85, 0.99),
     "max_abs_velocity": (0.05, 0.5),
+    "max_aspect_ratio": (1.5, 5.0),
+    "min_symmetry": (0.0, 0.8),
     "confirm_frames": (1, 8, "int"),
     "grace_frames": (1, 15, "int"),
 }
@@ -101,22 +108,30 @@ def ground_truth_at(segments: list, t: float):
     return None
 
 
-def precompute_frames(entries: list, start_epoch: float) -> list:
+def precompute_frames(entries: list, start_epoch: float, symmetry_scores: list = None) -> list:
     """Tracker + velocity estimation don't depend on the classifier
     parameters being swept -- only classify_leading/hysteresis do -- so this
     runs once, mirroring track_benchmark.py's cache-what's-expensive split.
     Frame times are converted to video-relative seconds (t - start_epoch),
     matching ground_truth.json's start_t/end_t convention (see
     label_leading_vehicle.py, which stamps the same conversion) -- comparing
-    against raw epoch timestamps would never match anything."""
+    against raw epoch timestamps would never match anything.
+
+    `symmetry_scores`, if given, is compute_symmetry.py's cache -- one list
+    of per-detection scores per entry, same order/index as `entries` (NOT
+    trackID-keyed -- see that file's docstring). Stamped on as `sym`, same
+    pattern as `vcx` below."""
     tracker = ByteTracker()
     velocity = VelocityEstimator()
     frames = []
-    for entry in entries:
+    for i, entry in enumerate(entries):
         dets = entry["detections"]
         track_ids = tracker.update(dets)
         for det, tid in zip(dets, track_ids):
             det["trackID"] = tid
+        if symmetry_scores is not None:
+            for det, sym in zip(dets, symmetry_scores[i]):
+                det["sym"] = sym
         t_rel = entry["t"] - start_epoch
         velocity.update(dets, t_rel)
         frames.append({"t": t_rel, "detections": dets})
@@ -166,6 +181,31 @@ def sample_params(rng: random.Random) -> dict:
     return params
 
 
+def sample_params_near(rng: random.Random, center: dict, scale: float) -> dict:
+    """Like sample_params, but samples within a window `scale` fraction of
+    each parameter's full range width, centered on center[key] and clipped
+    back to SEARCH_RANGES -- a local refinement pass around a promising
+    point the broad search already found, rather than resampling the whole
+    space blind again."""
+    params = dict(center)
+    for key, spec in SEARCH_RANGES.items():
+        if len(spec) == 3:
+            lo, hi, _ = spec
+            half_width = max(1, round((hi - lo) * scale / 2))
+            new_lo = max(lo, center[key] - half_width)
+            new_hi = min(hi, center[key] + half_width)
+            if new_hi <= new_lo:
+                new_hi = new_lo + 1
+            params[key] = rng.randint(new_lo, new_hi)
+        else:
+            lo, hi = spec
+            half_width = (hi - lo) * scale / 2
+            new_lo = max(lo, center[key] - half_width)
+            new_hi = min(hi, center[key] + half_width)
+            params[key] = rng.uniform(new_lo, new_hi)
+    return params
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("session_dir", type=Path)
@@ -173,7 +213,21 @@ def main() -> None:
     parser.add_argument("--detections", type=Path, default=None)
     parser.add_argument("--debug-log", type=Path, default=None, help="Defaults to <session_dir>/overlay-debug.log")
     parser.add_argument("--ground-truth", type=Path, default=None)
+    parser.add_argument(
+        "--symmetry-cache", type=Path, default=None,
+        help="compute_symmetry.py output -- enables the min_symmetry gate/search. Without it, "
+             "min_symmetry stays a no-op (no detection has a 'sym' field to gate on).",
+    )
     parser.add_argument("--trials", type=int, default=400)
+    parser.add_argument(
+        "--refine-trials", type=int, default=0,
+        help="After the broad search, run this many more trials sampled in a window around the best "
+             "point found (see --refine-scale) instead of the whole space blind. 0 disables refinement.",
+    )
+    parser.add_argument(
+        "--refine-scale", type=float, default=0.2,
+        help="Window width for refinement trials, as a fraction of each parameter's full search range.",
+    )
     parser.add_argument("--train-fraction", type=float, default=0.75)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--results", type=Path, default=None)
@@ -192,7 +246,8 @@ def main() -> None:
 
     entries = load_detections(detections_path)
     segments = json.loads(gt_path.read_text())
-    frames = precompute_frames(entries, start_epoch)
+    symmetry_scores = json.loads(args.symmetry_cache.read_text()) if args.symmetry_cache else None
+    frames = precompute_frames(entries, start_epoch, symmetry_scores)
 
     t0, t1 = frames[0]["t"], frames[-1]["t"]
     cutoff = t0 + (t1 - t0) * args.train_fraction
@@ -225,6 +280,18 @@ def main() -> None:
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{args.trials}  best train balanced_accuracy so far: {best_train_score:.3f}", file=sys.stderr)
 
+    if args.refine_trials:
+        print(f"\nRefining {args.refine_trials} trials around the broad search's best point "
+              f"(window={args.refine_scale:.0%} of each range)...", file=sys.stderr)
+        for i in range(args.refine_trials):
+            params = sample_params_near(rng, best_params, args.refine_scale)
+            result = score(params, t0, cutoff)
+            if result["balanced_accuracy"] is not None and result["balanced_accuracy"] > best_train_score:
+                best_train_score = result["balanced_accuracy"]
+                best_params = params
+            if (i + 1) % 50 == 0:
+                print(f"  {i+1}/{args.refine_trials}  best train balanced_accuracy so far: {best_train_score:.3f}", file=sys.stderr)
+
     best_train = score(best_params, t0, cutoff)
     best_held = score(best_params, cutoff, t1)
     print("\n[Best found: selected on train portion only]")
@@ -243,7 +310,8 @@ def main() -> None:
     results_path.write_text(json.dumps({
         "baseline_params": DEFAULT_PARAMS, "baseline_train": baseline_train, "baseline_held_out": baseline_held,
         "best_params": best_params, "best_train": best_train, "best_held_out": best_held,
-        "train_fraction": args.train_fraction, "trials": args.trials, "seed": args.seed,
+        "train_fraction": args.train_fraction, "trials": args.trials,
+        "refine_trials": args.refine_trials, "refine_scale": args.refine_scale, "seed": args.seed,
     }, indent=2))
     print(f"\nResults written to {results_path}")
 

@@ -160,6 +160,19 @@ final class CameraManager: NSObject, ObservableObject {
     private static let autoLowLightOnLuminance: Double = 50
     private static let autoLowLightOffLuminance: Double = 90
 
+    /// Consecutive at/below-threshold readings required before the boost actually
+    /// turns on -- added after a real false-positive on session
+    /// 26_07_30_Day_Hosp_nano_off: a single momentary dip while driving under dense
+    /// tree canopy (whole-frame average briefly reads dark even in full daylight,
+    /// since the frame is mostly heavy shade) tripped the boost on one sample, and
+    /// by the next probe ~2s later the car had moved into a sunlit gap -- boosted
+    /// exposure hitting real daylight, causing a severe flare/blowout in the
+    /// recording (confirmed by pulling the actual frame). Requiring the low reading
+    /// to persist across samples (~1s apart) distinguishes real darkness (tunnels,
+    /// dusk) from a momentary shaded patch, which clears before a second sample.
+    private static let consecutiveLowSamplesRequired = 2
+    private nonisolated(unsafe) var consecutiveLowLuminanceSamples = 0
+
     // Recording state. Only ever touched on sessionQueue (configure/startNewRecording
     // run there, and the video data output delegate is dispatched to sessionQueue too).
     private nonisolated(unsafe) var assetWriter: AVAssetWriter?
@@ -516,11 +529,22 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated func evaluateAutoLowLight(luminance: Double) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            DebugFileLogger.log("auto-lowlight: luminance=\(luminance) auto=\(self.isAutoLowLightEnabled) boost=\(self.isLowLightBoostEnabled)")
+            DebugFileLogger.log(
+                "auto-lowlight: luminance=\(luminance) auto=\(self.isAutoLowLightEnabled) "
+                + "boost=\(self.isLowLightBoostEnabled) consecutiveLow=\(self.consecutiveLowLuminanceSamples)"
+            )
             guard self.isAutoLowLightEnabled else { return }
-            if !self.isLowLightBoostEnabled, luminance <= Self.autoLowLightOnLuminance {
-                self.applyLowLightState(true)
-            } else if self.isLowLightBoostEnabled, luminance >= Self.autoLowLightOffLuminance {
+            if !self.isLowLightBoostEnabled {
+                guard luminance <= Self.autoLowLightOnLuminance else {
+                    self.consecutiveLowLuminanceSamples = 0
+                    return
+                }
+                self.consecutiveLowLuminanceSamples += 1
+                if self.consecutiveLowLuminanceSamples >= Self.consecutiveLowSamplesRequired {
+                    self.applyLowLightState(true)
+                    self.consecutiveLowLuminanceSamples = 0
+                }
+            } else if luminance >= Self.autoLowLightOffLuminance {
                 self.applyLowLightState(false)
             }
         }

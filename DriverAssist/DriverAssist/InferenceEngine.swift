@@ -246,10 +246,6 @@ final class InferenceEngine: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: Self.twoPassDefaultsKey)
     }
 
-    func toggleTwoPass() {
-        setTwoPassEnabled(!isTwoPassEnabled)
-    }
-
     func process(
         pixelBuffer: CVPixelBuffer,
         lowLightEnabled: Bool,
@@ -335,6 +331,9 @@ final class InferenceEngine: ObservableObject {
             egoSpeedAccuracyMps: egoSpeedManager.speedAccuracyMps,
             pitchDegrees: pitchSensor.pitchDegrees,
             pitchDriftDegrees: pitchSensor.pitchDriftDegrees,
+            rotationRateXDegreesPerSecond: pitchSensor.rotationRateXDegreesPerSecond,
+            rotationRateYDegreesPerSecond: pitchSensor.rotationRateYDegreesPerSecond,
+            rotationRateZDegreesPerSecond: pitchSensor.rotationRateZDegreesPerSecond,
             detections: result.detections
         )
         frameCount += 1

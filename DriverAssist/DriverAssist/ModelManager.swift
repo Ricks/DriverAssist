@@ -1,9 +1,9 @@
 import Foundation
 import CoreML
 
-// Declaration order is the swipe-cycle order (nano → small → medium) — see
-// `ContentView.cycleModel(forward:)`, which clamps at either end rather than
-// wrapping around.
+// nano/small are gesture-reachable (horizontal swipe -- see ContentView); medium
+// is voice-only (VoiceCommandManager's .selectModel command), not on that grid --
+// it has no high-res export (see ModelManager.highResTiers).
 enum DetectorModel: String, CaseIterable, Codable {
     case nano   = "yolo26n"
     case small  = "yolo26s"
@@ -16,12 +16,45 @@ final class ModelManager: ObservableObject {
     @Published private(set) var isLoaded = false
     @Published private(set) var lastError: String?
 
+    // Gesture-driven alternative input resolution (1920x1088, matching the
+    // camera's own 1080p capture, vs. the standard 1152x640 export) -- see
+    // the offline resolution_comparison.py experiment this came out of,
+    // which found a real small-object recall gain from feeding the model
+    // more of the already-captured detail. Not yet on-device validated for
+    // latency/thermal cost (that's the point of exposing it as a manual,
+    // deliberate swipe rather than a silent default).
+    //
+    // Only nano and small have a high-res export (see highResTiers) --
+    // medium was deliberately excluded, being the most expensive tier
+    // already, stacking it with the more expensive input too compounds two
+    // untested costs at once. Toggling high-res while medium is selected is
+    // a harmless no-op.
+    @Published private(set) var isHighResEnabled = false
+
     // Both models are kept resident so switching is O(1).
     private var models: [DetectorModel: MLModel] = [:]
+    private var highResModels: [DetectorModel: MLModel] = [:]
     private let configuration: MLModelConfiguration
     private var loadTasks: [DetectorModel: Task<Void, Never>] = [:]
+    private var highResLoadTasks: [DetectorModel: Task<Void, Never>] = [:]
 
-    var model: MLModel? { models[selectedModel] }
+    private static let highResTiers: Set<DetectorModel> = [.nano, .small]
+
+    private static func highResResourceName(for tier: DetectorModel) -> String {
+        "\(tier.rawValue)-1920x1088"
+    }
+
+    /// The high-res variant is substituted in only once it's actually
+    /// finished loading -- falling back to the standard resolution rather
+    /// than nil during that window means a swipe to high-res doesn't
+    /// briefly stall inference while the (already resident, just not yet
+    /// toggled-to) alternate model finishes loading.
+    var model: MLModel? {
+        if isHighResEnabled, let highRes = highResModels[selectedModel] {
+            return highRes
+        }
+        return models[selectedModel]
+    }
 
     private static let selectedModelDefaultsKey = "settings.selectedModel"
 
@@ -44,6 +77,9 @@ final class ModelManager: ObservableObject {
         for detectorModel in DetectorModel.allCases {
             startLoading(detectorModel)
         }
+        for tier in Self.highResTiers {
+            startLoadingHighRes(tier)
+        }
     }
 
     func switchModel(to newModel: DetectorModel) {
@@ -52,6 +88,10 @@ final class ModelManager: ObservableObject {
         isLoaded = models[newModel] != nil
         lastError = nil
         UserDefaults.standard.set(newModel.rawValue, forKey: Self.selectedModelDefaultsKey)
+    }
+
+    func setHighResEnabled(_ enabled: Bool) {
+        isHighResEnabled = enabled
     }
 
     private func startLoading(_ newModel: DetectorModel) {
@@ -86,8 +126,29 @@ final class ModelManager: ObservableObject {
         }
     }
 
+    private func startLoadingHighRes(_ tier: DetectorModel) {
+        guard highResLoadTasks[tier] == nil else { return }
+        let resourceName = Self.highResResourceName(for: tier)
+        highResLoadTasks[tier] = Task {
+            guard let url = Bundle.main.url(forResource: resourceName, withExtension: "mlmodelc") else {
+                print("[ModelManager] \(resourceName): .mlmodelc not found in bundle")
+                return
+            }
+            do {
+                let loaded = try await MLModel.load(contentsOf: url, configuration: configuration)
+                guard !Task.isCancelled else { return }
+                highResModels[tier] = loaded
+                print("[ModelManager] \(resourceName): loaded")
+            } catch {
+                guard !Task.isCancelled else { return }
+                print("[ModelManager] \(resourceName): load failed: \(error)")
+            }
+        }
+    }
+
     deinit {
         loadTasks.values.forEach { $0.cancel() }
+        highResLoadTasks.values.forEach { $0.cancel() }
     }
 }
 

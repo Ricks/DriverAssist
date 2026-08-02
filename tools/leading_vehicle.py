@@ -113,6 +113,27 @@ DEFAULT_MAX_BOTTOM_Y = 0.95
 # view" transient. 0.2 sits with comfortable margin on both sides.
 DEFAULT_MAX_ABS_VELOCITY = 0.2
 
+# Shape (aspect ratio) gate -- worth being upfront that this file already
+# looked at aspect ratio once and found it doesn't cleanly separate
+# cross-traffic from real close-following vehicles on its own: one real
+# 28.5s-long legitimate track sat at aspect ratio ~1.9-2.0 for its whole
+# steady-state duration (see DEFAULT_MAX_ABS_VELOCITY's comment above),
+# which is the same range an oblique/side view would land in. This default
+# is set loose (only rejects genuinely extreme, clearly-not-rear-on boxes)
+# for exactly that reason -- validate against real held-out labels (see
+# tune_leading_vehicle.py) before tightening it, don't assume it helps.
+DEFAULT_MAX_ASPECT_RATIO = 3.5
+
+# Symmetry gate -- rear (and front) views of a vehicle are close to
+# bilaterally symmetric (tail lights, bumper, plate); oblique/side views
+# aren't. Score is precomputed per detection from the actual video frame
+# (see compute_symmetry.py) since it needs pixel access this module
+# otherwise deliberately avoids (see module docstring) -- 0 disables the
+# gate (every detection passes) since a session without a symmetry cache
+# has no `sym` field on its detections at all (see below, same
+# missing-data-gets-the-benefit-of-the-doubt handling as `vcx`).
+DEFAULT_MIN_SYMMETRY = 0.0
+
 # ~15fps capture (see CameraManager.swift) -- 3 frames is ~0.2s of sustained
 # evidence before switching, 5 is ~0.33s tolerance for a brief missed
 # detection before releasing the lock. Not deeply tuned, just plausible
@@ -160,6 +181,7 @@ def classify_leading(
     labels: set = VEHICLE_LABELS,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE, min_width: float = DEFAULT_MIN_WIDTH,
     max_bottom_y: float = DEFAULT_MAX_BOTTOM_Y, max_abs_velocity: float = DEFAULT_MAX_ABS_VELOCITY,
+    max_aspect_ratio: float = DEFAULT_MAX_ASPECT_RATIO, min_symmetry: float = DEFAULT_MIN_SYMMETRY,
 ):
     """Returns the detection dict (must include trackID) classified as the
     forward-leading vehicle for this frame, or None. Ports Algorithm 1: a
@@ -173,12 +195,16 @@ def classify_leading(
     have `vcx` (see VelocityEstimator) exceeding `max_abs_velocity` in
     magnitude (rejects cross-traffic -- a candidate with no velocity history
     yet, `vcx is None`, is allowed through rather than rejected, since a
-    brand-new track deserves the benefit of the doubt on its first sighting).
-    If multiple candidates qualify, picks the tallest box as a rough
-    closeness proxy -- rare in practice for a single-lane-ahead scenario, and
-    not the thesis's distance metric (that used width specifically, which
-    needs a calibrated camera we don't have here -- see the design
-    discussion), just a placeholder tie-break.
+    brand-new track deserves the benefit of the doubt on its first sighting),
+    AND not exceed `max_aspect_ratio` (w/h -- rejects extreme side/oblique
+    views; see DEFAULT_MAX_ASPECT_RATIO's comment on why this is set loose),
+    AND not fall below `min_symmetry` on its precomputed `sym` score if it
+    has one (missing `sym`, like missing `vcx`, gets the benefit of the
+    doubt rather than being rejected). If multiple candidates qualify, picks
+    the tallest box as a rough closeness proxy -- rare in practice for a
+    single-lane-ahead scenario, and not the thesis's distance metric (that
+    used width specifically, which needs a calibrated camera we don't have
+    here -- see the design discussion), just a placeholder tie-break.
     """
     s1 = center_x - band_half_width
     s2 = center_x + band_half_width
@@ -194,6 +220,11 @@ def classify_leading(
             continue
         vcx = det.get("vcx")
         if vcx is not None and abs(vcx) > max_abs_velocity:
+            continue
+        if det["h"] > 0 and (det["w"] / det["h"]) > max_aspect_ratio:
+            continue
+        sym = det.get("sym")
+        if sym is not None and sym < min_symmetry:
             continue
         x1, x2 = det["x"], det["x"] + det["w"]
         fully_contained = x1 > s1 and x2 < s2
