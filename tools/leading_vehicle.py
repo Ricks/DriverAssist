@@ -47,6 +47,7 @@ from pathlib import Path
 
 from benchmark import iou
 from driverassist_sync import load_detections
+from path_awareness import DEFAULT_MAX_YAW_SHIFT, DEFAULT_YAW_SHIFT_PER_DEG_S, curve_adjusted_center_x
 from tracker import ByteTracker
 
 # A switch is classified "likely churn" (same physical vehicle, new trackID
@@ -64,6 +65,7 @@ VEHICLE_LABELS = {"car", "truck", "bus", "motorcycle"}
 DEFAULT_CENTER_X = 0.5
 DEFAULT_BAND_HALF_WIDTH = 0.025
 DEFAULT_THRESHOLD = 0.3  # T in Algorithm 1 -- higher is stricter
+
 
 # Minimum-evidence gate, added after digging into real switch data: with no
 # floor at all, tiny/uncertain detections near the vanishing point in busy
@@ -375,7 +377,15 @@ def run_session(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE, min_width: float = DEFAULT_MIN_WIDTH,
     max_bottom_y: float = DEFAULT_MAX_BOTTOM_Y, max_abs_velocity: float = DEFAULT_MAX_ABS_VELOCITY,
     confirm_frames: int = DEFAULT_CONFIRM_FRAMES, grace_frames: int = DEFAULT_GRACE_FRAMES,
+    yaw_rate_key: str = None, yaw_sign: float = 1.0,
+    yaw_shift_per_deg_s: float = DEFAULT_YAW_SHIFT_PER_DEG_S, max_yaw_shift: float = DEFAULT_MAX_YAW_SHIFT,
 ) -> dict:
+    """`yaw_rate_key`, if given, names the DetectionLogEntry field to read a
+    signed yaw rate from (e.g. "rotationRateZDegreesPerSecond") -- which axis
+    is actually yaw isn't confirmed yet (see curve_adjusted_center_x), so this
+    is left as a choice for the caller rather than hardcoded. None (the
+    default) disables curve adjustment entirely, matching every session
+    recorded so far, none of which have rotation rate logged at all."""
     tracker = ByteTracker()  # geometry-only (use_gmc defaults False) -- see module docstring
     velocity = VelocityEstimator()
     frames_with_vehicles = 0
@@ -393,8 +403,15 @@ def run_session(
         if vehicle_dets:
             frames_with_vehicles += 1
 
+        frame_center_x = center_x
+        raw_yaw = entry.get(yaw_rate_key) if yaw_rate_key else None
+        if raw_yaw is not None:
+            frame_center_x = curve_adjusted_center_x(
+                center_x, raw_yaw * yaw_sign, yaw_shift_per_deg_s, max_yaw_shift
+            )
+
         leading = classify_leading(
-            dets, center_x, band_half_width, threshold,
+            dets, frame_center_x, band_half_width, threshold,
             min_confidence=min_confidence, min_width=min_width,
             max_bottom_y=max_bottom_y, max_abs_velocity=max_abs_velocity,
         )
@@ -439,6 +456,15 @@ def main() -> None:
     parser.add_argument("--max-abs-velocity", type=float, default=DEFAULT_MAX_ABS_VELOCITY)
     parser.add_argument("--confirm-frames", type=int, default=DEFAULT_CONFIRM_FRAMES)
     parser.add_argument("--grace-frames", type=int, default=DEFAULT_GRACE_FRAMES)
+    parser.add_argument(
+        "--yaw-rate-key", type=str, default=None,
+        help="DetectionLogEntry field to read signed yaw rate from (e.g. rotationRateZDegreesPerSecond) "
+             "-- disabled by default, since no recorded session has this logged yet and which axis is "
+             "actually yaw isn't confirmed (see path_awareness.py).",
+    )
+    parser.add_argument("--yaw-sign", type=float, default=1.0, help="Multiplier to flip sign if the raw axis reads backwards")
+    parser.add_argument("--yaw-shift-per-deg-s", type=float, default=DEFAULT_YAW_SHIFT_PER_DEG_S)
+    parser.add_argument("--max-yaw-shift", type=float, default=DEFAULT_MAX_YAW_SHIFT)
     parser.add_argument("--results", type=Path, default=None, help="JSON path; defaults to <session_dir>/leading-vehicle.json")
     parser.add_argument(
         "--dump-switches", type=int, default=10,
@@ -456,6 +482,8 @@ def main() -> None:
         min_confidence=args.min_confidence, min_width=args.min_width,
         max_bottom_y=args.max_bottom_y, max_abs_velocity=args.max_abs_velocity,
         confirm_frames=args.confirm_frames, grace_frames=args.grace_frames,
+        yaw_rate_key=args.yaw_rate_key, yaw_sign=args.yaw_sign,
+        yaw_shift_per_deg_s=args.yaw_shift_per_deg_s, max_yaw_shift=args.max_yaw_shift,
     )
 
     def print_bucket(name: str, s: dict) -> None:

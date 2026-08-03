@@ -71,6 +71,21 @@ struct DetectionLogEntry: Codable {
     let rotationRateXDegreesPerSecond: Double?
     let rotationRateYDegreesPerSecond: Double?
     let rotationRateZDegreesPerSecond: Double?
+    // Same gravity-derived, non-drifting property as pitch -- see PitchSensor.swift.
+    let rollDegrees: Double?
+    // Real linear acceleration, gravity subtracted, in g (1.0 = ~9.8 m/s^2),
+    // device-local x/y/z -- see PitchSensor.swift. Not consumed by anything
+    // yet; intended future uses are braking detection (closing-rate warning
+    // work) and cross-checking hard cornering against rotationRate.
+    let userAccelerationX: Double?
+    let userAccelerationY: Double?
+    let userAccelerationZ: Double?
+    // Raw gravity vector (device-local x/y/z, unit vector) -- what
+    // pitchDegrees/rollDegrees are themselves derived from. Logged raw so
+    // they could be recomputed differently later without a new drive.
+    let gravityX: Double?
+    let gravityY: Double?
+    let gravityZ: Double?
     let detections: [Box]
 }
 
@@ -114,6 +129,13 @@ enum DetectionLogger {
         rotationRateXDegreesPerSecond: Double?,
         rotationRateYDegreesPerSecond: Double?,
         rotationRateZDegreesPerSecond: Double?,
+        rollDegrees: Double?,
+        userAccelerationX: Double?,
+        userAccelerationY: Double?,
+        userAccelerationZ: Double?,
+        gravityX: Double?,
+        gravityY: Double?,
+        gravityZ: Double?,
         detections: [Detection]
     ) {
         let entry = DetectionLogEntry(
@@ -136,6 +158,13 @@ enum DetectionLogger {
             rotationRateXDegreesPerSecond: rotationRateXDegreesPerSecond,
             rotationRateYDegreesPerSecond: rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: rotationRateZDegreesPerSecond,
+            rollDegrees: rollDegrees,
+            userAccelerationX: userAccelerationX,
+            userAccelerationY: userAccelerationY,
+            userAccelerationZ: userAccelerationZ,
+            gravityX: gravityX,
+            gravityY: gravityY,
+            gravityZ: gravityZ,
             detections: detections.map {
                 DetectionLogEntry.Box(
                     label: $0.label,

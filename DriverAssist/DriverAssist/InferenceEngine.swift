@@ -334,6 +334,13 @@ final class InferenceEngine: ObservableObject {
             rotationRateXDegreesPerSecond: pitchSensor.rotationRateXDegreesPerSecond,
             rotationRateYDegreesPerSecond: pitchSensor.rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: pitchSensor.rotationRateZDegreesPerSecond,
+            rollDegrees: pitchSensor.rollDegrees,
+            userAccelerationX: pitchSensor.userAccelerationX,
+            userAccelerationY: pitchSensor.userAccelerationY,
+            userAccelerationZ: pitchSensor.userAccelerationZ,
+            gravityX: pitchSensor.gravityX,
+            gravityY: pitchSensor.gravityY,
+            gravityZ: pitchSensor.gravityZ,
             detections: result.detections
         )
         frameCount += 1

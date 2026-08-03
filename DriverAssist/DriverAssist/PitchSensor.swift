@@ -2,8 +2,12 @@
 //  PitchSensor.swift
 //  DriverAssist
 //
-//  Publishes the phone's own pitch, and raw gyro rotation rate, from
-//  CoreMotion.
+//  Publishes the phone's own pitch/roll, raw gyro rotation rate, raw linear
+//  (gravity-subtracted) acceleration, and the raw gravity vector, from
+//  CoreMotion. Deliberately logs more than any single planned use needs --
+//  see the design discussion this came out of: a few extra Double fields
+//  per log line costs nothing, while not having a signal when a future
+//  hypothesis needs it means an entire wasted test drive.
 //
 //  Pitch is a static/DC reading derived from the gravity vector, not an
 //  integration, so unlike ego-speed this doesn't drift over time. Two
@@ -61,6 +65,33 @@ final class PitchSensor: ObservableObject {
     @Published private(set) var rotationRateYDegreesPerSecond: Double?
     @Published private(set) var rotationRateZDegreesPerSecond: Double?
 
+    /// Same gravity-derived, non-drifting property as pitch -- logged for the
+    /// same reason: cheap to capture now, and a road-banking/vehicle-lean
+    /// signal on a curve isn't available any other way. Not consumed by
+    /// anything yet.
+    @Published private(set) var rollDegrees: Double?
+
+    /// Real linear acceleration with gravity subtracted out (in g, i.e. 1.0 =
+    /// ~9.8 m/s^2), device-local x/y/z axes -- same axis-mapping caveat as
+    /// rotationRate above (not resolved to a single "forward/lateral" axis
+    /// here). Not consumed by anything yet; intended future uses are
+    /// detecting braking (feeds the closing-rate/following-distance warning
+    /// work) and cross-checking hard cornering against rotationRate (two
+    /// independent sensors of the same maneuver).
+    @Published private(set) var userAccelerationX: Double?
+    @Published private(set) var userAccelerationY: Double?
+    @Published private(set) var userAccelerationZ: Double?
+
+    /// Raw gravity vector (device-local x/y/z, unit vector) -- what
+    /// pitchDegrees/rollDegrees are themselves derived from. Logged
+    /// separately, raw, so pitch/roll could be recomputed differently later
+    /// (different smoothing, a different axis convention once the mount
+    /// orientation is confirmed) without needing a new drive -- same
+    /// "log raw, don't pre-resolve" reasoning as rotationRate's three axes.
+    @Published private(set) var gravityX: Double?
+    @Published private(set) var gravityY: Double?
+    @Published private(set) var gravityZ: Double?
+
     /// nil until both a live reading and a saved reference exist.
     var pitchDriftDegrees: Double? {
         guard let pitch = pitchDegrees, let reference = referencePitchDegrees else { return nil }
@@ -81,21 +112,31 @@ final class PitchSensor: ObservableObject {
             print("[PitchSensor] device motion not available")
             return
         }
-        // Slow poll deliberately -- this needs no frame-rate cadence, unlike
-        // the frame-to-frame rotation compensation GMC.swift already does;
-        // conflating the two was a real mistake worth not repeating (see
-        // design discussion on why "wiring up CoreMotion anyway" doesn't
-        // meaningfully reduce the cost of a GMC replacement).
-        motionManager.deviceMotionUpdateInterval = 0.5
+        // Matches the camera's own ~15fps capture cadence -- this used to be a
+        // deliberate slow 0.5s poll (fine for pitch's original static-
+        // calibration use), but rotationRate is now meant to inform per-frame
+        // curve detection (see path_awareness.py), and a stale-by-up-to-0.5s
+        // reading would often belong to the wrong frame entirely. CoreMotion
+        // sampling at 15Hz is negligible cost next to camera/ML inference
+        // already running -- not the kind of resolution/model-size tradeoff
+        // that needed real measurement earlier this project.
+        motionManager.deviceMotionUpdateInterval = 1.0 / 15.0
         motionManager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) { [weak self] motion, error in
             guard let motion else {
                 if let error { print("[PitchSensor] update failed: \(error)") }
                 return
             }
             self?.pitchDegrees = motion.attitude.pitch * 180 / .pi
+            self?.rollDegrees = motion.attitude.roll * 180 / .pi
             self?.rotationRateXDegreesPerSecond = motion.rotationRate.x * 180 / .pi
             self?.rotationRateYDegreesPerSecond = motion.rotationRate.y * 180 / .pi
             self?.rotationRateZDegreesPerSecond = motion.rotationRate.z * 180 / .pi
+            self?.userAccelerationX = motion.userAcceleration.x
+            self?.userAccelerationY = motion.userAcceleration.y
+            self?.userAccelerationZ = motion.userAcceleration.z
+            self?.gravityX = motion.gravity.x
+            self?.gravityY = motion.gravity.y
+            self?.gravityZ = motion.gravity.z
         }
     }
 
