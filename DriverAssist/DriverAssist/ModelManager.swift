@@ -40,8 +40,23 @@ final class ModelManager: ObservableObject {
 
     private static let highResTiers: Set<DetectorModel> = [.nano, .small]
 
+    // Actual model input dimensions, for HUD display -- see the resolution
+    // comparison this came out of (isHighResEnabled's doc comment above).
+    private static let baseResolutionLabel = "1152x640"
+    private static let highResResolutionLabel = "1920x1088"
+
     private static func highResResourceName(for tier: DetectorModel) -> String {
-        "\(tier.rawValue)-1920x1088"
+        "\(tier.rawValue)-\(highResResolutionLabel)"
+    }
+
+    /// What the HUD shows in place of the old two-pass indicator -- the actual
+    /// input resolution the selected model is running at right now, not just
+    /// "low res"/"high res", since the numbers themselves are what a real
+    /// drive's latency/thermal readings need to be interpreted against.
+    var currentResolutionLabel: String {
+        (isHighResEnabled && Self.highResTiers.contains(selectedModel))
+            ? Self.highResResolutionLabel
+            : Self.baseResolutionLabel
     }
 
     /// The high-res variant is substituted in only once it's actually

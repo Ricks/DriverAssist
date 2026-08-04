@@ -211,7 +211,7 @@ final class InferenceEngine: ObservableObject {
     /// to reproduce the preview's aspect-fill crop instead of naively stretching boxes
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
-    @Published private(set) var isTwoPassEnabled = true
+    @Published private(set) var isTwoPassEnabled = false
     /// Wall-clock time the most recently completed frame took end to end --
     /// decoder inference plus tracking/GMC (see `finishSuccess`), in ms —
     /// feeds `CameraManager.recordInferenceLatency` for the thermal "% of
@@ -235,15 +235,22 @@ final class InferenceEngine: ObservableObject {
         self.trackingManager = trackingManager
         self.egoSpeedManager = egoSpeedManager
         self.pitchSensor = pitchSensor
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: Self.twoPassDefaultsKey) != nil {
-            isTwoPassEnabled = defaults.bool(forKey: Self.twoPassDefaultsKey)
-        }
+        // Two-pass is hardcoded off for the time being -- deliberately NOT restoring
+        // a persisted on-state here (same reasoning as isAutoLowLightEnabled not
+        // persisting), so a stale "two pass on" from earlier testing can't silently
+        // carry forward into every later launch/rebuild the way it just did.
     }
 
+    /// No-op for now -- disabled along with the voice command's effect, not just
+    /// its HUD display, since the resolution label replaced the old "two-pass:
+    /// on/off" text (see ContentView). Without that field a misheard "two pass
+    /// on" would silently change behavior with no on-screen indication at all.
+    /// Trivially reversible: restore the two lines below once two-pass is back
+    /// on the HUD (or otherwise made visible) and worth testing again.
     func setTwoPassEnabled(_ enabled: Bool) {
-        isTwoPassEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: Self.twoPassDefaultsKey)
+        _ = enabled
+        // isTwoPassEnabled = enabled
+        // UserDefaults.standard.set(enabled, forKey: Self.twoPassDefaultsKey)
     }
 
     func process(

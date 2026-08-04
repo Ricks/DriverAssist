@@ -11,8 +11,8 @@ import UIKit
 
 /// Listens continuously for a fixed set of spoken commands ("small", "nano", "medium",
 /// "low light on", "low light off", "low light auto", "two pass on", "two pass off",
-/// "stabilization on", "stabilization off", "high res", "low res", "calibrate pitch")
-/// and reports them via `onCommand`.
+/// "stabilization on", "stabilization off", "high resolution", "low resolution",
+/// "calibrate pitch") and reports them via `onCommand`.
 ///
 /// No tracking-level command (e.g. "tracking normal"/"tracking high") for now --
 /// TrackingLevel.appearance is a no-op stub until a real on-device ReID model is
@@ -51,6 +51,15 @@ final class VoiceCommandManager: NSObject, ObservableObject {
     /// Bumped on every (re)start so stale completion callbacks from a just-cancelled
     /// task — which fire asynchronously — can recognize they're superseded and no-op.
     private var listeningGeneration = 0
+
+    /// How much of the current task's accumulated transcript (by Character count)
+    /// has already been matched against -- SFSpeechRecognitionTask's transcript only
+    /// grows within one task's lifetime, so without tracking this, an old word still
+    /// sitting in the string (e.g. "nano" from a minute ago) would keep re-matching
+    /// forever and block later commands earlier in the if/else chain (e.g. "small")
+    /// from ever being reached again. Reset to 0 whenever a genuinely new task starts
+    /// (see `startRecognitionTask`).
+    private var matchedTranscriptLength: Int = 0
 
     private var observersRegistered = false
     /// True while paused for an audio interruption or backgrounding, so foreground/
@@ -181,14 +190,15 @@ final class VoiceCommandManager: NSObject, ObservableObject {
     }
 
     /// Speech recognition tasks are single-shot (they end after ~1 minute or a
-    /// pause), so a fresh one is started after every result — including right
-    /// after a command fires, which also clears the accumulated transcript so
-    /// the same phrase can't immediately re-trigger.
+    /// pause), so a fresh one is started once the current one ends. Deliberately
+    /// NOT restarted just because a command matched anymore -- see the comment in
+    /// `handle` on why that was actually the source of a multi-second lag.
     private func startRecognitionTask() {
         guard let speechRecognizer, speechRecognizer.isAvailable else { return }
 
         listeningGeneration += 1
         let generation = listeningGeneration
+        matchedTranscriptLength = 0
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -201,6 +211,13 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             Task { @MainActor in
                 guard let self, generation == self.listeningGeneration else { return }
                 if let result {
+                    // Logged raw (partial and final alike) so a slow-to-match command
+                    // like the recent multi-second "low light auto" delay can actually
+                    // be diagnosed from real timing/transcript data next time, instead
+                    // of guessed at -- same reasoning as this app's other debug logging.
+                    DebugFileLogger.log(
+                        "voice: isFinal=\(result.isFinal) transcript=\"\(result.bestTranscription.formattedString)\""
+                    )
                     self.handle(transcript: result.bestTranscription.formattedString)
                 }
                 // Tasks are single-shot — they always end via an error or a final
@@ -216,7 +233,20 @@ final class VoiceCommandManager: NSObject, ObservableObject {
     }
 
     private func handle(transcript: String) {
-        let lowered = transcript.lowercased()
+        // Only match against the portion of the transcript not already matched --
+        // see `matchedTranscriptLength`'s doc comment. A transcript shorter than
+        // what's on record means a new task actually started without going through
+        // `startRecognitionTask` resetting it first (shouldn't normally happen, but
+        // fail safe rather than crash on the negative-range dropFirst below).
+        guard transcript.count >= matchedTranscriptLength else {
+            matchedTranscriptLength = 0
+            return
+        }
+        let newPortion = String(transcript.dropFirst(matchedTranscriptLength))
+        // Hyphens normalized to spaces -- Apple's dictation renders common compound
+        // terms like "low-light" hyphenated (matching this app's own HUD text), which
+        // would otherwise never match the space-separated phrases checked below.
+        let lowered = newPortion.lowercased().replacingOccurrences(of: "-", with: " ")
         let command: Command?
         if lowered.contains("low light auto") {
             command = .lowLightAuto
@@ -235,12 +265,15 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             command = .stabilization(true)
         } else if lowered.contains("stabilization off") {
             command = .stabilization(false)
-        // Voice equivalent of the vertical swipe (see ContentView) -- "low res"
-        // checked as its own distinct phrase, not just "low ...", so it can't be
-        // confused with "low light on/off" above.
-        } else if lowered.contains("high res") {
+        // Voice equivalent of the vertical swipe (see ContentView). "resolution"
+        // rather than "res" -- confirmed from real on-device logs that "res" as a
+        // bare word is acoustically ambiguous enough that the recognizer never once
+        // transcribed it correctly (got "Rez"/"IRS"/"Iris"/"Eris" instead, repeatedly,
+        // across a dozen+ tries); "res" kept as a fallback in case it's ever heard
+        // correctly, but "resolution" is the reliable phrase.
+        } else if lowered.contains("high resolution") || lowered.contains("high res") {
             command = .highRes(true)
-        } else if lowered.contains("low res") {
+        } else if lowered.contains("low resolution") || lowered.contains("low res") {
             command = .highRes(false)
         } else if lowered.contains("calibrate pitch") {
             command = .calibratePitch
@@ -255,10 +288,16 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         }
         guard let command else { return }
 
+        // Deliberately NOT tearing down/restarting the recognition task here anymore
+        // -- confirmed from real on-device logs that doing so cost 5-12 seconds of
+        // dead air before the new task produced its next partial result (on-device
+        // SFSpeechRecognitionTask cold-start), which was the actual source of the
+        // "took several seconds" lag. The task keeps running; `matchedTranscriptLength`
+        // above is what prevents this same phrase from re-firing on every subsequent
+        // partial result instead.
+        matchedTranscriptLength = transcript.count
+        DebugFileLogger.log("voice: MATCHED \(command)")
         onCommand?(command)
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        startRecognitionTask()
     }
 
     private func isTwoPassCommand(_ lowered: String, state: String) -> Bool {

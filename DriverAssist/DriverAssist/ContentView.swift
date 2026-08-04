@@ -85,7 +85,7 @@ struct InferenceView: View {
                 Spacer()
                 HStack {
                     VStack(alignment: .leading) {
-                        Text(twoPassLabel)
+                        Text(resolutionLabel)
                             .font(.system(size: 36, weight: .medium))
                             .foregroundStyle(.white.opacity(0.75))
                             .shadow(color: .black.opacity(0.6), radius: 2)
@@ -219,8 +219,8 @@ struct InferenceView: View {
         return cameraManager.isAutoLowLightEnabled ? "low-light: auto (\(state))" : "low-light: \(state)"
     }
 
-    private var twoPassLabel: String {
-        "two-pass: \(inferenceEngine.isTwoPassEnabled ? "on" : "off")"
+    private var resolutionLabel: String {
+        "res: \(modelManager.currentResolutionLabel)"
     }
 
     private var stabilizationLabel: String {
