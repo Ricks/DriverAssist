@@ -50,20 +50,42 @@ struct InferenceView: View {
     // accidental touch or a misheard command -- see the long-press gesture
     // below and the guards in the voice command switch in onAppear.
     @State private var parametersLocked = false
-    @State private var showLockToast = false
+
+    // Brief center-screen confirmation for one-shot actions (lock toggle,
+    // attitude calibration) -- generalized to arbitrary text rather than a
+    // lock-only bool, since calibration needs to show the actual captured
+    // pitch/roll values for an immediate sanity check, not just "done".
+    @State private var toastText: String?
 
     private func toggleParametersLocked() {
         parametersLocked.toggle()
         DebugFileLogger.log("gesture: MATCHED toggleLock(\(parametersLocked))")
-        flashLockToast()
+        flashToast(parametersLocked ? "LOCKED" : "UNLOCKED")
     }
 
-    private func flashLockToast() {
-        withAnimation { showLockToast = true }
+    private func flashToast(_ text: String) {
+        withAnimation { toastText = text }
         Task {
             try? await Task.sleep(for: .seconds(1.5))
-            withAnimation { showLockToast = false }
+            withAnimation { toastText = nil }
         }
+    }
+
+    /// Deliberate, UI-triggered pitch+roll calibration -- see
+    /// PitchSensor.captureReferenceAttitude() and DistanceEstimator.swift's
+    /// file-level comment for why this must be done standing still on known-
+    /// flat, level ground, not while driving. Not gated by parametersLocked,
+    /// same reasoning as the voice command's .calibrateAttitude case: this is
+    /// a one-shot action, not a config parameter a locked test run needs held
+    /// fixed.
+    private func calibrateAttitude() {
+        guard let result = inferenceEngine.pitchSensor.captureReferenceAttitude() else {
+            DebugFileLogger.log("calibrate: FAILED no motion reading yet")
+            flashToast("CALIBRATION FAILED\n(no sensor data yet)")
+            return
+        }
+        DebugFileLogger.log("calibrate: MATCHED pitch=\(result.pitch) roll=\(result.roll)")
+        flashToast(String(format: "CALIBRATED\npitch %.1f°  roll %.1f°", result.pitch, result.roll))
     }
 
     init(modelManager: ModelManager) {
@@ -127,14 +149,34 @@ struct InferenceView: View {
             .padding(.vertical, 12)
             .ignoresSafeArea(edges: [.top, .bottom])
 
-            if showLockToast {
-                Text(parametersLocked ? "LOCKED" : "UNLOCKED")
+            if let toastText {
+                Text(toastText)
                     .font(.system(size: 48, weight: .bold))
                     .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
                     .padding(.vertical, 16)
                     .background(Color.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 20))
                     .transition(.opacity)
+            }
+
+            if hasPressedGo {
+                VStack {
+                    Spacer()
+                    Button {
+                        calibrateAttitude()
+                    } label: {
+                        Text("Calibrate")
+                            .font(.system(size: 28, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color.black.opacity(0.35), in: Capsule())
+                    }
+                    .padding(.bottom, 24)
+                }
+                .ignoresSafeArea(edges: .bottom)
             }
 
             if !hasPressedGo {
@@ -162,7 +204,7 @@ struct InferenceView: View {
                 .onEnded { value in
                     guard !parametersLocked else {
                         DebugFileLogger.log("gesture: IGNORED (locked) drag")
-                        flashLockToast()
+                        flashToast("LOCKED")
                         return
                     }
                     if abs(value.translation.width) > abs(value.translation.height) {
@@ -249,10 +291,10 @@ struct InferenceView: View {
                 case .highRes(let enabled):
                     guard !ignoredIfLocked("highRes(\(enabled))") else { return }
                     modelManager?.setHighResEnabled(enabled)
-                case .calibratePitch:
+                case .calibrateAttitude:
                     // Not a config parameter -- a one-shot calibration action, stays
                     // available even while locked.
-                    inferenceEngine?.pitchSensor.captureReferencePitch()
+                    inferenceEngine?.pitchSensor.captureReferenceAttitude()
                 }
             }
             // Disabled for now (2026-08-05) -- test drives are mostly run LOCKED now,

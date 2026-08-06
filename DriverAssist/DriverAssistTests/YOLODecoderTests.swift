@@ -28,7 +28,7 @@ import CoreML
         // car (class 2), pixel box (100,100)-(300,400) in 640-space, confidence 0.8
         let output = try makeOutput(rows: [[100, 100, 300, 400, 0.8, 2]])
 
-        let detections = try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640)
+        let detections = try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640)
 
         #expect(detections.count == 1)
         let detection = try #require(detections.first)
@@ -43,19 +43,19 @@ import CoreML
     @Test func dropsBelowConfidenceThreshold() throws {
         // 0.1 confidence is below the 0.25 threshold.
         let output = try makeOutput(rows: [[100, 100, 300, 400, 0.1, 2]])
-        #expect(try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640).isEmpty)
+        #expect(try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640).isEmpty)
     }
 
     @Test func dropsNonTargetClasses() throws {
         // Class 16 ("dog" in COCO) is not a driving-relevant target.
         let output = try makeOutput(rows: [[100, 100, 300, 400, 0.9, 16]])
-        #expect(try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640).isEmpty)
+        #expect(try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640).isEmpty)
     }
 
     @Test func roundsFloatingPointClassIds() throws {
         // Real model output stores class id as float; small imprecision must round correctly.
         let output = try makeOutput(rows: [[0, 0, 64, 64, 0.9, 4.998]])
-        let detections = try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640)
+        let detections = try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640)
         #expect(detections.first?.label == "bus") // class 5 = "bus"
     }
 
@@ -65,7 +65,7 @@ import CoreML
             [100, 100, 300, 300, 0.9, 2],
             [105, 105, 305, 305, 0.5, 2],
         ])
-        let detections = try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640)
+        let detections = try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640)
         #expect(detections.count == 1)
         #expect(abs((detections.first?.confidence ?? 0) - 0.9) < 0.0001)
     }
@@ -77,7 +77,7 @@ import CoreML
         let output = try MLDictionaryFeatureProvider(dictionary: ["output": MLFeatureValue(multiArray: array)])
 
         #expect {
-            try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640)
+            try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640)
         } throws: { error in
             if case InferenceError.unexpectedShape = error { return true }
             return false
@@ -89,7 +89,7 @@ import CoreML
         let output = try MLDictionaryFeatureProvider(dictionary: ["output": MLFeatureValue(string: "not-an-array")])
 
         #expect {
-            try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640)
+            try decoder.decodeDetections(from: output, modelWidth: 640, modelHeight: 640, sourceWidth: 640, sourceHeight: 640)
         } throws: { error in
             if case InferenceError.missingOutput = error { return true }
             return false

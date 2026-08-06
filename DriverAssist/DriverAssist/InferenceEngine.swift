@@ -86,12 +86,19 @@ struct YOLODecoder: Sendable {
         return DetectionFilter.nonMaxSuppression(detections)
     }
 
-    // The camera delivers full-resolution (4K where supported), 16:9 frames. The
-    // model's input is exported at a matching 1152x640 (also 16:9, not square), so
-    // .scaleFill no longer distorts proportions the way it would squashing 16:9 into
-    // a square — it now just scales both axes by very nearly the same factor.
-    // Capturing at the highest resolution available means more real detail survives
-    // this downscale, which is what actually helps detect small/distant objects.
+    // Capture is 1080p/15fps (see CameraManager -- moved off 4K/30fps after a real
+    // drive showed that pipeline alone thermally throttled the device 10-15x,
+    // independent of model choice). The model's input (1152x640 standard, 1920x1088
+    // high-res) is close to but not exactly the same aspect ratio as that 1920x1080
+    // capture, so .scaleFit (preserve aspect ratio, letterbox the rest) is used
+    // instead of .scaleFill (stretch to exact size, distorting proportions) --
+    // matches how the offline resolution/accuracy validation actually ran
+    // (tools/benchmark.py's run_reference_model calls ultralytics' own
+    // model.predict(imgsz:), which letterboxes by default), and avoids even the
+    // small residual stretch .scaleFill would otherwise apply. See
+    // decodeDetections for the corresponding un-letterbox math this requires --
+    // without it, every detection's reported position would silently shift by the
+    // padding offset.
     private func runSinglePass(_ image: CIImage, model: MLModel, constraint: MLImageConstraint) throws -> [Detection] {
         guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
             throw InferenceError.missingOutput("failed to create CGImage from pixel buffer")
@@ -99,14 +106,16 @@ struct YOLODecoder: Sendable {
         let imageFeature = try MLFeatureValue(
             cgImage: cgImage,
             constraint: constraint,
-            options: [.cropAndScale: VNImageCropAndScaleOption.scaleFill.rawValue]
+            options: [.cropAndScale: VNImageCropAndScaleOption.scaleFit.rawValue]
         )
         let input = try MLDictionaryFeatureProvider(dictionary: ["image": imageFeature])
         let output = try model.prediction(from: input)
         return try decodeDetections(
             from: output,
             modelWidth: Float(constraint.pixelsWide),
-            modelHeight: Float(constraint.pixelsHigh)
+            modelHeight: Float(constraint.pixelsHigh),
+            sourceWidth: Float(image.extent.width),
+            sourceHeight: Float(image.extent.height)
         )
     }
 
@@ -143,7 +152,13 @@ struct YOLODecoder: Sendable {
         }
     }
 
-    func decodeDetections(from output: MLFeatureProvider, modelWidth: Float, modelHeight: Float) throws -> [Detection] {
+    func decodeDetections(
+        from output: MLFeatureProvider,
+        modelWidth: Float,
+        modelHeight: Float,
+        sourceWidth: Float,
+        sourceHeight: Float
+    ) throws -> [Detection] {
         guard let array = output.featureNames.lazy
             .compactMap({ output.featureValue(for: $0)?.multiArrayValue })
             .first
@@ -155,6 +170,22 @@ struct YOLODecoder: Sendable {
         guard shape.count == 3, shape[0] == 1, shape[2] >= 6 else {
             throw InferenceError.unexpectedShape(shape)
         }
+
+        // .scaleFit (see runSinglePass) scales the source uniformly -- by
+        // whichever axis is the tighter fit -- to preserve its aspect ratio
+        // within the model's input buffer, then centers it, leaving letterbox
+        // bars on the loose axis. Raw model-space coordinates have to be
+        // un-letterboxed (subtract the padding offset, divide by the
+        // *scaled* content size, not the full buffer size) before they're
+        // valid normalized source-image coordinates -- dividing by
+        // modelWidth/modelHeight directly, like the old .scaleFill path did,
+        // would silently include the padding bars in the denominator and
+        // shift every box.
+        let letterboxScale = min(modelWidth / sourceWidth, modelHeight / sourceHeight)
+        let scaledContentWidth = sourceWidth * letterboxScale
+        let scaledContentHeight = sourceHeight * letterboxScale
+        let xOffset = (modelWidth - scaledContentWidth) / 2
+        let yOffset = (modelHeight - scaledContentHeight) / 2
 
         let numDetections = shape[1]
         var results: [Detection] = []
@@ -170,10 +201,20 @@ struct YOLODecoder: Sendable {
             // dimensions independently — using a single shared divisor here would
             // silently reintroduce the aspect-ratio distortion the rectangular export
             // was meant to eliminate.
-            let x1 = value(in: array, at: [0, i, 0]) / modelWidth
-            let y1 = value(in: array, at: [0, i, 1]) / modelHeight
-            let x2 = value(in: array, at: [0, i, 2]) / modelWidth
-            let y2 = value(in: array, at: [0, i, 3]) / modelHeight
+            let rawX1 = value(in: array, at: [0, i, 0])
+            let rawY1 = value(in: array, at: [0, i, 1])
+            let rawX2 = value(in: array, at: [0, i, 2])
+            let rawY2 = value(in: array, at: [0, i, 3])
+
+            // Clamp to [0, 1] -- a box that extends into the letterbox padding
+            // (a real object partially at the frame edge) would otherwise
+            // decode to a coordinate outside the source image entirely, which
+            // .scaleFill's full-buffer-is-real-content assumption never had
+            // to guard against.
+            let x1 = min(1, max(0, (rawX1 - xOffset) / scaledContentWidth))
+            let y1 = min(1, max(0, (rawY1 - yOffset) / scaledContentHeight))
+            let x2 = min(1, max(0, (rawX2 - xOffset) / scaledContentWidth))
+            let y2 = min(1, max(0, (rawY2 - yOffset) / scaledContentHeight))
 
             let box = CGRect(
                 x: CGFloat(x1),

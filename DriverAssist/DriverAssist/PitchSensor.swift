@@ -50,6 +50,7 @@ import Foundation
 final class PitchSensor: ObservableObject {
     @Published private(set) var pitchDegrees: Double?
     @Published private(set) var referencePitchDegrees: Double?
+    @Published private(set) var referenceRollDegrees: Double?
 
     /// Raw gyro rotation rate (deg/s), in the device's own x/y/z axes --
     /// deliberately NOT resolved down to a single "yaw rate" here, because
@@ -98,12 +99,23 @@ final class PitchSensor: ObservableObject {
         return pitch - reference
     }
 
+    /// Same idea as `pitchDriftDegrees` -- nil until both a live reading and
+    /// a saved reference exist.
+    var rollDriftDegrees: Double? {
+        guard let roll = rollDegrees, let reference = referenceRollDegrees else { return nil }
+        return roll - reference
+    }
+
     private let motionManager = CMMotionManager()
-    private static let referenceDefaultsKey = "settings.referencePitchDegrees"
+    private static let referencePitchDefaultsKey = "settings.referencePitchDegrees"
+    private static let referenceRollDefaultsKey = "settings.referenceRollDegrees"
 
     init() {
-        if UserDefaults.standard.object(forKey: Self.referenceDefaultsKey) != nil {
-            referencePitchDegrees = UserDefaults.standard.double(forKey: Self.referenceDefaultsKey)
+        if UserDefaults.standard.object(forKey: Self.referencePitchDefaultsKey) != nil {
+            referencePitchDegrees = UserDefaults.standard.double(forKey: Self.referencePitchDefaultsKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.referenceRollDefaultsKey) != nil {
+            referenceRollDegrees = UserDefaults.standard.double(forKey: Self.referenceRollDefaultsKey)
         }
     }
 
@@ -145,13 +157,22 @@ final class PitchSensor: ObservableObject {
     }
 
     /// Call once the mount is freshly set up (phone reattached, aligned to
-    /// the witness mark) to save the current reading as the reference future
-    /// drives compare against. Exposed here as a plain method -- not yet
-    /// wired to any UI/voice trigger beyond VoiceCommandManager's "calibrate
-    /// pitch" command.
-    func captureReferencePitch() {
-        guard let pitch = pitchDegrees else { return }
+    /// the witness mark) and the vehicle is on known-flat, level ground --
+    /// saves the current pitch AND roll together as the reference both
+    /// `DistanceEstimator` and future drift checks use. Pitch and roll are
+    /// captured together, not separately, since both need the same flat-
+    /// ground precondition to be meaningful (see DistanceEstimator.swift's
+    /// file-level comment on why live/road-tilted readings can't substitute
+    /// for this). Returns the captured values so a caller (the UI button)
+    /// can show them for an immediate sanity check -- nil if no motion
+    /// reading is available yet to capture.
+    @discardableResult
+    func captureReferenceAttitude() -> (pitch: Double, roll: Double)? {
+        guard let pitch = pitchDegrees, let roll = rollDegrees else { return nil }
         referencePitchDegrees = pitch
-        UserDefaults.standard.set(pitch, forKey: Self.referenceDefaultsKey)
+        referenceRollDegrees = roll
+        UserDefaults.standard.set(pitch, forKey: Self.referencePitchDefaultsKey)
+        UserDefaults.standard.set(roll, forKey: Self.referenceRollDefaultsKey)
+        return (pitch, roll)
     }
 }
