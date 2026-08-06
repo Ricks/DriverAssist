@@ -130,10 +130,14 @@ struct InferenceView: View {
                 .onEnded { value in
                     if abs(value.translation.width) > abs(value.translation.height) {
                         // Left swipe (finger moves right-to-left) selects nano; right selects small.
-                        modelManager.switchModel(to: value.translation.width < 0 ? .nano : .small)
+                        let target: DetectorModel = value.translation.width < 0 ? .nano : .small
+                        DebugFileLogger.log("gesture: MATCHED selectModel(\(target.rawValue))")
+                        modelManager.switchModel(to: target)
                     } else {
                         // Swipe up sets high-res (1920x1088) input, swipe down sets standard (1152x640).
-                        modelManager.setHighResEnabled(value.translation.height < 0)
+                        let enabled = value.translation.height < 0
+                        DebugFileLogger.log("gesture: MATCHED setHighRes(\(enabled))")
+                        modelManager.setHighResEnabled(enabled)
                     }
                 }
         )

@@ -43,6 +43,32 @@ RANGE_BUFFER_BEFORE_SECONDS = 2.0
 RANGE_BUFFER_AFTER_SECONDS = 5.0
 
 
+def pull_logs(tools_dir: Path) -> None:
+    """Runs pull_logs.sh to refresh the shared logs pool from the device before
+    extracting this session's slice -- without this, a session packaged after the
+    pool went stale (nobody re-ran pull_logs.sh since an earlier drive) silently
+    filters against old data and finds nothing for the new time range, which then
+    surfaces as a confusing downstream crash in reconstruct_annotated.py instead of
+    the real problem. Failure here (device unreachable, wifi flake -- known to
+    happen) doesn't abort packaging: the shared pool may still be usable/current
+    enough, or the caller may be intentionally working offline from already-pulled
+    data, so this only warns and lets write_session_logs's own empty-range check
+    below catch it if the local data really is too stale to use.
+    """
+    script = tools_dir / "pull_logs.sh"
+    if not script.exists():
+        return
+    print("Pulling latest logs from device...")
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Warning: pull_logs.sh failed ({result.returncode}) -- continuing with "
+              f"whatever's already local, which may be stale:\n{result.stderr.strip()}",
+              file=sys.stderr)
+    else:
+        for line in result.stdout.splitlines():
+            print(f"  {line}")
+
+
 def find_session_video(session_dir: Path) -> Path:
     candidates = [
         p for p in session_dir.iterdir()
@@ -106,6 +132,25 @@ def write_session_logs(video: Path, session_dir: Path, logs_dir: Path) -> tuple:
 
     print(f"Wrote {len(session_detections)} detection entries -> {detections_path}")
     print(f"Wrote {lines_written} debug-log lines -> {debug_log_path}")
+
+    # Zero of both is almost never a real empty drive -- the app logs a line per
+    # captured frame (15fps) regardless of whether anything was detected, so a
+    # genuine drive has thousands of overlay-debug lines even with zero objects
+    # in frame. This combination is the actual symptom of a stale shared logs
+    # pool (nobody re-ran pull_logs.sh since an earlier drive), which otherwise
+    # surfaces downstream as a confusing reconstruct_annotated.py crash instead
+    # of the real, fixable cause.
+    if not session_detections and lines_written == 0:
+        sys.exit(
+            f"Found 0 entries in {logs_dir} for this video's time range "
+            f"({range_start:.0f}-{range_end if range_end == float('inf') else f'{range_end:.0f}'}). "
+            "This almost certainly means the shared logs pool is stale, not that the "
+            "drive had nothing happen -- pull_logs.sh should have refreshed it "
+            "automatically unless that failed (check the warning above, if any) or "
+            "--skip-pull was passed. Fix the underlying issue and re-run rather than "
+            "trusting this output."
+        )
+
     return detections_path, debug_log_path
 
 
@@ -125,11 +170,21 @@ def main() -> None:
         "--skip-annotate", action="store_true",
         help="Only extract this session's local detections.jsonl/overlay-debug.log -- skip generating the annotated reconstruction",
     )
+    parser.add_argument(
+        "--skip-pull", action="store_true",
+        help="Don't run pull_logs.sh first -- use whatever's already in --logs-dir as-is",
+    )
     args = parser.parse_args()
 
     session_dir = args.session_dir
     if not session_dir.is_dir():
         sys.exit(f"{session_dir} is not a directory -- create it and move the raw recording in first.")
+
+    tools_dir = Path(__file__).parent
+    if args.skip_pull:
+        print("--skip-pull passed -- not refreshing the shared logs pool from the device.")
+    else:
+        pull_logs(tools_dir)
 
     video = find_session_video(session_dir)
     print(f"Session video: {video}")
@@ -142,7 +197,6 @@ def main() -> None:
     else:
         detections_path, debug_log_path = write_session_logs(video, session_dir, args.logs_dir)
 
-    tools_dir = Path(__file__).parent
     annotated_path = session_dir / f"{video.stem}-annotated.mp4"
     if args.skip_annotate:
         print(f"--skip-annotate passed -- not generating {annotated_path.name}.")

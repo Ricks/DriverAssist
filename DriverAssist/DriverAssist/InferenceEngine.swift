@@ -276,6 +276,7 @@ final class InferenceEngine: ObservableObject {
         let twoPass = isTwoPassEnabled
         let startTime = CFAbsoluteTimeGetCurrent()
         let modelLabel = modelManager.selectedModel.rawValue
+        let resolutionLabel = modelManager.actualInputResolutionLabel
 
         queue.async { [weak self] in
             do {
@@ -292,6 +293,7 @@ final class InferenceEngine: ObservableObject {
                         pixelBuffer: pixelBufferBox.value,
                         elapsedMs: elapsedMs,
                         modelLabel: modelLabel,
+                        resolutionLabel: resolutionLabel,
                         twoPass: twoPass,
                         lowLightEnabled: lowLightEnabled,
                         autoLowLightEnabled: autoLowLightEnabled,
@@ -311,6 +313,7 @@ final class InferenceEngine: ObservableObject {
         pixelBuffer: CVPixelBuffer,
         elapsedMs: Double,
         modelLabel: String,
+        resolutionLabel: String,
         twoPass: Bool,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
@@ -326,6 +329,7 @@ final class InferenceEngine: ObservableObject {
         DetectionLogger.log(
             timestamp: Date().timeIntervalSince1970,
             model: modelLabel,
+            resolution: resolutionLabel,
             twoPass: twoPass,
             elapsedMs: elapsedMs,
             lowLightEnabled: lowLightEnabled,

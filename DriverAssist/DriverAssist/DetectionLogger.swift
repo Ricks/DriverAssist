@@ -32,6 +32,10 @@ struct DetectionLogEntry: Codable {
 
     let t: Double
     let model: String
+    // Actual input resolution used for this frame's inference ("1152x640" or
+    // "1920x1088") -- see ModelManager.actualInputResolutionLabel. Logged
+    // per-entry, same as `model`, since this can also change mid-drive.
+    let resolution: String
     let twoPass: Bool
     let elapsedMs: Double
     let lowLightEnabled: Bool
@@ -114,6 +118,7 @@ enum DetectionLogger {
     static func log(
         timestamp: Double,
         model: String,
+        resolution: String,
         twoPass: Bool,
         elapsedMs: Double,
         lowLightEnabled: Bool,
@@ -141,6 +146,7 @@ enum DetectionLogger {
         let entry = DetectionLogEntry(
             t: timestamp,
             model: model,
+            resolution: resolution,
             twoPass: twoPass,
             elapsedMs: elapsedMs,
             lowLightEnabled: lowLightEnabled,

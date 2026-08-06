@@ -151,7 +151,15 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var isProbingLowLight = false
     private nonisolated(unsafe) var probeStartedAt: CFAbsoluteTime = 0
     private nonisolated(unsafe) var lastProbeTime: CFAbsoluteTime = 0
-    private nonisolated static let probeInterval: CFAbsoluteTime = 2
+    // Was 2s -- confirmed (2026-08-05 Obsidian review) this produces a visible ~0.3s
+    // brightness dip baked directly into the recording every interval while boost is
+    // active (no separate compositing step -- recording reads the same pixel buffer
+    // this probe biases). 5s cuts that by more than half with no new calibration risk.
+    // The real fix -- estimating scene brightness from device.iso/exposureDuration
+    // instead of ever touching bias -- needs its own validated threshold system in
+    // different units, which isn't safe to guess without real device data; this is
+    // the safe mitigation until that's built and tuned against a real night drive.
+    private nonisolated static let probeInterval: CFAbsoluteTime = 5
     private nonisolated static let probeSettleDuration: CFAbsoluteTime = 0.3
 
     /// 0-255 brightness thresholds (see `sampleAutoLowLightIfDue`). The gap between

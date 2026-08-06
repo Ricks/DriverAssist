@@ -59,6 +59,18 @@ final class ModelManager: ObservableObject {
             : Self.baseResolutionLabel
     }
 
+    /// Same idea as `currentResolutionLabel`, but for telemetry rather than the
+    /// HUD: reflects which model `model` will actually return right now, not
+    /// just the user's toggle intent. The two can briefly disagree right after
+    /// swiping to high-res, while that variant is still loading (see `model`'s
+    /// own fallback) -- logging this instead of `currentResolutionLabel` means
+    /// a drive's detections.jsonl records what really ran, not what was asked for.
+    var actualInputResolutionLabel: String {
+        (isHighResEnabled && highResModels[selectedModel] != nil)
+            ? Self.highResResolutionLabel
+            : Self.baseResolutionLabel
+    }
+
     /// The high-res variant is substituted in only once it's actually
     /// finished loading -- falling back to the standard resolution rather
     /// than nil during that window means a swipe to high-res doesn't
