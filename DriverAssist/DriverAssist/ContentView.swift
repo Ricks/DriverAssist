@@ -44,6 +44,28 @@ struct InferenceView: View {
     @State private var previousBrightness: CGFloat = UIScreen.main.brightness
     private static let dimmedBrightness: CGFloat = 0.6
 
+    // Freezes model/resolution/low-light/stabilization against both the swipe
+    // gesture and voice commands, for test drives that need a fixed, known
+    // config for the whole run instead of one that can drift from an
+    // accidental touch or a misheard command -- see the long-press gesture
+    // below and the guards in the voice command switch in onAppear.
+    @State private var parametersLocked = false
+    @State private var showLockToast = false
+
+    private func toggleParametersLocked() {
+        parametersLocked.toggle()
+        DebugFileLogger.log("gesture: MATCHED toggleLock(\(parametersLocked))")
+        flashLockToast()
+    }
+
+    private func flashLockToast() {
+        withAnimation { showLockToast = true }
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            withAnimation { showLockToast = false }
+        }
+    }
+
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         _inferenceEngine  = StateObject(
@@ -105,6 +127,16 @@ struct InferenceView: View {
             .padding(.vertical, 12)
             .ignoresSafeArea(edges: [.top, .bottom])
 
+            if showLockToast {
+                Text(parametersLocked ? "LOCKED" : "UNLOCKED")
+                    .font(.system(size: 48, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 32)
+                    .padding(.vertical, 16)
+                    .background(Color.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 20))
+                    .transition(.opacity)
+            }
+
             if !hasPressedGo {
                 Color.black.ignoresSafeArea()
                 Button {
@@ -128,6 +160,11 @@ struct InferenceView: View {
             // on this grid at all). Two-pass is also voice-only now.
             DragGesture(minimumDistance: 24)
                 .onEnded { value in
+                    guard !parametersLocked else {
+                        DebugFileLogger.log("gesture: IGNORED (locked) drag")
+                        flashLockToast()
+                        return
+                    }
                     if abs(value.translation.width) > abs(value.translation.height) {
                         // Left swipe (finger moves right-to-left) selects nano; right selects small.
                         let target: DetectorModel = value.translation.width < 0 ? .nano : .small
@@ -140,6 +177,12 @@ struct InferenceView: View {
                         modelManager.setHighResEnabled(enabled)
                     }
                 }
+        )
+        .simultaneousGesture(
+            // Long-press anywhere toggles the lock, whether currently locked or
+            // not -- always available so a locked drive can still be unlocked.
+            LongPressGesture(minimumDuration: 0.8)
+                .onEnded { _ in toggleParametersLocked() }
         )
         .onChange(of: inferenceEngine.lastFrameElapsedMs) { _, newValue in
             let configKey = "\(modelManager.selectedModel.rawValue)|\(inferenceEngine.isTwoPassEnabled)"
@@ -177,25 +220,48 @@ struct InferenceView: View {
             cameraManager.start()
             inferenceEngine.egoSpeedManager.start()
             inferenceEngine.pitchSensor.start()
+            // A Binding (not the plain Bool) so this long-lived closure reads the
+            // lock's live value on every call, instead of freezing whatever it
+            // was at onAppear time.
+            let isLocked = $parametersLocked
+            func ignoredIfLocked(_ label: String) -> Bool {
+                guard isLocked.wrappedValue else { return false }
+                DebugFileLogger.log("voice: IGNORED (locked) \(label)")
+                return true
+            }
             voiceCommandManager.onCommand = { [weak modelManager, weak cameraManager, weak inferenceEngine] command in
                 switch command {
                 case .selectModel(let model):
+                    guard !ignoredIfLocked("selectModel(\(model.rawValue))") else { return }
                     modelManager?.switchModel(to: model)
                 case .lowLight(let enabled):
+                    guard !ignoredIfLocked("lowLight(\(enabled))") else { return }
                     cameraManager?.setLowLightBoost(enabled)
                 case .lowLightAuto:
+                    guard !ignoredIfLocked("lowLightAuto") else { return }
                     cameraManager?.enableAutoLowLight()
                 case .twoPass(let enabled):
+                    guard !ignoredIfLocked("twoPass(\(enabled))") else { return }
                     inferenceEngine?.setTwoPassEnabled(enabled)
                 case .stabilization(let enabled):
+                    guard !ignoredIfLocked("stabilization(\(enabled))") else { return }
                     cameraManager?.setStabilizationEnabled(enabled)
                 case .highRes(let enabled):
+                    guard !ignoredIfLocked("highRes(\(enabled))") else { return }
                     modelManager?.setHighResEnabled(enabled)
                 case .calibratePitch:
+                    // Not a config parameter -- a one-shot calibration action, stays
+                    // available even while locked.
                     inferenceEngine?.pitchSensor.captureReferencePitch()
                 }
             }
-            voiceCommandManager.start()
+            // Disabled for now (2026-08-05) -- test drives are mostly run LOCKED now,
+            // which already blocks every parameter-changing command voice could send,
+            // and the mic session (even correctly configured, see the .duckOthers fix
+            // in VoiceCommandManager) still ducks other apps' audio the whole time
+            // it's listening, which isn't wanted right now. onCommand above stays
+            // wired up so re-enabling this is just uncommenting the one line.
+            // voiceCommandManager.start()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false

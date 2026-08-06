@@ -165,7 +165,12 @@ final class VoiceCommandManager: NSObject, ObservableObject {
     private func beginSession() {
         let audioSession = AVAudioSession.sharedInstance()
         do {
-            try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+            // .record (not .playAndRecord) silently drops .duckOthers -- Apple only
+            // honors that option for .ambient/.soloAmbient/.playback/.playAndRecord --
+            // so this was fully interrupting other apps' audio (e.g. Audible over
+            // CarPlay) instead of ducking it, for as long as voice listening was
+            // active, which in practice means the whole drive.
+            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: .duckOthers)
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             return
