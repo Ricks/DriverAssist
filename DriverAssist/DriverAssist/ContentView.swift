@@ -121,6 +121,16 @@ struct InferenceView: View {
                             .shadow(color: .black.opacity(0.6), radius: 2)
                     }
                     Spacer()
+                    // TEMPORARY -- for the yaw-rate sign/magnitude bench test (rotate the
+                    // mounted phone by hand, watch this update live, confirm sign matches
+                    // the rotation direction before trusting yawRateDegreesPerSecond for
+                    // anything). Remove once that's been validated on a real drive; not
+                    // meant to ship as a permanent HUD element.
+                    Text(yawRateDebugLabel)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(.yellow)
+                        .shadow(color: .black.opacity(0.6), radius: 2)
+                    Spacer()
                     Text(stabilizationLabel)
                         .font(.system(size: 36, weight: .medium))
                         .foregroundStyle(.white.opacity(0.75))
@@ -317,6 +327,16 @@ struct InferenceView: View {
     }
 
     // MARK: Helpers
+
+    // TEMPORARY -- see the Text(yawRateDebugLabel) call site for removal note.
+    // Shows the resolved yaw rate alongside all three raw gyro axes so a
+    // bench test can see at a glance whether the resolved value tracks any
+    // of them sensibly, not just whether it moves at all.
+    private var yawRateDebugLabel: String {
+        let sensor = inferenceEngine.pitchSensor
+        func fmt(_ v: Double?) -> String { v.map { String(format: "%.1f", $0) } ?? "--" }
+        return "yaw \(fmt(sensor.yawRateDegreesPerSecond))°/s  (x\(fmt(sensor.rotationRateXDegreesPerSecond)) y\(fmt(sensor.rotationRateYDegreesPerSecond)) z\(fmt(sensor.rotationRateZDegreesPerSecond)))"
+    }
 
     private var modelLabel: String {
         switch modelManager.selectedModel {

@@ -17,6 +17,17 @@
 //  speed (see DetectionLogger.swift) so real drive data exists to validate
 //  against once the classifier/warning work actually consumes it.
 //
+//  courseDegrees (CLLocation.course, true-north heading, 0..<360) is logged
+//  for the same reason, added specifically to give the yaw-rate validation
+//  plan an independent cross-check: differentiating course over time gives a
+//  second, GPS-derived yaw-rate estimate to compare PitchSensor's gyro-based
+//  one against. No new permission surface -- same CLLocationManager already
+//  authorized for speed, just reading one more field off the same fix. Known
+//  caveat carried over from speed: ~1Hz updates, and course specifically is
+//  only meaningful while actually moving (undefined/noisy near-stationary),
+//  so this cross-check is weakest exactly where the accelerometer one is too
+//  -- slow, tight turns.
+//
 
 import CoreLocation
 import Foundation
@@ -26,6 +37,11 @@ final class EgoSpeedManager: NSObject, ObservableObject {
     /// there isn't one yet, which callers should treat as "no data", not 0.
     @Published private(set) var speedMps: Double?
     @Published private(set) var speedAccuracyMps: Double?
+    /// nil until a valid fix with real course data exists -- CLLocation.course
+    /// is negative when course is unavailable (e.g. not moving), same
+    /// "negative means no data" convention as speed above.
+    @Published private(set) var courseDegrees: Double?
+    @Published private(set) var courseAccuracyDegrees: Double?
     @Published private(set) var authorizationDenied = false
 
     private let manager = CLLocationManager()
@@ -75,9 +91,13 @@ extension EgoSpeedManager: CLLocationManagerDelegate {
         guard let latest = locations.last, latest.speed >= 0 else { return }
         let speed = latest.speed
         let accuracy = latest.speedAccuracy >= 0 ? latest.speedAccuracy : nil
+        let course = latest.course >= 0 ? latest.course : nil
+        let courseAccuracy = latest.courseAccuracy >= 0 ? latest.courseAccuracy : nil
         Task { @MainActor [weak self] in
             self?.speedMps = speed
             self?.speedAccuracyMps = accuracy
+            self?.courseDegrees = course
+            self?.courseAccuracyDegrees = courseAccuracy
         }
     }
 

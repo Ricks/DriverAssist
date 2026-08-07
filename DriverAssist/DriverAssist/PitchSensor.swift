@@ -25,9 +25,13 @@
 //  going through a curve/turn -- classify_leading's central-band assumption
 //  (the followed vehicle stays near frame-center) breaks down on a curve,
 //  and a real yaw-rate signal is a much cheaper way to detect that than
-//  vision-based lane curvature. Not consumed yet either; see the file-level
-//  note on rotationRateXDegreesPerSecond etc. below for why this logs all
-//  three raw axes rather than a single resolved "yaw rate".
+//  vision-based lane curvature. Not consumed yet; see the file-level note on
+//  rotationRateXDegreesPerSecond etc. below for why this logs all three raw
+//  axes AND a resolved yawRateDegreesPerSecond (rotating rotationRate into
+//  world coordinates via the current attitude, rather than guessing which
+//  raw axis is yaw) -- the raw axes stay logged for cross-checking the
+//  resolved value against on a real drive, not because the resolved value
+//  is provisional.
 //
 //  Deliberately uses .xArbitraryZVertical (gravity + gyro only) rather than
 //  a magnetic-north reference frame -- pitch and roll derive from gravity
@@ -41,6 +45,17 @@
 //  in this app's actual landscape mounted orientation is unconfirmed --
 //  check this against reality once the real mount is in use, don't trust
 //  the sign blindly.
+//
+//  YAW RATE SIGN CONVENTION: CONFIRMED 2026-08-06 via bench test (hand-
+//  rotating the mounted phone, watching yawRateDegreesPerSecond live) --
+//  turning right gives negative, turning left gives positive, matching the
+//  documented convention (positive = counter-clockwise viewed from above).
+//  This validates the CMAttitude.rotationMatrix device-to-world assumption
+//  the projection relies on. NOTE: this only confirms the sign, not the
+//  magnitude/accuracy -- still needs the real-drive cross-checks (hand-
+//  labeled turns, GPS-course differentiation, accelerometer a_lateral ~= v*w)
+//  from the validation plan before trusting it for anything quantitative,
+//  e.g. classify_leading's central-band loosening.
 //
 
 import CoreMotion
@@ -65,6 +80,21 @@ final class PitchSensor: ObservableObject {
     @Published private(set) var rotationRateXDegreesPerSecond: Double?
     @Published private(set) var rotationRateYDegreesPerSecond: Double?
     @Published private(set) var rotationRateZDegreesPerSecond: Double?
+
+    /// World-frame yaw rate (deg/s, positive = counter-clockwise viewed from
+    /// above -- standard right-hand rule about the vertical axis) -- the
+    /// resolved value the three raw axes above exist to make possible.
+    /// Computed by rotating device-frame `rotationRate` into the
+    /// `.xArbitraryZVertical` reference frame via the current attitude's
+    /// rotation matrix and reading off the vertical (Z) component:
+    /// `omega_world = R(attitude) * omega_device`. This is exact regardless
+    /// of mount tilt/orientation -- unlike picking one of the three raw axes
+    /// by guessing, it doesn't assume anything about how the phone sits in
+    /// the mount, since `attitude` already captures that. Sign confirmed via
+    /// bench test 2026-08-06 (see the top-of-file note) -- magnitude/accuracy
+    /// still needs real-drive validation before this is trustworthy for
+    /// anything quantitative.
+    @Published private(set) var yawRateDegreesPerSecond: Double?
 
     /// Same gravity-derived, non-drifting property as pitch -- logged for the
     /// same reason: cheap to capture now, and a road-banking/vehicle-lean
@@ -143,6 +173,14 @@ final class PitchSensor: ObservableObject {
             self?.rotationRateXDegreesPerSecond = motion.rotationRate.x * 180 / .pi
             self?.rotationRateYDegreesPerSecond = motion.rotationRate.y * 180 / .pi
             self?.rotationRateZDegreesPerSecond = motion.rotationRate.z * 180 / .pi
+
+            // omega_world = R(attitude) * omega_device -- see
+            // yawRateDegreesPerSecond's doc comment. Only the Z row of R is
+            // needed since we only want the world-vertical component.
+            let r = motion.attitude.rotationMatrix
+            let omega = motion.rotationRate
+            let yawRateRadPerSecond = r.m31 * omega.x + r.m32 * omega.y + r.m33 * omega.z
+            self?.yawRateDegreesPerSecond = yawRateRadPerSecond * 180 / .pi
             self?.userAccelerationX = motion.userAcceleration.x
             self?.userAccelerationY = motion.userAcceleration.y
             self?.userAccelerationZ = motion.userAcceleration.z

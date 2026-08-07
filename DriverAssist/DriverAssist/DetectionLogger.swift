@@ -65,6 +65,12 @@ struct DetectionLogEntry: Codable {
     // misrepresent "no data" as "stationary"/"level".
     let egoSpeedMps: Double?
     let egoSpeedAccuracyMps: Double?
+    // GPS course (true-north heading, degrees, 0..<360) -- see
+    // EgoSpeedManager.swift. Logged so differentiating it over time gives an
+    // independent, GPS-derived cross-check against PitchSensor's gyro-based
+    // yawRateDegreesPerSecond (see the yaw-rate validation plan).
+    let courseDegrees: Double?
+    let courseAccuracyDegrees: Double?
     let pitchDegrees: Double?
     let pitchDriftDegrees: Double?
     // Raw gyro rotation rate (deg/s, device-local x/y/z axes) -- see
@@ -75,6 +81,11 @@ struct DetectionLogEntry: Codable {
     let rotationRateXDegreesPerSecond: Double?
     let rotationRateYDegreesPerSecond: Double?
     let rotationRateZDegreesPerSecond: Double?
+    // World-frame yaw rate resolved from the three raw axes above via the
+    // attitude rotation matrix -- see PitchSensor.yawRateDegreesPerSecond.
+    // Logged alongside the raw axes (not instead of) so the resolved value
+    // can be cross-checked against real observed turns.
+    let yawRateDegreesPerSecond: Double?
     // Same gravity-derived, non-drifting property as pitch -- see PitchSensor.swift.
     let rollDegrees: Double?
     // Real linear acceleration, gravity subtracted, in g (1.0 = ~9.8 m/s^2),
@@ -129,11 +140,14 @@ enum DetectionLogger {
         gmcStats: GMCStats?,
         egoSpeedMps: Double?,
         egoSpeedAccuracyMps: Double?,
+        courseDegrees: Double?,
+        courseAccuracyDegrees: Double?,
         pitchDegrees: Double?,
         pitchDriftDegrees: Double?,
         rotationRateXDegreesPerSecond: Double?,
         rotationRateYDegreesPerSecond: Double?,
         rotationRateZDegreesPerSecond: Double?,
+        yawRateDegreesPerSecond: Double?,
         rollDegrees: Double?,
         userAccelerationX: Double?,
         userAccelerationY: Double?,
@@ -159,11 +173,14 @@ enum DetectionLogger {
             gmcElapsedMs: gmcStats?.elapsedMs,
             egoSpeedMps: egoSpeedMps,
             egoSpeedAccuracyMps: egoSpeedAccuracyMps,
+            courseDegrees: courseDegrees,
+            courseAccuracyDegrees: courseAccuracyDegrees,
             pitchDegrees: pitchDegrees,
             pitchDriftDegrees: pitchDriftDegrees,
             rotationRateXDegreesPerSecond: rotationRateXDegreesPerSecond,
             rotationRateYDegreesPerSecond: rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: rotationRateZDegreesPerSecond,
+            yawRateDegreesPerSecond: yawRateDegreesPerSecond,
             rollDegrees: rollDegrees,
             userAccelerationX: userAccelerationX,
             userAccelerationY: userAccelerationY,
