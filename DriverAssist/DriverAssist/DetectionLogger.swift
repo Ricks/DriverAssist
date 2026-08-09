@@ -31,6 +31,10 @@ struct DetectionLogEntry: Codable {
     }
 
     let t: Double
+    // See DrivingSide.swift -- default .right, not expected to change
+    // mid-drive, logged per entry anyway for the same reason model/
+    // resolution are (self-contained entries, no separate session metadata).
+    let drivingSide: DrivingSide
     let model: String
     // Actual input resolution used for this frame's inference ("1152x640" or
     // "1920x1088") -- see ModelManager.actualInputResolutionLabel. Logged
@@ -41,6 +45,12 @@ struct DetectionLogEntry: Codable {
     let lowLightEnabled: Bool
     let autoLowLightEnabled: Bool
     let stabilizationEnabled: Bool
+    // Whether ContentView's parameter lock was active for this entry -- lets
+    // a session that was supposed to run locked (the standard pre-drive
+    // routine) be confirmed as actually having stayed locked the whole way
+    // through, rather than inferring it indirectly from model/resolution
+    // happening not to change.
+    let parametersLocked: Bool
     // Which TrackingLevel was active for this entry -- mirrors `model`/
     // `twoPass` in being per-entry, since this can change mid-drive too.
     let trackingLevel: String
@@ -73,6 +83,11 @@ struct DetectionLogEntry: Codable {
     let courseAccuracyDegrees: Double?
     let pitchDegrees: Double?
     let pitchDriftDegrees: Double?
+    // The reference value pitchDriftDegrees is computed against -- logged
+    // directly (not just derivable as pitchDegrees - pitchDriftDegrees) so
+    // post-hoc analysis of a session doesn't have to reconstruct it
+    // indirectly. See PitchSensor.captureReferenceAttitude().
+    let referencePitchDegrees: Double?
     // Raw gyro rotation rate (deg/s, device-local x/y/z axes) -- see
     // PitchSensor.swift. Logged raw (not resolved to a single "yaw rate")
     // since which axis is actually yaw depends on final mount orientation,
@@ -88,6 +103,9 @@ struct DetectionLogEntry: Codable {
     let yawRateDegreesPerSecond: Double?
     // Same gravity-derived, non-drifting property as pitch -- see PitchSensor.swift.
     let rollDegrees: Double?
+    // Same idea as pitchDriftDegrees/referencePitchDegrees above, for roll.
+    let rollDriftDegrees: Double?
+    let referenceRollDegrees: Double?
     // Real linear acceleration, gravity subtracted, in g (1.0 = ~9.8 m/s^2),
     // device-local x/y/z -- see PitchSensor.swift. Not consumed by anything
     // yet; intended future uses are braking detection (closing-rate warning
@@ -128,6 +146,7 @@ enum DetectionLogger {
 
     static func log(
         timestamp: Double,
+        drivingSide: DrivingSide,
         model: String,
         resolution: String,
         twoPass: Bool,
@@ -135,6 +154,7 @@ enum DetectionLogger {
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         stabilizationEnabled: Bool,
+        parametersLocked: Bool,
         trackingLevel: String,
         trackingElapsedMs: Double,
         gmcStats: GMCStats?,
@@ -144,11 +164,14 @@ enum DetectionLogger {
         courseAccuracyDegrees: Double?,
         pitchDegrees: Double?,
         pitchDriftDegrees: Double?,
+        referencePitchDegrees: Double?,
         rotationRateXDegreesPerSecond: Double?,
         rotationRateYDegreesPerSecond: Double?,
         rotationRateZDegreesPerSecond: Double?,
         yawRateDegreesPerSecond: Double?,
         rollDegrees: Double?,
+        rollDriftDegrees: Double?,
+        referenceRollDegrees: Double?,
         userAccelerationX: Double?,
         userAccelerationY: Double?,
         userAccelerationZ: Double?,
@@ -159,6 +182,7 @@ enum DetectionLogger {
     ) {
         let entry = DetectionLogEntry(
             t: timestamp,
+            drivingSide: drivingSide,
             model: model,
             resolution: resolution,
             twoPass: twoPass,
@@ -166,6 +190,7 @@ enum DetectionLogger {
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
             stabilizationEnabled: stabilizationEnabled,
+            parametersLocked: parametersLocked,
             trackingLevel: trackingLevel,
             trackingElapsedMs: trackingElapsedMs,
             gmcCorrespondenceCount: gmcStats?.correspondenceCount,
@@ -177,11 +202,14 @@ enum DetectionLogger {
             courseAccuracyDegrees: courseAccuracyDegrees,
             pitchDegrees: pitchDegrees,
             pitchDriftDegrees: pitchDriftDegrees,
+            referencePitchDegrees: referencePitchDegrees,
             rotationRateXDegreesPerSecond: rotationRateXDegreesPerSecond,
             rotationRateYDegreesPerSecond: rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: rotationRateZDegreesPerSecond,
             yawRateDegreesPerSecond: yawRateDegreesPerSecond,
             rollDegrees: rollDegrees,
+            rollDriftDegrees: rollDriftDegrees,
+            referenceRollDegrees: referenceRollDegrees,
             userAccelerationX: userAccelerationX,
             userAccelerationY: userAccelerationY,
             userAccelerationZ: userAccelerationZ,

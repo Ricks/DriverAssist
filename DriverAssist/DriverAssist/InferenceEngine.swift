@@ -298,7 +298,8 @@ final class InferenceEngine: ObservableObject {
         pixelBuffer: CVPixelBuffer,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
-        stabilizationEnabled: Bool
+        stabilizationEnabled: Bool,
+        parametersLocked: Bool
     ) {
         sourceSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         DebugFileLogger.log("process() called, sourceSize set to \(sourceSize)")
@@ -338,7 +339,8 @@ final class InferenceEngine: ObservableObject {
                         twoPass: twoPass,
                         lowLightEnabled: lowLightEnabled,
                         autoLowLightEnabled: autoLowLightEnabled,
-                        stabilizationEnabled: stabilizationEnabled
+                        stabilizationEnabled: stabilizationEnabled,
+                        parametersLocked: parametersLocked
                     )
                 }
             } catch {
@@ -358,7 +360,8 @@ final class InferenceEngine: ObservableObject {
         twoPass: Bool,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
-        stabilizationEnabled: Bool
+        stabilizationEnabled: Bool,
+        parametersLocked: Bool
     ) {
         let trackingStart = CFAbsoluteTimeGetCurrent()
         let result = trackingManager.track(detections, pixelBuffer: pixelBuffer)
@@ -369,6 +372,7 @@ final class InferenceEngine: ObservableObject {
         self.lastFrameElapsedMs = elapsedMs + trackingElapsedMs
         DetectionLogger.log(
             timestamp: Date().timeIntervalSince1970,
+            drivingSide: DrivingSideSetting.current,
             model: modelLabel,
             resolution: resolutionLabel,
             twoPass: twoPass,
@@ -376,6 +380,7 @@ final class InferenceEngine: ObservableObject {
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
             stabilizationEnabled: stabilizationEnabled,
+            parametersLocked: parametersLocked,
             trackingLevel: trackingManager.trackingLevel.rawValue,
             trackingElapsedMs: trackingElapsedMs,
             gmcStats: result.gmcStats,
@@ -385,11 +390,14 @@ final class InferenceEngine: ObservableObject {
             courseAccuracyDegrees: egoSpeedManager.courseAccuracyDegrees,
             pitchDegrees: pitchSensor.pitchDegrees,
             pitchDriftDegrees: pitchSensor.pitchDriftDegrees,
+            referencePitchDegrees: pitchSensor.referencePitchDegrees,
             rotationRateXDegreesPerSecond: pitchSensor.rotationRateXDegreesPerSecond,
             rotationRateYDegreesPerSecond: pitchSensor.rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: pitchSensor.rotationRateZDegreesPerSecond,
             yawRateDegreesPerSecond: pitchSensor.yawRateDegreesPerSecond,
             rollDegrees: pitchSensor.rollDegrees,
+            rollDriftDegrees: pitchSensor.rollDriftDegrees,
+            referenceRollDegrees: pitchSensor.referenceRollDegrees,
             userAccelerationX: pitchSensor.userAccelerationX,
             userAccelerationY: pitchSensor.userAccelerationY,
             userAccelerationZ: pitchSensor.userAccelerationZ,

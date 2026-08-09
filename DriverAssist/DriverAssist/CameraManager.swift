@@ -114,31 +114,6 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
     private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
-    private nonisolated(unsafe) var focusSettleObservation: NSKeyValueObservation?
-
-    // Periodic focus recalibration (see `recalibrateFocusIfDue`): a one-shot
-    // settle-then-lock calibration can catch a bad moment — a dark scene, a close
-    // object, still sitting in a driveway — and then stay wrong for an entire drive
-    // with no way to recover, which is what happened on a real night drive. Bounding
-    // how long a bad calibration can last by periodically re-running the same cycle,
-    // the same principle as the low-light auto-detector re-sampling instead of
-    // deciding once and never revisiting it.
-    private nonisolated(unsafe) var lastFocusCalibrationTime: CFAbsoluteTime = 0
-    private nonisolated static let focusRecalibrationInterval: CFAbsoluteTime = 60
-    private nonisolated static let maxFocusSettleWait: CFAbsoluteTime = 5
-
-    /// The last lens position a calibration actually settled on with confidence.
-    /// A timed-out (unsettled) recalibration re-locks to this instead of committing
-    /// to whatever uncertain position the lens happened to be hunting through —
-    /// otherwise an indoor/close-range recalibration with nothing confident to focus
-    /// on progressively drifts the lock worse with every retry.
-    private nonisolated(unsafe) var lastGoodLensPosition: Float?
-
-    // Gate on the "Go" button (pressed once the phone is mounted in its final dash
-    // position) so the very first focus calibration never runs while the phone is
-    // still being handled/positioned, which would settle on the wrong distance.
-    private nonisolated(unsafe) var isReadyForFocusCalibration = false
-    private nonisolated(unsafe) var hasBegunFocusCalibration = false
 
     /// The exposure bias (in EV) the boost is currently applying, so it can be
     /// restored after a probe. Written and read only on `sessionQueue` — no lock
@@ -218,7 +193,12 @@ final class CameraManager: NSObject, ObservableObject {
         currentStabilizationEnabled = isStabilizationEnabled
     }
 
-    func start() {
+    /// `recording: false` starts the session (live preview + inference feed)
+    /// without writing a video file -- lets the configuring screen show a
+    /// real camera preview while the user is still picking settings, without
+    /// that screen ending up in the recording. Call `beginRecording()` later
+    /// to start actually writing, without restarting the session.
+    func start(recording: Bool = true) {
         // Requested up front (rather than lazily on the first segment save) so the
         // permission dialog doesn't interrupt an in-progress drive.
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
@@ -229,21 +209,42 @@ final class CameraManager: NSObject, ObservableObject {
             let status = AVCaptureDevice.authorizationStatus(for: .video)
             switch status {
             case .authorized:
-                sessionQueue.async { [weak self] in self?.configure() }
+                sessionQueue.async { [weak self] in self?.configure(startRecording: recording) }
             case .notDetermined:
                 let granted = await AVCaptureDevice.requestAccess(for: .video)
-                if granted { self.sessionQueue.async { [weak self] in self?.configure() } }
+                if granted { self.sessionQueue.async { [weak self] in self?.configure(startRecording: recording) } }
             default:
                 break
             }
         }
     }
 
-    func stop() {
+    /// Starts writing to disk on an already-running preview-only session
+    /// (see `start(recording:)`) -- called once the user commits to driving
+    /// (Lock Settings/Unlocked), without tearing down and reconfiguring the
+    /// session that's already showing the live preview. No-op if a
+    /// recording is already in progress, or the session isn't running yet.
+    func beginRecording() {
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning else { return }
+            self.startNewRecording()
+        }
+    }
+
+    /// `completion` fires on the main queue only after `finishRecording()`
+    /// (file finalize + Photos save, both blocking) has actually completed
+    /// -- lets a caller that's about to do something irreversible right
+    /// after (e.g. terminating the app on exitSession) wait for a clean
+    /// finish rather than relying on the mid-write-kill recovery path
+    /// (`recoverOrphanedRecordings`) on every normal exit.
+    func stop(completion: (@Sendable () -> Void)? = nil) {
         let sessionBox = UncheckedSendableBox(value: session)
         sessionQueue.async { [weak self] in
             self?.finishRecording()
             sessionBox.value.stopRunning()
+            if let completion {
+                DispatchQueue.main.async { completion() }
+            }
         }
     }
 
@@ -307,31 +308,24 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// The road ahead is always far away, so autofocus hunting near objects (the
     /// dashboard, a windshield reflection) is pure downside here. Restricting the
-    /// *range* autofocus searches to `.far` (while leaving continuous autofocus
-    /// running) stops it hunting near, but confirmed on-device it still visibly
-    /// hunts *within* the far range — refocusing between, say, a car 15m ahead and
-    /// a building 200m ahead — which reads as "going in and out of focus" over a
-    /// real drive. So: let it run just long enough to settle on a genuinely sharp
-    /// far-field position, then lock there. A blind `lensPosition` guess isn't
-    /// guaranteed to land at true infinity focus (a lens's mechanical far stop and
-    /// true infinity focus aren't always the same point) — that's what produced
-    /// permanently blurry recordings before — but the position autofocus itself
-    /// converges on has actually been verified sharp.
+    /// *range* autofocus searches to `.far`, while leaving continuous autofocus
+    /// running for the whole drive, stops it hunting near.
     ///
-    /// This one-shot calibration was confirmed on a real night drive to sometimes
-    /// still come out permanently blurry — most likely it locked onto a bad moment
-    /// (low contrast in the dark, a close object, still sitting in a driveway) with
-    /// no way to ever correct itself for the rest of the drive. Logged persistently
-    /// (`DebugFileLogger`, not just live console) so the next occurrence is actually
-    /// diagnosable, and re-run periodically (`recalibrateFocusIfDue`) rather than once,
-    /// so a bad calibration is wrong for at most `focusRecalibrationInterval`, not the
-    /// whole drive.
-    private nonisolated func beginFocusCalibration(for device: AVCaptureDevice) {
-        lastFocusCalibrationTime = CFAbsoluteTimeGetCurrent()
+    /// This used to also settle-then-lock to a single confirmed-sharp lens
+    /// position (waiting on `isAdjustingFocus`, with a 5s timeout), on the
+    /// reasoning that a blind lensPosition guess isn't guaranteed to land on
+    /// true infinity focus. REMOVED 2026-08-08: confirmed via the on-device
+    /// debug log that activating this restricted-range continuous-AF mode
+    /// itself (not just the settle wait) makes the camera hardware pause
+    /// frame delivery for several seconds -- a real freeze on every drive
+    /// start, worse than the downside it was solving. Traded for: continuous
+    /// AF may occasionally re-hunt between two far-away objects (e.g. a car
+    /// 15m ahead vs. a building 200m back) over the course of a drive --
+    /// confirmed on-device to happen, reads as brief refocusing, not a freeze.
+    private nonisolated func restrictAutofocusToFarField(for device: AVCaptureDevice) {
         guard
             device.isFocusModeSupported(.continuousAutoFocus),
-            device.isAutoFocusRangeRestrictionSupported,
-            device.isFocusModeSupported(.locked)
+            device.isAutoFocusRangeRestrictionSupported
         else { return }
         do {
             try device.lockForConfiguration()
@@ -339,75 +333,7 @@ final class CameraManager: NSObject, ObservableObject {
             device.autoFocusRangeRestriction = .far
             device.focusMode = .continuousAutoFocus
         } catch {
-            return
-        }
-
-        DebugFileLogger.log("focus: calibration started")
-        let calibrationStart = CFAbsoluteTimeGetCurrent()
-
-        focusSettleObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] device, change in
-            guard change.newValue == false else { return }
-            self?.focusSettleObservation = nil
-            let elapsed = CFAbsoluteTimeGetCurrent() - calibrationStart
-            DebugFileLogger.log(String(format: "focus: settled after %.2fs at lensPosition=%.3f", elapsed, device.lensPosition))
-            self?.lockFocus(at: device, lensPosition: device.lensPosition)
-        }
-
-        // Night-time autofocus is inherently less confident (low contrast) and may
-        // never cleanly settle — don't wait forever, or this drive's recalibration
-        // effectively never happens and we're back to the original bug. A timeout
-        // here means this attempt never confirmed anything, so re-lock to the last
-        // position that DID settle confidently rather than committing to whatever
-        // uncertain position the lens happened to be at (falling back to the current
-        // position only on the very first calibration, with no prior good lock yet).
-        sessionQueue.asyncAfter(deadline: .now() + Self.maxFocusSettleWait) { [weak self] in
-            guard let self, self.focusSettleObservation != nil else { return }
-            self.focusSettleObservation = nil
-            if let goodPosition = self.lastGoodLensPosition {
-                DebugFileLogger.log(String(format: "focus: settle timed out after %.0fs, keeping previous good lensPosition=%.3f instead of unconfirmed=%.3f", Self.maxFocusSettleWait, goodPosition, device.lensPosition))
-                self.lockFocus(at: device, lensPosition: goodPosition)
-            } else {
-                DebugFileLogger.log(String(format: "focus: settle timed out after %.0fs, no prior good lock, locking at lensPosition=%.3f anyway", Self.maxFocusSettleWait, device.lensPosition))
-                self.lockFocus(at: device, lensPosition: device.lensPosition)
-            }
-        }
-    }
-
-    /// Re-runs the settle-then-lock calibration roughly every
-    /// `focusRecalibrationInterval` — called from every captured frame, matching how
-    /// `sampleAutoLowLightIfDue` self-throttles instead of needing its own timer.
-    private nonisolated func recalibrateFocusIfDue() {
-        guard
-            hasBegunFocusCalibration,
-            let device = captureDevice,
-            focusSettleObservation == nil,
-            CFAbsoluteTimeGetCurrent() - lastFocusCalibrationTime >= Self.focusRecalibrationInterval
-        else { return }
-        beginFocusCalibration(for: device)
-    }
-
-    /// Called when the user presses "Go" after mounting the phone in its final dash
-    /// position. Safe to call before or after `configure()` has run: if the capture
-    /// device isn't ready yet, `configure()` itself checks `isReadyForFocusCalibration`
-    /// and starts calibration as soon as the device is available.
-    func markReadyForFocusCalibration() {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            self.isReadyForFocusCalibration = true
-            guard let device = self.captureDevice, !self.hasBegunFocusCalibration else { return }
-            self.hasBegunFocusCalibration = true
-            self.beginFocusCalibration(for: device)
-        }
-    }
-
-    private nonisolated func lockFocus(at device: AVCaptureDevice, lensPosition: Float) {
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
-            lastGoodLensPosition = lensPosition
-        } catch {
-            // Device may be mid-reconfiguration; focus stays continuous (still far-restricted).
+            // Device may be mid-reconfiguration; try again on the next configure().
         }
     }
 
@@ -558,13 +484,13 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    private nonisolated func configure() {
+    private nonisolated func configure(startRecording: Bool) {
         guard !session.isRunning else { return }
 
         // After stop(), inputs/outputs are still attached — just restart.
         if !session.inputs.isEmpty {
             session.startRunning()
-            startNewRecording()
+            if startRecording { startNewRecording() }
             return
         }
 
@@ -591,10 +517,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
         session.addInput(input)
         captureDevice = device
-        if isReadyForFocusCalibration {
-            hasBegunFocusCalibration = true
-            beginFocusCalibration(for: device)
-        }
+        restrictAutofocusToFarField(for: device)
         restrictMaxExposureDuration(for: device)
         restrictFrameRate(for: device, to: 15)
 
@@ -623,7 +546,7 @@ final class CameraManager: NSObject, ObservableObject {
 
         session.commitConfiguration()
         session.startRunning()
-        startNewRecording()
+        if startRecording { startNewRecording() }
     }
 
     /// Watches for the session being interrupted (e.g. another app takes the camera,
@@ -1183,7 +1106,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         sampleAutoLowLightIfDue(pixelBuffer)
-        recalibrateFocusIfDue()
         appendRecordingFrame(pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
 
         let box = UncheckedSendableBox(value: pixelBuffer)

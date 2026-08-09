@@ -1,8 +1,8 @@
 import Foundation
 import CoreML
 
-// nano/small are gesture-reachable (horizontal swipe -- see ContentView); medium
-// is voice-only (VoiceCommandManager's .selectModel command), not on that grid --
+// nano/small are tap-reachable (see ContentView.toggleModel); medium is
+// voice-only (VoiceCommandManager's .selectModel command), not tap-reachable --
 // it has no high-res export (see ModelManager.highResTiers).
 enum DetectorModel: String, CaseIterable, Codable {
     case nano   = "yolo26n"
@@ -57,6 +57,13 @@ final class ModelManager: ObservableObject {
         (isHighResEnabled && Self.highResTiers.contains(selectedModel))
             ? Self.highResResolutionLabel
             : Self.baseResolutionLabel
+    }
+
+    /// Whether `selectedModel` has a high-res export at all -- medium doesn't
+    /// (see `highResTiers`), so a settings UI can hide/disable the high-res
+    /// toggle for it instead of offering a control that's silently a no-op.
+    var supportsHighRes: Bool {
+        Self.highResTiers.contains(selectedModel)
     }
 
     /// Same idea as `currentResolutionLabel`, but for telemetry rather than the

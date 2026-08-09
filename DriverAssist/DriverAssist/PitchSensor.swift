@@ -96,10 +96,21 @@ final class PitchSensor: ObservableObject {
     /// anything quantitative.
     @Published private(set) var yawRateDegreesPerSecond: Double?
 
-    /// Same gravity-derived, non-drifting property as pitch -- logged for the
-    /// same reason: cheap to capture now, and a road-banking/vehicle-lean
-    /// signal on a curve isn't available any other way. Not consumed by
-    /// anything yet.
+    /// Rotation about the camera's own forward (boresight) axis -- how
+    /// tilted the video frame's horizon is, i.e. "degrees from level" for
+    /// the mount. Deliberately NOT `CMAttitude.roll`: that Euler angle
+    /// rotates about the device's long/portrait axis, which in this app's
+    /// landscape mount is horizontal, not the boresight axis this needs --
+    /// and more importantly, the mount's SHORT axis sits vertical (see
+    /// cameraOrientationWarning's confirmed gravityX reading), which is
+    /// exactly CMAttitude's PITCH axis. With pitch parked near +/-90 in
+    /// normal mounted use, the yaw-pitch-roll decomposition sits in (or
+    /// next to) gimbal lock and `.roll` comes out as unstable garbage --
+    /// CONFIRMED bad 2026-08-08 via bench test: flat on a desk (away from
+    /// the singularity) read a correct 0, but stood up on its landscape
+    /// edge (its actual mounted orientation) read -88 instead of ~0.
+    /// Computed directly from the gravity vector below instead, which has
+    /// no such singularity.
     @Published private(set) var rollDegrees: Double?
 
     /// Real linear acceleration with gravity subtracted out (in g, i.e. 1.0 =
@@ -169,7 +180,16 @@ final class PitchSensor: ObservableObject {
                 return
             }
             self?.pitchDegrees = motion.attitude.pitch * 180 / .pi
-            self?.rollDegrees = motion.attitude.roll * 180 / .pi
+            // Rotating about the boresight (device Z) axis exchanges gravity
+            // between X and Y while leaving Z untouched, so atan2(y, -x)
+            // isolates exactly that rotation -- and, per the small-angle
+            // trig identity, comes out independent of pitch/nose-tilt too
+            // (see rollDegrees's doc comment). -x because the confirmed
+            // level+correct-orientation reading is gravityX ~= -1, which
+            // this needs to map to 0 degrees. Sign not yet bench-confirmed
+            // -- same "verify before trusting" discipline as gravityX's own
+            // mount-orientation check.
+            self?.rollDegrees = atan2(motion.gravity.y, -motion.gravity.x) * 180 / .pi
             self?.rotationRateXDegreesPerSecond = motion.rotationRate.x * 180 / .pi
             self?.rotationRateYDegreesPerSecond = motion.rotationRate.y * 180 / .pi
             self?.rotationRateZDegreesPerSecond = motion.rotationRate.z * 180 / .pi
