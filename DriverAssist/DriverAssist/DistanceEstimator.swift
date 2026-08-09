@@ -265,4 +265,61 @@ struct DistanceEstimator {
             focalLengthNormalized: f
         )
     }
+
+    // MARK: - Lever arm (camera-to-rear-axle offset)
+    //
+    // The rotational half of the translational+rotational optic-flow
+    // decomposition from the following-distance design discussion
+    // (Longuet-Higgins/Prazdny): when the vehicle yaws, a camera mounted
+    // off the yaw rotation center (the rear axle, standard bicycle-model
+    // assumption) has its own velocity contribution from that rotation,
+    // v = omega x r, on top of the vehicle's translational (forward) speed.
+    // Groundwork for the still-unwritten full ego-motion optic-flow work --
+    // not consumed anywhere yet.
+    //
+    // Vehicle body frame: x = forward, y = left, z = up (right-handed,
+    // matches PitchSensor.yawRateDegreesPerSecond's confirmed sign
+    // convention: positive omega = counter-clockwise viewed from above =
+    // turning left). For pure yaw (omega purely vertical, omega = (0,0,
+    // omega_z)) and r = (r_x, r_y, r_z), the cross product drops the
+    // vertical component of r entirely:
+    //     v = omega x r = (-omega_z * r_y, omega_z * r_x, 0)
+    // -- camera height plays no part, only the horizontal offsets do.
+    //
+    // r_x: MEASURED 2026-08-09 with a tape measure -- 2.03m forward of the
+    // rear axle (also measured: 82cm to the front axle, i.e. ~2.85m
+    // wheelbase -- a sanity-check figure, not itself used here).
+    // r_y: DERIVED 2026-08-09, not an independent measurement -- computed
+    // by assuming the iPhone itself (not the camera lens) is centered on
+    // the dash, then adding the confirmed 5.92cm lens-to-phone-body lateral
+    // offset (see PitchSensor/ContentView's camera-orientation-warning
+    // history). ~6cm to the driver's-left of the vehicle's true centerline,
+    // +/-1cm combined uncertainty -- softer than r_x, since the dash-
+    // centering half is still an assumption, not a caliper measurement.
+    enum LeverArm {
+        static let forwardOfRearAxleMeters: Double = 2.03
+        static let leftOfCenterlineMeters: Double = 0.06
+
+        /// Camera's own velocity due to yaw rotation about the rear axle,
+        /// in the vehicle's body frame (x = forward, y = left, meters/
+        /// second). Pass `PitchSensor.yawRateDegreesPerSecond` (a live
+        /// reading, unlike pitch/roll's reference-not-live values -- yaw
+        /// RATE is a dynamic quantity, there's no "hill grade" equivalent
+        /// misattribution risk the way a static angle has).
+        ///
+        /// This is only the rotational term -- for the camera's TOTAL
+        /// body-frame velocity, add the vehicle's own forward (translational)
+        /// speed to the forward component separately, e.g. GPS
+        /// `EgoSpeedManager` speed: `(egoSpeedMetersPerSecond +
+        /// result.forwardMetersPerSecond, result.leftMetersPerSecond)`.
+        static func cameraVelocityFromYaw(
+            yawRateDegreesPerSecond: Double
+        ) -> (forwardMetersPerSecond: Double, leftMetersPerSecond: Double) {
+            let omega = yawRateDegreesPerSecond * .pi / 180
+            return (
+                forwardMetersPerSecond: -omega * leftOfCenterlineMeters,
+                leftMetersPerSecond: omega * forwardOfRearAxleMeters
+            )
+        }
+    }
 }
