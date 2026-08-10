@@ -115,6 +115,23 @@ struct InferenceView: View {
     // check, not just "done".
     @State private var toastText: String?
 
+    /// Hidden distance-calibration flow state -- see
+    /// `beginDistanceCalibration`'s doc comment and `levelScreen`'s
+    /// long-press. Not part of `SessionPhase`: this is a side-flow off the
+    /// level/configuring screens, not a step in the normal lifecycle.
+    @State private var isCalibrationRecording = false
+    /// nil = flow inactive. 0/1/2 = currently on that round of 3 (either
+    /// showing "Adjust pitch" or actively recording that round's clip).
+    @State private var distanceCalibrationRound: Int?
+    @State private var isChoosingTapeMarkCount = false
+    @State private var tapeMarkCount = 3
+    /// Roll at the moment the flow began (`beginDistanceCalibration`) --
+    /// shown alongside the live roll on the "Adjust pitch" screen as a
+    /// fixed reference point, since only pitch is meant to change between
+    /// rounds; roll drifting away from this baseline while handling the
+    /// phone is exactly what it's there to catch.
+    @State private var initialCalibrationRoll: Double?
+
     private func flashToast(_ text: String) {
         withAnimation { toastText = text }
         Task {
@@ -169,6 +186,124 @@ struct InferenceView: View {
     private func enterConfiguring() {
         cameraManager.start(recording: false)
         withAnimation { sessionPhase = .configuring }
+    }
+
+    /// Hidden, deliberate long-press on the level screen (or tap on the
+    /// configuring screen's small "Distance cal" label) -- NOT part of the
+    /// normal session lifecycle (`sessionPhase` doesn't change). Kicks off
+    /// the tape-mark distance-calibration flow: how many tape marks were
+    /// placed, then three rounds of "adjust pitch, confirm, record a ~1s
+    /// clip" -- gathering reference footage at three different pitches is
+    /// what lets the eventual fit be validated for pitch-independence
+    /// later (retilt + re-check against the same tape marks without
+    /// refitting -- see the following-distance-measurement memory), not
+    /// just fit once. Actual tape-mark distances are entered separately,
+    /// later, offline -- this only captures the video + the reference
+    /// pitch/roll for each round.
+    private func beginDistanceCalibration() {
+        guard !isCalibrationRecording, distanceCalibrationRound == nil else { return }
+        initialCalibrationRoll = pitchSensor.rollDegrees
+        isChoosingTapeMarkCount = true
+    }
+
+    private func cancelDistanceCalibration() {
+        DebugFileLogger.log("distance-cal: MATCHED cancel")
+        isChoosingTapeMarkCount = false
+        distanceCalibrationRound = nil
+        initialCalibrationRoll = nil
+    }
+
+    private func confirmTapeMarkCount() {
+        DebugFileLogger.log("distance-cal: MATCHED confirmTapeMarkCount count=\(tapeMarkCount)")
+        isChoosingTapeMarkCount = false
+        distanceCalibrationRound = 0
+    }
+
+    /// "Ready" on the "Adjust pitch" screen -- captures the CURRENT live
+    /// pitch/roll at full precision (the on-screen readout only shows
+    /// these rounded to the nearest degree) and starts that round's ~1s
+    /// recording.
+    private func finishPitchAdjustment() {
+        guard let round = distanceCalibrationRound else { return }
+        let pitch = pitchSensor.pitchDegrees
+        let roll = pitchSensor.rollDegrees
+        DebugFileLogger.log("distance-cal: round=\(round) pitch=\(String(describing: pitch)) roll=\(String(describing: roll))")
+        recordCalibrationRound(round: round)
+    }
+
+    /// Records one round's ~1s, 4K, locked-far-focus clip (see
+    /// CameraManager.startCalibrationRecording's file-level comment),
+    /// saved as calibration-<timestamp>.mov via Photos -- never confused
+    /// with a real drive's recording-<timestamp>.mov. No stop control --
+    /// one second of already-locked-focus 4K is plenty of frames, so it
+    /// just auto-stops rather than needing a second deliberate action.
+    ///
+    /// After stopping, checks the detected tape-mark count (see
+    /// CameraManager.countRedTapeMarks) against what was entered: on match,
+    /// advances to the next round (or finishes after round 3); on
+    /// mismatch, stays on the same round so the user can adjust and retry
+    /// rather than restarting the whole three-round sequence. If a clean
+    /// still frame from this ever isn't enough to make the tape out
+    /// reliably, the planned fallback is a proper photo capture instead of
+    /// a longer clip.
+    private func recordCalibrationRound(round: Int) {
+        guard !isCalibrationRecording else { return }
+        // Set TRUE immediately, synchronously -- not after
+        // startCalibrationRecording's async completion -- so a second tap
+        // during the focus-settle window (which can take a few seconds,
+        // with no visible feedback otherwise) can't start a second
+        // overlapping attempt on the same session. CONFIRMED bug
+        // 2026-08-09 via debug log: two overlapping "focus: settling"
+        // calls 154ms apart, from the Ready button still being visible/
+        // tappable during that window -- neither attempt's completion ever
+        // reached the pass/fail comparison, reading as "stuck on round 1
+        // with no error message" (there wasn't a missing-error bug -- the
+        // comparison itself was never being reached). This also means the
+        // "recording" banner now shows the instant Done is tapped instead
+        // of after an unexplained multi-second pause, which was likely why
+        // the user tapped again in the first place.
+        isCalibrationRecording = true
+        DebugFileLogger.log("distance-cal: round=\(round) MATCHED start recording")
+        cameraManager.startCalibrationRecording { started in
+            Task { @MainActor in
+                guard started else {
+                    DebugFileLogger.log("distance-cal: round=\(round) FAILED to start")
+                    isCalibrationRecording = false
+                    flashToast("CALIBRATION RECORDING\nFAILED TO START")
+                    return
+                }
+                try? await Task.sleep(for: .seconds(1))
+                cameraManager.stopCalibrationRecording { detectedCount in
+                    Task { @MainActor in
+                        isCalibrationRecording = false
+                        // CameraManager.stopCalibrationRecording already
+                        // restarts a normal preview-only session internally
+                        // (atomically, before its completion fires) -- a
+                        // separate `cameraManager.start(recording: false)`
+                        // call here used to race with the next round's
+                        // startCalibrationRecording if it started quickly,
+                        // corrupting the session. CONFIRMED bug 2026-08-09:
+                        // stuck on "Recording round 3/3" with a stray
+                        // "recording-" (not "calibration-") prefixed file
+                        // created mid-flow -- see stopCalibrationRecording's
+                        // doc comment for the full explanation.
+                        if detectedCount == tapeMarkCount {
+                            DebugFileLogger.log("distance-cal: round=\(round) PASSED detectedCount=\(detectedCount)")
+                            if round >= 2 {
+                                distanceCalibrationRound = nil
+                                initialCalibrationRoll = nil
+                                flashToast("DISTANCE CALIBRATION\nCOMPLETE (3/3)")
+                            } else {
+                                distanceCalibrationRound = round + 1
+                            }
+                        } else {
+                            DebugFileLogger.log("distance-cal: round=\(round) FAILED detectedCount=\(detectedCount) expected=\(tapeMarkCount)")
+                            flashToast("COULDN'T CLEARLY SEE ALL\n\(tapeMarkCount) TAPE MARKS (found \(detectedCount))\nADJUST AND RETRY")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Starts (or restarts, after a prior exit) the actual drive: applies the
@@ -285,19 +420,50 @@ struct InferenceView: View {
             // when the phase change would have torn down one preview layer
             // and attached a new one to the same running session -- a session-
             // level stall, not anything in CameraManager's recording path.
-            if sessionPhase == .configuring || sessionPhase == .driving {
+            // isCalibrationRecording / distanceCalibrationRound: the hidden
+            // distance-calibration side-flow also needs a live preview, so
+            // the user can see the tape marks are actually in frame and in
+            // focus while adjusting pitch and recording -- see
+            // beginDistanceCalibration.
+            if sessionPhase == .configuring || sessionPhase == .driving
+                || isCalibrationRecording || distanceCalibrationRound != nil {
                 CameraPreviewView(session: cameraManager.session)
                     .ignoresSafeArea()
             }
-            switch sessionPhase {
-            case .calibratePrompt:
-                calibratePromptScreen
-            case .level:
-                levelScreen
-            case .configuring:
-                withSessionGestures(configuringScreen)
-            case .driving:
-                withSessionGestures(drivingScreen)
+            // Mutually exclusive with sessionPhase's own screen, not
+            // layered on top of it -- CONFIRMED bug 2026-08-09: layering
+            // (even rendered after, on top in z-order) still let
+            // configuringScreen's Lock Settings button and settingsHUD
+            // show/receive touches through any part of the overlay that
+            // wasn't itself opaque. The camera preview above is still
+            // shown throughout (needed so the user can confirm all tape
+            // marks are actually in frame), only sessionPhase's own screen
+            // content is swapped out.
+            if isChoosingTapeMarkCount {
+                tapeMarkCountPickerOverlay
+            } else if isCalibrationRecording {
+                distanceCalibrationRecordingBanner
+            } else if let round = distanceCalibrationRound {
+                distanceCalibrationPitchScreen(round: round)
+            } else {
+                switch sessionPhase {
+                case .calibratePrompt:
+                    calibratePromptScreen
+                case .level:
+                    levelScreen
+                case .configuring:
+                    withSessionGestures(configuringScreen)
+                case .driving:
+                    withSessionGestures(drivingScreen)
+                }
+            }
+
+            // Hoisted here (once) rather than duplicated per-screen --
+            // CONFIRMED bug 2026-08-09: a per-screen toastView had been
+            // missed on distanceCalibrationPitchScreen, so a failed tape-
+            // mark detection retried silently with no visible error at all.
+            if let toastText {
+                toastView(toastText)
             }
         }
         .onChange(of: inferenceEngine.lastFrameElapsedMs) { _, newValue in
@@ -458,10 +624,160 @@ struct InferenceView: View {
                 }
                 .padding(.top, 24)
             }
+        }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 1.5)
+                .onEnded { _ in
+                    beginDistanceCalibration()
+                }
+        )
+    }
 
-            if let toastText {
-                toastView(toastText)
+    // MARK: — Distance-calibration side-flow (hidden, see beginDistanceCalibration)
+
+    /// A singleton screen -- fully opaque, nothing else (camera preview,
+    /// whichever screen triggered it) needs to show through, unlike
+    /// `distanceCalibrationPitchScreen`, which genuinely needs the live
+    /// preview visible behind it.
+    private var tapeMarkCountPickerOverlay: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack(spacing: 32) {
+                Text("How many tape marks?")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.white)
+                HStack(spacing: 32) {
+                    Button {
+                        tapeMarkCount = max(1, tapeMarkCount - 1)
+                    } label: {
+                        Text("−")
+                            .font(.system(size: 40, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 64, height: 64)
+                            .background(Color.black.opacity(0.5), in: Circle())
+                    }
+                    Text("\(tapeMarkCount)")
+                        .font(.system(size: 64, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 80)
+                    Button {
+                        tapeMarkCount += 1
+                    } label: {
+                        Text("+")
+                            .font(.system(size: 40, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 64, height: 64)
+                            .background(Color.black.opacity(0.5), in: Circle())
+                    }
+                }
+                Button {
+                    confirmTapeMarkCount()
+                } label: {
+                    Text("Confirm")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 48)
+                        .frame(height: 64)
+                        .background(Color.yellow, in: Capsule())
+                }
+                Button {
+                    cancelDistanceCalibration()
+                } label: {
+                    Text("Cancel")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.top, 8)
             }
+        }
+    }
+
+    private var pitchDegreesRounded: Int {
+        Int((pitchSensor.pitchDegrees ?? 0).rounded())
+    }
+
+    /// Camera feed still shows underneath (needed so the user can confirm
+    /// all tape marks are actually in frame) -- only sessionPhase's own
+    /// screen content (Lock Settings, settingsHUD, etc.) is swapped out
+    /// while this is on screen, not layered under it -- see body's comment.
+    /// User physically adjusts the phone's tilt in the mount, watching the
+    /// live pitch/roll readout, then taps Ready once satisfied. Rounded to
+    /// the nearest degree for display only -- `finishPitchAdjustment` logs
+    /// the actual full-precision reading. Initial roll (captured once, at
+    /// the very start of the whole flow) is shown alongside the live one
+    /// as a fixed reference -- only pitch is meant to change between
+    /// rounds, so this is what catches roll drifting away from where it
+    /// started while handling the phone.
+    ///
+    /// Info on the left, actions on the right, center left empty --
+    /// deliberately, so the red tape marks (roughly centered in frame,
+    /// same as the settings HUD leaves the center clear) aren't obscured
+    /// by any of this screen's own UI.
+    private func distanceCalibrationPitchScreen(round: Int) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Adjust Pitch")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.6), radius: 3)
+                Text("Round \(round + 1) of 3")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.6), radius: 3)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Pitch: \(pitchDegreesRounded)°")
+                    Text("Roll: \(rollDegreesRounded)°")
+                    if let initialCalibrationRoll {
+                        Text("Initial roll: \(Int(initialCalibrationRoll.rounded()))°")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                }
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.6), radius: 3)
+                .padding()
+                .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 16))
+            }
+            Spacer()
+            VStack(spacing: 16) {
+                Button {
+                    finishPitchAdjustment()
+                } label: {
+                    Text("Ready")
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 40)
+                        .frame(height: 64)
+                        .background(Color.yellow, in: Capsule())
+                }
+                Button {
+                    cancelDistanceCalibration()
+                } label: {
+                    Text("Cancel")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .shadow(color: .black.opacity(0.6), radius: 3)
+                }
+            }
+        }
+        .padding(24)
+    }
+
+    /// Shown in place of sessionPhase's own screen while a round's clip is
+    /// actively recording -- see body's comment on why this replaces
+    /// (rather than layers on top of) the level/configuring screen.
+    private var distanceCalibrationRecordingBanner: some View {
+        VStack {
+            Text("● RECORDING ROUND \((distanceCalibrationRound ?? 0) + 1)/3 (4K)")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .padding()
+                .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.top, 50)
+            Spacer()
         }
     }
 
@@ -483,7 +799,24 @@ struct InferenceView: View {
         ZStack {
             // Camera preview itself is rendered once at the top-level body,
             // shared across configuring/driving -- see body's comment.
-            settingsHUD { EmptyView() }
+            //
+            // topLeading fills the same corner drivingScreen uses for
+            // recording/thermal status, here with a small, deliberately
+            // low-key trigger for the tape-mark distance-calibration flow
+            // (see beginDistanceCalibration's doc comment) -- needed here,
+            // not just the level screen's hidden long-press, because the
+            // real workflow is: roll-calibrate in a known-level parking
+            // spot, drive to a street with room for tape marks (staying on
+            // this screen the whole time -- its preview-only session
+            // doesn't need Lock Settings/Unlocked pressed yet), then start
+            // the distance calibration once there.
+            settingsHUD {
+                Text(isCalibrationRecording ? "● Recording" : "Distance cal")
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(isCalibrationRecording ? .red : .white.opacity(0.4))
+                    .shadow(color: .black.opacity(0.6), radius: 2)
+                    .onTapGesture { beginDistanceCalibration() }
+            }
 
             if cameraOrientationWarning {
                 VStack {
@@ -546,10 +879,6 @@ struct InferenceView: View {
                         .foregroundStyle(thermalLabelColor)
                         .shadow(color: .black.opacity(0.6), radius: 2)
                 }
-            }
-
-            if let toastText {
-                toastView(toastText)
             }
         }
     }

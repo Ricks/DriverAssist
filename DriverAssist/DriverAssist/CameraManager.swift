@@ -114,6 +114,46 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
     private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
+    private nonisolated(unsafe) var focusSettleObservation: NSKeyValueObservation?
+    /// Identifies which `settleAndLockFarFieldFocus` call is the CURRENT
+    /// one -- see that function's doc comment for why `focusSettleObservation
+    /// != nil` alone isn't a sufficient guard against a stale/delayed
+    /// notification from a PREVIOUS call re-firing after a newer one has
+    /// already started.
+    private nonisolated(unsafe) var currentFocusSettleToken: UUID?
+
+    // Periodic focus recalibration (see `recalibrateFocusIfDue`): a one-shot
+    // settle-then-lock can catch a bad moment -- a dark scene, a close
+    // object, still sitting in a driveway -- and then stay wrong for an
+    // entire drive with no way to recover, which is what happened on a real
+    // night drive. Bounding how long a bad lock can last by periodically
+    // re-running the same cycle, the same principle as the low-light
+    // auto-detector re-sampling instead of deciding once and never
+    // revisiting it. RESTORED 2026-08-09 alongside the settle-then-lock this
+    // depends on -- see `settleAndLockFarFieldFocus`'s doc comment for why
+    // both are safe to bring back now.
+    private nonisolated(unsafe) var lastFocusLockTime: CFAbsoluteTime = 0
+    private nonisolated static let focusRecalibrationInterval: CFAbsoluteTime = 60
+    private nonisolated static let maxFocusSettleWait: CFAbsoluteTime = 5
+
+    /// The last lens position a lock actually settled on with confidence. A
+    /// timed-out (unsettled) recalibration re-locks to this instead of
+    /// committing to whatever uncertain position the lens happened to be
+    /// hunting through -- otherwise a dark/close-range recalibration with
+    /// nothing confident to focus on progressively drifts the lock worse
+    /// with every retry.
+    private nonisolated(unsafe) var lastGoodLensPosition: Float?
+    /// Filename prefix `startNewRecording` uses -- "recording" for a normal
+    /// drive, "calibration" while `startCalibrationRecording` is active, so
+    /// a tape-mark reference clip can never be mistaken for real drive
+    /// footage.
+    private nonisolated(unsafe) var activeRecordingFilenamePrefix = "recording"
+    /// Most recent frame captured while `activeRecordingFilenamePrefix ==
+    /// "calibration"` -- what `stopCalibrationRecording` runs tape-mark
+    /// detection against. Only tracked during calibration recording (see
+    /// `captureOutput`), nil otherwise -- no reason to hold a frame
+    /// reference during normal driving.
+    private nonisolated(unsafe) var latestCalibrationPixelBuffer: CVPixelBuffer?
 
     /// The exposure bias (in EV) the boost is currently applying, so it can be
     /// restored after a probe. Written and read only on `sessionQueue` — no lock
@@ -248,6 +288,356 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Calibration recording (tape-mark distance calibration)
+    //
+    // A short, one-off, high-resolution reference clip for the tape-mark
+    // distance calibration (DistanceEstimator.fit() / the following-distance
+    // measurement plan) -- NOT part of the normal session lifecycle, and
+    // deliberately not exposed anywhere in the main UI (see ContentView's
+    // hidden long-press trigger on the level screen). Two ways this
+    // differs from a normal drive recording:
+    // - 4K instead of 1080p: thermal throttling (the reason 1080p was
+    //   chosen) isn't a concern for a clip this short, and more rows
+    //   between camera and horizon means less rounding error reading off
+    //   which row a tape mark lands on.
+    // - Locked, settled far-field focus instead of continuous autofocus:
+    //   reintroduces (scoped to just this path) the settle-then-lock
+    //   approach that was removed from the normal startup flow for causing
+    //   a multi-second freeze there -- acceptable here since this is a
+    //   rare, deliberate action the user is already waiting on, not
+    //   something that silently blocks the normal driving flow. Confirmed
+    //   real problem this solves: continuous AF locking onto the dash
+    //   (near, high-contrast, filling the bottom of frame) instead of the
+    //   distant tape marks.
+    //
+    // Saves to calibration-<timestamp>.mov (not recording-<timestamp>.mov)
+    // so it can never be confused with real drive footage, and is
+    // deliberately NOT picked up by `recoverOrphanedRecordings`'s
+    // "recording-" prefix filter. Fully tears the session down when
+    // stopped (see `teardownSession`) so the next normal `start()` re-runs
+    // the full setup path (1080p, continuous AF) instead of inheriting
+    // this mode's settings.
+
+    /// Reachable from the level screen (before ever driving anywhere) OR
+    /// the configuring screen (its session is always already running in
+    /// preview-only mode by the time you get there, since the roll-
+    /// calibration flow passes through it first -- e.g. calibrate roll in
+    /// a known-level parking spot, drive to a street with room for tape
+    /// marks, then start this once there, all in one continuous session
+    /// without ever pressing Lock Settings/Unlocked). Either way this stops
+    /// and fully tears down whatever the session currently is (stopped, or
+    /// running preview-only) so the fresh 4K configure below always takes
+    /// the full setup path, not `configure`'s quick-restart shortcut.
+    ///
+    /// `completion` reports whether the recording actually started (false
+    /// if a normal drive recording was already in progress -- can't switch
+    /// mid-recording -- or the device/session setup failed) -- fires on the
+    /// main queue.
+    func startCalibrationRecording(completion: @escaping @Sendable (Bool) -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self, self.assetWriter == nil else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+            self.teardownSession()
+            self.activeRecordingFilenamePrefix = "calibration"
+            self.configure(startRecording: false, preset: .hd4K3840x2160, settleFocus: false)
+            guard let device = self.captureDevice else {
+                self.activeRecordingFilenamePrefix = "recording"
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            self.settleAndLockFarFieldFocus(device: device) { [weak self] in
+                guard let self else { return }
+                self.startNewRecording()
+                DispatchQueue.main.async { completion(true) }
+            }
+        }
+    }
+
+    /// Finishes and saves the calibration clip (to Photos, same as a normal
+    /// recording), runs tape-mark detection against the last captured
+    /// frame, then fully tears the session down -- see this section's
+    /// file-level comment for why the teardown matters. `completion` fires
+    /// on the main queue with the detected tape-mark count (0 if no frame
+    /// was captured at all) -- the caller compares it against however many
+    /// were actually placed and decides pass/retry, and can also use the
+    /// call landing as "teardown is complete, safe to restart the normal
+    /// preview-only session" (needed on the configuring screen, which would
+    /// otherwise be left with a dead camera preview).
+    func stopCalibrationRecording(completion: @escaping @Sendable (Int) -> Void) {
+        let sessionBox = UncheckedSendableBox(value: session)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let detectedCount = self.latestCalibrationPixelBuffer.map { self.countRedTapeMarks(in: $0) } ?? 0
+            self.latestCalibrationPixelBuffer = nil
+            self.finishRecording()
+            sessionBox.value.stopRunning()
+            self.teardownSession()
+            self.activeRecordingFilenamePrefix = "recording"
+            // Restarted here, synchronously, in the SAME sessionQueue block
+            // -- not left for the caller to restart later with a separate
+            // async call. CONFIRMED bug 2026-08-09: ContentView used to call
+            // `cameraManager.start(recording: false)` afterward to restore
+            // the configuring screen's preview; when the next calibration
+            // round started quickly, that separate call raced with the next
+            // `startCalibrationRecording`'s own teardown/reconfigure,
+            // corrupting the session (a plain "recording-" prefixed file
+            // got created mid-calibration, and the round got stuck with no
+            // completion ever firing). Doing it here instead makes the
+            // whole "finish this round, get back to a normal preview"
+            // sequence one atomic chain -- nothing else can interleave.
+            self.configure(startRecording: false, settleFocus: true)
+            DispatchQueue.main.async { completion(detectedCount) }
+        }
+    }
+
+    /// Counts distinct horizontal red bands crossing a central column
+    /// range of the frame -- tape marks are laid perpendicular to the
+    /// direction of travel, so each one should appear as its own roughly-
+    /// horizontal band at a different row, distinguishable from road/
+    /// asphalt by hue alone (red tape against gray/black road is a strong,
+    /// simple color signal). Deliberately NOT a general object detector --
+    /// scoped tightly to "distinct red band count" since that's exactly
+    /// the check `recordCalibrationClip`'s caller needs.
+    ///
+    /// *** THRESHOLDS NOT YET VALIDATED against a real photo of the actual
+    /// tape on the actual street -- reasoned from "red tape, ~4in wide,
+    /// daylight" but not tuned against real footage. Expect to loosen/
+    /// tighten `redPixel`'s brightness/dominance thresholds or
+    /// `minRedRowFraction` after the first real attempt, the same way
+    /// every other threshold in this project got corrected once real data
+    /// existed to check it against.
+    ///
+    /// Samples on a coarse stride (not every pixel) for speed -- this runs
+    /// once per calibration round on a still frame, not per-frame in a
+    /// real-time loop, so a full-resolution scan isn't needed for accuracy,
+    /// just enough samples per row to estimate red coverage reliably.
+    private nonisolated func countRedTapeMarks(in pixelBuffer: CVPixelBuffer) -> Int {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return 0 }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+
+        // Tape marks span the lane, roughly centered in frame -- sampling
+        // only the central half of columns avoids shoulder/curb clutter
+        // and roughly halves the work.
+        let colStart = width / 4
+        let colEnd = width - width / 4
+        let sampleCount = 200
+        let colStride = max(1, (colEnd - colStart) / sampleCount)
+        let rowStride = 2
+
+        func redPixel(atByteOffset offset: Int) -> Bool {
+            // kCVPixelFormatType_32BGRA byte order: B, G, R, A.
+            let b = Double(bytes[offset])
+            let g = Double(bytes[offset + 1])
+            let r = Double(bytes[offset + 2])
+            return r > 100 && r > g * 1.5 && r > b * 1.5
+        }
+
+        var redFractionByRow: [Int: Double] = [:]
+        var row = 0
+        while row < height {
+            var redCount = 0
+            var total = 0
+            var col = colStart
+            while col < colEnd {
+                redPixel(atByteOffset: row * bytesPerRow + col * 4) ? (redCount += 1) : ()
+                total += 1
+                col += colStride
+            }
+            if total > 0 {
+                redFractionByRow[row] = Double(redCount) / Double(total)
+            }
+            row += rowStride
+        }
+
+        let minRedRowFraction = 0.4
+        let redRows = redFractionByRow.filter { $0.value >= minRedRowFraction }.keys.sorted()
+
+        // A single tape mark spans several consecutive qualifying rows
+        // (it has real width in the image, not just one row) -- merge rows
+        // within this gap into the same band instead of over-counting one
+        // mark as several.
+        let mergeGapRows = 20
+        var bandCount = 0
+        var previousRow: Int?
+        for r in redRows {
+            if let previous = previousRow, r - previous <= mergeGapRows {
+                // Still the same band.
+            } else {
+                bandCount += 1
+            }
+            previousRow = r
+        }
+        return bandCount
+    }
+
+    /// Removes the session's inputs/outputs (not just stopping it) so the
+    /// next `configure()` call takes the full setup path again -- the only
+    /// way to guarantee a calibration recording's 4K preset and locked
+    /// focus don't leak into a subsequent normal drive recording, since
+    /// `configure`'s quick-restart path (inputs still attached) skips
+    /// re-applying the preset/focus mode entirely.
+    private nonisolated func teardownSession() {
+        session.beginConfiguration()
+        for input in session.inputs { session.removeInput(input) }
+        for output in session.outputs { session.removeOutput(output) }
+        session.commitConfiguration()
+        captureDevice = nil
+        rotationCoordinator = nil
+        rotationObservation = nil
+    }
+
+    /// Restricts autofocus to the far range, then waits for it to settle on
+    /// a genuinely sharp position before locking there. Shared by two
+    /// callers: the driving session's start-of-drive focus (re-run
+    /// periodically, see `recalibrateFocusIfDue`) and
+    /// `startCalibrationRecording`'s one-off lock.
+    ///
+    /// HISTORY: used to run unconditionally at drive start, then got
+    /// removed 2026-08-08 after appearing to cause a multi-second freeze on
+    /// Lock Settings -- the on-device debug log showed `captureOutput`
+    /// itself stopped firing for the whole settle window, which looked
+    /// damning. CONFIRMED 2026-08-09 that diagnosis was wrong: even after
+    /// fully removing this machinery, the freeze persisted unchanged. The
+    /// real cause was `configuringScreen`/`drivingScreen` each creating
+    /// their own `CameraPreviewView`, tearing down and re-attaching a
+    /// second `AVCaptureVideoPreviewLayer` to the same running session on
+    /// the phase transition -- fixed separately by hoisting
+    /// `CameraPreviewView` to the top-level view, shared across that
+    /// transition. Restoring this is therefore safe: the thing it was
+    /// blamed for has a different, already-fixed cause. Its own real
+    /// downside is unrelated and separately documented: confirmed on a
+    /// real night drive to sometimes lock onto a bad moment (dark scene,
+    /// still in the driveway) and stay wrong for the rest of the drive --
+    /// see `recalibrateFocusIfDue` for how that's bounded. Also confirmed
+    /// 2026-08-09 (tape-mark calibration clip): the plain `.far`-restriction
+    /// -only approach this replaced doesn't reliably keep continuous AF off
+    /// a large, close, high-contrast object (e.g. the dash) -- locking
+    /// removes that risk instead of just leaving it transient.
+    ///
+    /// `completion` fires exactly once per call, whether focus settled,
+    /// timed out, or the device doesn't support the required modes at all.
+    ///
+    /// *** Guards against stale re-firing with a unique token, not just
+    /// "is focusSettleObservation non-nil" -- CONFIRMED bug 2026-08-09:
+    /// during the 3-round distance calibration, round 0's completion
+    /// re-fired minutes after round 1 had already started its own settle,
+    /// re-running round 0's whole chain a second time (a second, stale
+    /// `stopCalibrationRecording` call for a round the UI had already moved
+    /// past). Root cause: `setFocusModeLocked` inside `finish` can itself
+    /// briefly perturb `isAdjustingFocus`, and/or AVFoundation's KVO
+    /// delivery isn't guaranteed to happen on `sessionQueue` -- either way,
+    /// a notification tied to THIS call could still arrive after
+    /// `focusSettleObservation` had already been reassigned to a NEWER
+    /// call's observation, so the old `!= nil` check passed incorrectly
+    /// (it was checking "is *some* settle active", not "is *this* one still
+    /// current"). A per-call UUID token closes that gap: a stale
+    /// notification's captured token can never match a newer call's token.
+    private nonisolated func settleAndLockFarFieldFocus(
+        device: AVCaptureDevice,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        guard
+            device.isFocusModeSupported(.continuousAutoFocus),
+            device.isAutoFocusRangeRestrictionSupported,
+            device.isFocusModeSupported(.locked)
+        else {
+            completion()
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.autoFocusRangeRestriction = .far
+            device.focusMode = .continuousAutoFocus
+        } catch {
+            completion()
+            return
+        }
+
+        let token = UUID()
+        currentFocusSettleToken = token
+        DebugFileLogger.log("focus: settling")
+        let settleStart = CFAbsoluteTimeGetCurrent()
+        let finish: @Sendable (Bool) -> Void = { [weak self] settled in
+            guard let self else {
+                completion()
+                return
+            }
+            guard self.currentFocusSettleToken == token else {
+                // Stale -- a newer settle call has already superseded this
+                // one. Not this call's completion to fire.
+                return
+            }
+            self.focusSettleObservation = nil
+            self.currentFocusSettleToken = nil
+            self.lastFocusLockTime = CFAbsoluteTimeGetCurrent()
+
+            let lockPosition: Float
+            if settled {
+                lockPosition = device.lensPosition
+                self.lastGoodLensPosition = lockPosition
+                DebugFileLogger.log(String(
+                    format: "focus: settled after %.2fs at lensPosition=%.3f",
+                    CFAbsoluteTimeGetCurrent() - settleStart, lockPosition
+                ))
+            } else if let goodPosition = self.lastGoodLensPosition {
+                lockPosition = goodPosition
+                DebugFileLogger.log(String(
+                    format: "focus: settle timed out after %.0fs, keeping previous good lensPosition=%.3f instead of unconfirmed=%.3f",
+                    Self.maxFocusSettleWait, goodPosition, device.lensPosition
+                ))
+            } else {
+                lockPosition = device.lensPosition
+                DebugFileLogger.log(String(
+                    format: "focus: settle timed out after %.0fs, no prior good lock, locking at lensPosition=%.3f anyway",
+                    Self.maxFocusSettleWait, lockPosition
+                ))
+            }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                device.setFocusModeLocked(lensPosition: lockPosition, completionHandler: nil)
+            } catch {
+                // Device may be mid-reconfiguration; focus stays continuous
+                // (still far-restricted), not ideal but not broken either.
+            }
+            completion()
+        }
+
+        focusSettleObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] _, change in
+            guard change.newValue == false, self?.currentFocusSettleToken == token else { return }
+            finish(true)
+        }
+        sessionQueue.asyncAfter(deadline: .now() + Self.maxFocusSettleWait) { [weak self] in
+            guard self?.currentFocusSettleToken == token else { return }
+            finish(false)
+        }
+    }
+
+    /// Re-runs the settle-then-lock focus roughly every
+    /// `focusRecalibrationInterval` -- called from every captured frame,
+    /// matching how `sampleAutoLowLightIfDue` self-throttles instead of
+    /// needing its own timer. Bounds how long a bad one-shot lock can stay
+    /// wrong for -- see `settleAndLockFarFieldFocus`'s doc comment.
+    private nonisolated func recalibrateFocusIfDue() {
+        guard
+            let device = captureDevice,
+            focusSettleObservation == nil,
+            CFAbsoluteTimeGetCurrent() - lastFocusLockTime >= Self.focusRecalibrationInterval
+        else { return }
+        settleAndLockFarFieldFocus(device: device) {}
+    }
+
     /// Sets the low-light exposure boost to an explicit state (voice commands "low
     /// light on"/"off"). Suspends auto-detection until `enableAutoLowLight()` is
     /// called again, so the two don't immediately fight.
@@ -303,37 +693,6 @@ final class CameraManager: NSObject, ObservableObject {
             device.setExposureTargetBias(bias, completionHandler: nil)
         } catch {
             // Device may be mid-reconfiguration; the bias just won't apply this time.
-        }
-    }
-
-    /// The road ahead is always far away, so autofocus hunting near objects (the
-    /// dashboard, a windshield reflection) is pure downside here. Restricting the
-    /// *range* autofocus searches to `.far`, while leaving continuous autofocus
-    /// running for the whole drive, stops it hunting near.
-    ///
-    /// This used to also settle-then-lock to a single confirmed-sharp lens
-    /// position (waiting on `isAdjustingFocus`, with a 5s timeout), on the
-    /// reasoning that a blind lensPosition guess isn't guaranteed to land on
-    /// true infinity focus. REMOVED 2026-08-08: confirmed via the on-device
-    /// debug log that activating this restricted-range continuous-AF mode
-    /// itself (not just the settle wait) makes the camera hardware pause
-    /// frame delivery for several seconds -- a real freeze on every drive
-    /// start, worse than the downside it was solving. Traded for: continuous
-    /// AF may occasionally re-hunt between two far-away objects (e.g. a car
-    /// 15m ahead vs. a building 200m back) over the course of a drive --
-    /// confirmed on-device to happen, reads as brief refocusing, not a freeze.
-    private nonisolated func restrictAutofocusToFarField(for device: AVCaptureDevice) {
-        guard
-            device.isFocusModeSupported(.continuousAutoFocus),
-            device.isAutoFocusRangeRestrictionSupported
-        else { return }
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-            device.autoFocusRangeRestriction = .far
-            device.focusMode = .continuousAutoFocus
-        } catch {
-            // Device may be mid-reconfiguration; try again on the next configure().
         }
     }
 
@@ -484,10 +843,35 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    private nonisolated func configure(startRecording: Bool) {
+    /// `preset` defaults to the normal drive preset (1080p, see the thermal
+    /// comment below) -- `startCalibrationRecording` passes 4K instead, for
+    /// a short one-off clip where thermal isn't a concern but row precision
+    /// is. Only meaningful on a fresh (non-quick-restart) configure -- see
+    /// that path's own comment for why a stale preset can't leak from a
+    /// calibration recording into a normal one.
+    /// `settleFocus: false` skips the automatic focus-settle below --
+    /// `startCalibrationRecording` uses this, since it always does its own
+    /// explicit settle-then-lock afterward (it needs the completion to
+    /// know when to actually start writing frames, which the automatic
+    /// fire-and-forget call here can't provide). CONFIRMED bug 2026-08-09:
+    /// without this, both calls ran concurrently and raced over the same
+    /// shared focus-tracking state (`focusSettleObservation` etc.) -- the
+    /// explicit call's completion (the one `startCalibrationRecording`
+    /// actually depends on) never fired, so `startNewRecording()` never
+    /// ran and the caller's "recording" state stayed stuck forever. Debug
+    /// log showed two `focus: settling` lines ~150ms apart per attempt,
+    /// same signature as the earlier double-tap race, but this one was a
+    /// straightforward logic bug, not a UI timing issue.
+    private nonisolated func configure(startRecording: Bool, preset: AVCaptureSession.Preset = .hd1920x1080, settleFocus: Bool = true) {
         guard !session.isRunning else { return }
 
         // After stop(), inputs/outputs are still attached — just restart.
+        // Only reachable for a normal (non-calibration) start: `preset` is
+        // ignored here, so `startCalibrationRecording`/`stopCalibrationRecording`
+        // deliberately tear the session fully down (removing inputs/outputs)
+        // rather than just stopping it, forcing the full setup path below to
+        // run again next time -- otherwise a 4K calibration preset could
+        // silently persist into the next normal drive recording.
         if !session.inputs.isEmpty {
             session.startRunning()
             if startRecording { startNewRecording() }
@@ -505,7 +889,7 @@ final class CameraManager: NSObject, ObservableObject {
         // cut to that fixed cost. See `logThermalState` for the telemetry that
         // confirms whether this is actually sustainable on a real long drive.
         session.beginConfiguration()
-        session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .hd1280x720
+        session.sessionPreset = session.canSetSessionPreset(preset) ? preset : .hd1280x720
 
         guard
             let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -517,7 +901,15 @@ final class CameraManager: NSObject, ObservableObject {
         }
         session.addInput(input)
         captureDevice = device
-        restrictAutofocusToFarField(for: device)
+        // Fire-and-forget: doesn't block this synchronous configure() from
+        // completing/starting the session, matching how it ran before.
+        // recalibrateFocusIfDue() (from captureOutput) keeps it fresh for
+        // the rest of the drive. Skipped when the caller (e.g.
+        // startCalibrationRecording) is going to do its own explicit
+        // settle-then-lock right after -- see this function's doc comment.
+        if settleFocus {
+            settleAndLockFarFieldFocus(device: device) {}
+        }
         restrictMaxExposureDuration(for: device)
         restrictFrameRate(for: device, to: 15)
 
@@ -905,7 +1297,7 @@ final class CameraManager: NSObject, ObservableObject {
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let url = documents.appendingPathComponent("recording-\(formatter.string(from: Date())).mov")
+        let url = documents.appendingPathComponent("\(activeRecordingFilenamePrefix)-\(formatter.string(from: Date())).mov")
 
         do {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -1106,7 +1498,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         sampleAutoLowLightIfDue(pixelBuffer)
+        recalibrateFocusIfDue()
         appendRecordingFrame(pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        if activeRecordingFilenamePrefix == "calibration" {
+            latestCalibrationPixelBuffer = pixelBuffer
+        }
 
         let box = UncheckedSendableBox(value: pixelBuffer)
         Task { @MainActor [weak self] in

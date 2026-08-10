@@ -40,11 +40,13 @@
 //  permission needed: CMMotionManager's raw device motion doesn't require
 //  the Motion & Fitness prompt CMPedometer/CMMotionActivity do.
 //
-//  NOT YET VERIFIED against a real mounted phone: whether CMDeviceMotion's
-//  pitch axis/sign convention matches "camera tilted down toward the road"
-//  in this app's actual landscape mounted orientation is unconfirmed --
-//  check this against reality once the real mount is in use, don't trust
-//  the sign blindly.
+//  CONFIRMED BROKEN 2026-08-09, then fixed: raw CMDeviceMotion `.pitch`
+//  (a CMAttitude Euler angle) doesn't mean "nose tilted down toward the
+//  road" in this app's landscape mount at all -- see pitchDegrees's own
+//  derivation below for the gimbal-lock reason and the gravity-vector fix
+//  (same underlying issue rollDegrees already hit and was fixed for).
+//  pitchDegrees's new sign is reasoned, not yet bench-confirmed -- don't
+//  trust it blindly either, same discipline as everything else here.
 //
 //  YAW RATE SIGN CONVENTION: CONFIRMED 2026-08-06 via bench test (hand-
 //  rotating the mounted phone, watching yawRateDegreesPerSecond live) --
@@ -179,17 +181,38 @@ final class PitchSensor: ObservableObject {
                 if let error { print("[PitchSensor] update failed: \(error)") }
                 return
             }
-            self?.pitchDegrees = motion.attitude.pitch * 180 / .pi
+            // Same gimbal-lock problem rollDegrees already hit, just for
+            // pitch: CMAttitude.pitch rotates about the device's LOCAL X
+            // axis, but that axis is real-world VERTICAL in this landscape
+            // mount (confirmed via gravityX) -- so raw `.pitch` was really
+            // reading something closer to yaw/heading, not nose-up/down
+            // tilt. CONFIRMED bad 2026-08-09 via bench test: phone standing
+            // upright in its mounted landscape orientation, tilted flat
+            // onto a table (a genuine ~90 degree nose-down tilt), only
+            // moved pitchDegrees a few degrees. Fixed the same way roll
+            // was: derive directly from the gravity vector instead. sqrt(x^2
+            // + y^2) is the gravity magnitude in the horizontal (X-Y) plane
+            // -- rolling about the boresight (Z) axis only exchanges
+            // gravity between X and Y, leaving this combined magnitude (and
+            // Z itself) unchanged, so atan2(z, sqrt(x^2+y^2)) comes out
+            // independent of roll, by the same kind of trig identity as
+            // rollDegrees's own derivation. Sign chosen so nose-down (Z
+            // rotating toward gravity) reads positive, matching
+            // DistanceEstimator's documented convention -- NOT YET BENCH-
+            // CONFIRMED, same "verify before trusting" discipline as every
+            // other sign convention here.
+            let gx = motion.gravity.x, gy = motion.gravity.y, gz = motion.gravity.z
+            self?.pitchDegrees = atan2(gz, (gx * gx + gy * gy).squareRoot()) * 180 / .pi
             // Rotating about the boresight (device Z) axis exchanges gravity
             // between X and Y while leaving Z untouched, so atan2(y, -x)
             // isolates exactly that rotation -- and, per the small-angle
             // trig identity, comes out independent of pitch/nose-tilt too
-            // (see rollDegrees's doc comment). -x because the confirmed
-            // level+correct-orientation reading is gravityX ~= -1, which
-            // this needs to map to 0 degrees. Sign not yet bench-confirmed
-            // -- same "verify before trusting" discipline as gravityX's own
+            // (see pitchDegrees's derivation above, same underlying trig).
+            // -x because the confirmed level+correct-orientation reading is
+            // gravityX ~= -1, which this needs to map to 0 degrees. Sign
+            // not yet bench-confirmed -- same discipline as gravityX's own
             // mount-orientation check.
-            self?.rollDegrees = atan2(motion.gravity.y, -motion.gravity.x) * 180 / .pi
+            self?.rollDegrees = atan2(gy, -gx) * 180 / .pi
             self?.rotationRateXDegreesPerSecond = motion.rotationRate.x * 180 / .pi
             self?.rotationRateYDegreesPerSecond = motion.rotationRate.y * 180 / .pi
             self?.rotationRateZDegreesPerSecond = motion.rotationRate.z * 180 / .pi
