@@ -132,6 +132,26 @@ struct InferenceView: View {
     /// phone is exactly what it's there to catch.
     @State private var initialCalibrationRoll: Double?
 
+    /// Ground-truth distance entry, right after the tape-mark count is
+    /// confirmed -- nil = inactive, 0..<tapeMarkCount = currently on that
+    /// mark's input screen. Once the last mark is confirmed, flows straight
+    /// into round 1 of pitch-adjustment/recording (`distanceCalibrationRound`)
+    /// -- re-chained 2026-08-11 after briefly being decoupled on 2026-08-10;
+    /// the decoupled version left no way to actually reach the recording
+    /// rounds at all, which is what prompted re-chaining them. Entry screens
+    /// don't need to be visited in physical near-to-far order (there's no
+    /// way to enforce that from the UI alone); whatever order the user
+    /// enters them in, `confirmTapeMarkDistance` sorts ascending (nearest
+    /// first) before logging the final array.
+    @State private var tapeMarkDistanceIndex: Int?
+    /// Sized to `tapeMarkCount` as soon as the flow starts (see
+    /// `confirmTapeMarkCount`), indexed by screen index -- lets Back/Next
+    /// revisit and overwrite any mark's entry rather than only supporting
+    /// forward-only append.
+    @State private var tapeMarkDistancesMeters: [Double] = []
+    @State private var currentDistanceMeters = 0
+    @State private var currentDistanceCentimeters = 0
+
     private func flashToast(_ text: String) {
         withAnimation { toastText = text }
         Task {
@@ -141,8 +161,18 @@ struct InferenceView: View {
     }
 
     /// "Yes" on the calibrate-prompt screen -- go do the actual leveling
-    /// step.
+    /// step. Starts the preview-only session here too (not just at
+    /// `enterConfiguring`, which no-ops harmlessly on the already-running
+    /// session per `CameraManager.configure`'s `!session.isRunning` guard)
+    /// so the level screen's live camera feed -- and the yaw-reference line
+    /// on it -- is up before the user gets there, instead of popping in
+    /// only once `.configuring` is reached. Side benefit: the distance-
+    /// calibration side-flow reachable from this screen (long-press, see
+    /// `beginDistanceCalibration`) now also always finds a running session,
+    /// rather than depending on `startCalibrationRecording`'s cold-start
+    /// path for round 0's first attempt.
     private func confirmCalibrate() {
+        cameraManager.start(recording: false)
         withAnimation { sessionPhase = .level }
     }
 
@@ -211,12 +241,82 @@ struct InferenceView: View {
         isChoosingTapeMarkCount = false
         distanceCalibrationRound = nil
         initialCalibrationRoll = nil
+        tapeMarkDistanceIndex = nil
+        tapeMarkDistancesMeters = []
+        currentDistanceMeters = 0
+        currentDistanceCentimeters = 0
     }
 
     private func confirmTapeMarkCount() {
         DebugFileLogger.log("distance-cal: MATCHED confirmTapeMarkCount count=\(tapeMarkCount)")
         isChoosingTapeMarkCount = false
-        distanceCalibrationRound = 0
+        // 10m is a reasonable starting guess for a following-distance tape
+        // mark -- initializing here (rather than 0) means fewer stepper
+        // taps for the common case.
+        tapeMarkDistancesMeters = Array(repeating: 10, count: tapeMarkCount)
+        currentDistanceMeters = 10
+        currentDistanceCentimeters = 0
+        tapeMarkDistanceIndex = 0
+    }
+
+    /// Splits a combined meters value back into its stepper parts, for
+    /// loading a previously-entered (or default-zero) mark's distance into
+    /// the current screen's fields -- used by both directions of
+    /// navigation so Back/Next always show what was last entered for that
+    /// mark rather than resetting to zero.
+    private func loadDistanceIntoFields(_ distance: Double) {
+        let meters = Int(distance)
+        currentDistanceMeters = meters
+        currentDistanceCentimeters = Int(((distance - Double(meters)) * 100).rounded())
+    }
+
+    /// "Next"/"Start Calibration" on the tape-mark distance entry screen --
+    /// records the current mark's distance (meters + cm combined) at its
+    /// own index (not appended -- Back can revisit and overwrite any
+    /// mark), then either advances to the next mark or, after the last
+    /// one, sorts the collected distances ascending (nearest first, since
+    /// entry order needn't match physical order), logs them, and starts
+    /// round 1 of pitch-adjustment/recording (`distanceCalibrationRound`).
+    private func confirmTapeMarkDistance() {
+        guard let index = tapeMarkDistanceIndex else { return }
+        let distance = Double(currentDistanceMeters) + Double(currentDistanceCentimeters) / 100
+        tapeMarkDistancesMeters[index] = distance
+        DebugFileLogger.log("distance-cal: mark=\(index) distanceMeters=\(distance)")
+        if index + 1 >= tapeMarkCount {
+            let sorted = tapeMarkDistancesMeters.sorted()
+            DebugFileLogger.log("distance-cal: MATCHED all distances entered, nearest-first \(sorted)")
+            tapeMarkDistanceIndex = nil
+            tapeMarkDistancesMeters = []
+            currentDistanceMeters = 0
+            currentDistanceCentimeters = 0
+            // Re-chained 2026-08-11: distance entry now flows straight into
+            // round 1 of pitch-adjustment/recording, same as before the
+            // 2026-08-10 decoupling -- `initialCalibrationRoll` (captured
+            // back in `beginDistanceCalibration`) stays set, since it's the
+            // fixed roll reference `distanceCalibrationPitchScreen` shows
+            // across all 3 rounds; only cleared once round 3 actually
+            // completes (see `recordCalibrationRound`'s round >= 2 branch).
+            distanceCalibrationRound = 0
+        } else {
+            tapeMarkDistanceIndex = index + 1
+            loadDistanceIntoFields(tapeMarkDistancesMeters[index + 1])
+        }
+    }
+
+    /// "Back" on the tape-mark distance entry screen -- saves whatever's
+    /// currently entered (so a Back tap never silently discards it) and
+    /// steps to the previous mark's screen, loading its own last-entered
+    /// value. Logs the save the same way `confirmTapeMarkDistance` does --
+    /// otherwise a value entered then left via Back (never revisited via
+    /// Next) would only show up in the final sorted-array summary line,
+    /// not in the per-mark log trail.
+    private func backTapeMarkDistance() {
+        guard let index = tapeMarkDistanceIndex, index > 0 else { return }
+        let distance = Double(currentDistanceMeters) + Double(currentDistanceCentimeters) / 100
+        tapeMarkDistancesMeters[index] = distance
+        DebugFileLogger.log("distance-cal: mark=\(index) distanceMeters=\(distance) (via back)")
+        tapeMarkDistanceIndex = index - 1
+        loadDistanceIntoFields(tapeMarkDistancesMeters[index - 1])
     }
 
     /// "Ready" on the "Adjust pitch" screen -- captures the CURRENT live
@@ -425,7 +525,7 @@ struct InferenceView: View {
             // the user can see the tape marks are actually in frame and in
             // focus while adjusting pitch and recording -- see
             // beginDistanceCalibration.
-            if sessionPhase == .configuring || sessionPhase == .driving
+            if sessionPhase == .level || sessionPhase == .configuring || sessionPhase == .driving
                 || isCalibrationRecording || distanceCalibrationRound != nil {
                 CameraPreviewView(session: cameraManager.session)
                     .ignoresSafeArea()
@@ -441,6 +541,8 @@ struct InferenceView: View {
             // content is swapped out.
             if isChoosingTapeMarkCount {
                 tapeMarkCountPickerOverlay
+            } else if let index = tapeMarkDistanceIndex {
+                tapeMarkDistanceScreen(index: index)
             } else if isCalibrationRecording {
                 distanceCalibrationRecordingBanner
             } else if let round = distanceCalibrationRound {
@@ -599,20 +701,75 @@ struct InferenceView: View {
 
     // MARK: — Level screen
 
+    /// A fixed vertical line marking where a real-world dash point sits on
+    /// screen when yaw is correctly zeroed -- lets yaw be rechecked/redone
+    /// any time just by looking at the live preview and nudging the mount
+    /// until that same real-world point sits back on this line, instead of
+    /// needing the laser-in-the-V-groove routine every time (see
+    /// [[project-following-distance-measurement]]'s yaw-alignment entries).
+    /// `referenceNormalizedX` is the measured X position (as a fraction of
+    /// frame width) of the yellow laser-dot mark in
+    /// `data/26_08_11_YawCalibration/recording-20260811-130522.MOV` --
+    /// captured with yaw zeroed via laser AND roll at zero, in the same
+    /// `.hd1920x1080` preset the live preview uses (`CameraManager.configure`'s
+    /// default), so no FOV/crop mismatch between that reference clip and
+    /// what's on screen now. Measured as the centroid of the dot's pixels
+    /// across two frames 7s apart (1016.6/1920 and 1016.6/1920, i.e.
+    /// stable) -- not eyeballed.
+    ///
+    /// `CameraPreviewView`'s `.resizeAspectFill` means this can't just be
+    /// `referenceNormalizedX * screenWidth` -- the buffer is scaled to fill
+    /// the view and center-cropped on whichever axis overflows, so the crop
+    /// offset has to be computed from the actual runtime view size (device
+    /// screen aspect ratio isn't assumed/hardcoded here).
+    private struct YawReferenceLine: View {
+        static let referenceNormalizedX: CGFloat = 0.5295
+        private static let videoWidth: CGFloat = 1920
+        private static let videoHeight: CGFloat = 1080
+
+        var body: some View {
+            GeometryReader { geo in
+                let scale = max(geo.size.width / Self.videoWidth, geo.size.height / Self.videoHeight)
+                let displayedWidth = Self.videoWidth * scale
+                let originX = (geo.size.width - displayedWidth) / 2
+                let x = originX + Self.referenceNormalizedX * displayedWidth
+                Rectangle()
+                    .fill(Color.yellow.opacity(0.85))
+                    .frame(width: 2, height: geo.size.height)
+                    .position(x: x, y: geo.size.height / 2)
+            }
+            // Without this, GeometryReader is only proposed the safe-area-
+            // inset size, not the true full-screen bounds CameraPreviewView
+            // itself fills (see its own `.ignoresSafeArea()`) -- the line
+            // stopped short of the real screen edges, matching the reported
+            // "doesn't go all the way to the bottom" symptom exactly.
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+        }
+    }
+
     private var rollDegreesRounded: Int {
         Int((pitchSensor.rollDegrees ?? 0).rounded())
     }
 
+    /// Live camera preview shows through from `body` (see the
+    /// `sessionPhase == .level` case added to its visibility condition) --
+    /// deliberately no opaque background here anymore, matching
+    /// `distanceCalibrationPitchScreen`'s pattern, so `YawReferenceLine` and
+    /// the dash behind it are actually visible. Text shadows replace the
+    /// old solid-black backdrop for legibility over live video.
     private var levelScreen: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            YawReferenceLine()
             VStack(spacing: 32) {
                 Text("\(rollDegreesRounded)°")
                     .font(.system(size: 96, weight: .bold, design: .rounded))
                     .foregroundStyle(abs(rollDegreesRounded) <= 1 ? .green : .white)
+                    .shadow(color: .black.opacity(0.7), radius: 4)
                 Text("from level")
                     .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.6))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .shadow(color: .black.opacity(0.7), radius: 4)
                 Button {
                     calibrateAttitude()
                 } label: {
@@ -693,6 +850,109 @@ struct InferenceView: View {
         }
     }
 
+    /// Shared circular +/- button, matching `tapeMarkCountPickerOverlay`'s
+    /// original inline style -- factored out once the meters/cm entry
+    /// screen below tripled the number of call sites.
+    private func stepperButton(_ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 40, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 64, height: 64)
+                .background(Color.black.opacity(0.5), in: Circle())
+        }
+    }
+
+    /// One of N sequential screens (see `tapeMarkDistanceIndex`), shown
+    /// before any of the 3 pitch/recording rounds, for entering the
+    /// measured ground-truth distance from the camera to each tape mark --
+    /// split into meters/cm steppers on one line rather than text entry,
+    /// matching `tapeMarkCountPickerOverlay`'s tap-based convention, the
+    /// only input style used anywhere else in the app. Fully opaque
+    /// singleton, same reasoning as that screen: no camera preview needed
+    /// for pure numeric entry. Back/Next let the user revisit and correct
+    /// any mark in either direction -- entry order doesn't need to match
+    /// physical near-to-far order since `confirmTapeMarkDistance` sorts
+    /// before logging.
+    private func tapeMarkDistanceScreen(index: Int) -> some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack(spacing: 32) {
+                Text("Tape Mark \(index + 1)")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(.white)
+                HStack(spacing: 48) {
+                    VStack(spacing: 8) {
+                        Text("meters")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                        HStack(spacing: 20) {
+                            stepperButton("−") {
+                                currentDistanceMeters = max(0, currentDistanceMeters - 1)
+                            }
+                            Text("\(currentDistanceMeters)")
+                                .font(.system(size: 56, weight: .bold, design: .rounded))
+                                .foregroundStyle(.white)
+                                .frame(minWidth: 72)
+                            stepperButton("+") {
+                                currentDistanceMeters += 1
+                            }
+                        }
+                    }
+                    VStack(spacing: 8) {
+                        Text("cm")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                        HStack(spacing: 20) {
+                            stepperButton("−") {
+                                currentDistanceCentimeters = (currentDistanceCentimeters - 1 + 100) % 100
+                            }
+                            Text("\(currentDistanceCentimeters)")
+                                .font(.system(size: 56, weight: .bold, design: .rounded))
+                                .foregroundStyle(.white)
+                                .frame(minWidth: 72)
+                            stepperButton("+") {
+                                currentDistanceCentimeters = (currentDistanceCentimeters + 1) % 100
+                            }
+                        }
+                    }
+                }
+                HStack(spacing: 24) {
+                    if index > 0 {
+                        Button {
+                            backTapeMarkDistance()
+                        } label: {
+                            Text("Back")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 40)
+                                .frame(height: 64)
+                                .background(Color.white.opacity(0.15), in: Capsule())
+                        }
+                    }
+                    Button {
+                        confirmTapeMarkDistance()
+                    } label: {
+                        Text(index + 1 >= tapeMarkCount ? "Start Calibration" : "Next")
+                            .font(.system(size: 24, weight: .bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 40)
+                            .frame(height: 64)
+                            .background(Color.yellow, in: Capsule())
+                    }
+                }
+                Button {
+                    cancelDistanceCalibration()
+                } label: {
+                    Text("Cancel")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.top, 8)
+            }
+        }
+    }
+
     private var pitchDegreesRounded: Int {
         Int((pitchSensor.pitchDegrees ?? 0).rounded())
     }
@@ -715,6 +975,13 @@ struct InferenceView: View {
     /// same as the settings HUD leaves the center clear) aren't obscured
     /// by any of this screen's own UI.
     private func distanceCalibrationPitchScreen(round: Int) -> some View {
+        ZStack {
+            YawReferenceLine()
+            distanceCalibrationPitchScreenContent(round: round)
+        }
+    }
+
+    private func distanceCalibrationPitchScreenContent(round: Int) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Adjust Pitch")
