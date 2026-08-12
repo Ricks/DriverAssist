@@ -366,7 +366,12 @@ final class InferenceEngine: ObservableObject {
         let trackingStart = CFAbsoluteTimeGetCurrent()
         let result = trackingManager.track(detections, pixelBuffer: pixelBuffer)
         let trackingElapsedMs = (CFAbsoluteTimeGetCurrent() - trackingStart) * 1000
-        self.detections = result.detections
+        let rangedDetections = Self.attachDistances(
+            to: result.detections,
+            sourceSize: sourceSize,
+            pitchSensor: pitchSensor
+        )
+        self.detections = rangedDetections
         self.lastError = nil
         self.isBusy = false
         self.lastFrameElapsedMs = elapsedMs + trackingElapsedMs
@@ -404,7 +409,7 @@ final class InferenceEngine: ObservableObject {
             gravityX: pitchSensor.gravityX,
             gravityY: pitchSensor.gravityY,
             gravityZ: pitchSensor.gravityZ,
-            detections: result.detections
+            detections: rangedDetections
         )
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {
@@ -417,5 +422,34 @@ final class InferenceEngine: ObservableObject {
         self.lastError = error.localizedDescription
         self.isBusy = false
         print("[InferenceEngine] inference failed: \(error)")
+    }
+
+    /// Attaches DistanceEstimator.calibrated's estimate to each detection.
+    /// Needs a reference pitch to produce anything -- stays nil (not the
+    /// stale previous value) for every detection until the user has pressed
+    /// "Calibrate" at least once, same nil-over-placeholder reasoning as the
+    /// rest of PitchSensor/EgoSpeedManager's logging.
+    private static func attachDistances(
+        to detections: [Detection],
+        sourceSize: CGSize,
+        pitchSensor: PitchSensor
+    ) -> [Detection] {
+        guard let referencePitch = pitchSensor.referencePitchDegrees,
+              sourceSize.width > 0, sourceSize.height > 0 else {
+            return detections
+        }
+        let referenceRoll = pitchSensor.referenceRollDegrees ?? 0
+        let aspectRatio = Double(sourceSize.width / sourceSize.height)
+        return detections.map { detection in
+            var detection = detection
+            detection.distanceMeters = DistanceEstimator.calibrated.distanceMeters(
+                bottomY: Double(detection.boundingBox.maxY),
+                centerX: Double(detection.boundingBox.midX),
+                referencePitchDegreesBelowHorizontal: referencePitch,
+                referenceRollDegrees: referenceRoll,
+                aspectRatio: aspectRatio
+            )
+            return detection
+        }
     }
 }

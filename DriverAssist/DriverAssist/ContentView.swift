@@ -87,6 +87,11 @@ struct InferenceView: View {
     @State private var batteryState: UIDevice.BatteryState = UIDevice.current.batteryState
     @State private var sessionPhase: SessionPhase = .calibratePrompt
     @State private var showExitConfirmation = false
+    /// True while any `StepperButton` is mid-hold (repeat timer running) --
+    /// lets `withSessionGestures`'s long-press-to-exit gesture ignore a
+    /// stepper hold-to-repeat past 0.8s instead of popping the exit dialog
+    /// over it. See `withSessionGestures`'s doc comment.
+    @State private var isStepperActive = false
 
     // Drives the critical-thermal blink — `cameraManager.thermalState` only changes
     // (and thus only re-evaluates the HUD) when the state itself changes, so without
@@ -151,6 +156,27 @@ struct InferenceView: View {
     @State private var tapeMarkDistancesMeters: [Double] = []
     @State private var currentDistanceMeters = 0
     @State private var currentDistanceCentimeters = 0
+
+    /// True for the whole "Calibration" (`.level`) phase and the whole
+    /// "Distance Calibration" side-flow (however it was entered -- long-
+    /// press from the level screen or the tap toggle on the configuring
+    /// screen -- and through every one of its sub-screens), so the screen
+    /// can go to full brightness for both: both involve eyeballing the live
+    /// camera feed against a real-world dash point (the yaw-reference line,
+    /// or the tape marks themselves), which is much harder to see at the
+    /// normal dimmed dashcam brightness. Deliberately a single derived
+    /// value read by one `onChange` in `body`, rather than threading
+    /// explicit brightness sets through every entry/exit point of this
+    /// side-flow (tap toggle, long-press, Cancel from several different
+    /// screens, natural 3-round completion) -- fewer places to get a
+    /// conditional restore wrong.
+    private var wantsFullBrightness: Bool {
+        sessionPhase == .level
+            || isChoosingTapeMarkCount
+            || tapeMarkDistanceIndex != nil
+            || isCalibrationRecording
+            || distanceCalibrationRound != nil
+    }
 
     private func flashToast(_ text: String) {
         withAnimation { toastText = text }
@@ -218,9 +244,15 @@ struct InferenceView: View {
         withAnimation { sessionPhase = .configuring }
     }
 
-    /// Hidden, deliberate long-press on the level screen (or tap on the
-    /// configuring screen's small "Distance cal" label) -- NOT part of the
-    /// normal session lifecycle (`sessionPhase` doesn't change). Kicks off
+    /// Deliberate, hidden-in-plain-sight tap on either screen's small
+    /// "Distance cal" label -- NOT part of the normal session lifecycle
+    /// (`sessionPhase` doesn't change). 2026-08-11: the level screen's
+    /// trigger used to be a 1.5s long-press instead of a tap, specifically
+    /// so it wouldn't collide with the level screen also needing the
+    /// standard 0.8s long-press-to-exit gesture (`withSessionGestures`) --
+    /// switched to match the configuring screen's tap trigger once that
+    /// was the actual ask, which also freed the level screen up to get the
+    /// exit gesture like every other screen. Kicks off
     /// the tape-mark distance-calibration flow: how many tape marks were
     /// placed, then three rounds of "adjust pitch, confirm, record a ~1s
     /// clip" -- gathering reference footage at three different pitches is
@@ -327,7 +359,13 @@ struct InferenceView: View {
         guard let round = distanceCalibrationRound else { return }
         let pitch = pitchSensor.pitchDegrees
         let roll = pitchSensor.rollDegrees
-        DebugFileLogger.log("distance-cal: round=\(round) pitch=\(String(describing: pitch)) roll=\(String(describing: roll))")
+        // 2026-08-11: added after finding that implied per-round focal
+        // length varied ~2x across three tape-mark calibration rounds in a
+        // way pitch couldn't explain -- video stabilization crop (see
+        // CameraManager.isStabilizationEnabled) changes pixel-space FOV, and
+        // this wasn't being recorded per round, so a differing setting
+        // between rounds couldn't be ruled in or out after the fact.
+        DebugFileLogger.log("distance-cal: round=\(round) pitch=\(String(describing: pitch)) roll=\(String(describing: roll)) stabilizationEnabled=\(cameraManager.isStabilizationEnabled)")
         recordCalibrationRound(round: round)
     }
 
@@ -338,14 +376,15 @@ struct InferenceView: View {
     /// one second of already-locked-focus 4K is plenty of frames, so it
     /// just auto-stops rather than needing a second deliberate action.
     ///
-    /// After stopping, checks the detected tape-mark count (see
-    /// CameraManager.countRedTapeMarks) against what was entered: on match,
-    /// advances to the next round (or finishes after round 3); on
-    /// mismatch, stays on the same round so the user can adjust and retry
-    /// rather than restarting the whole three-round sequence. If a clean
-    /// still frame from this ever isn't enough to make the tape out
-    /// reliably, the planned fallback is a proper photo capture instead of
-    /// a longer clip.
+    /// 2026-08-11: no automatic tape-mark detection anymore -- previously
+    /// ran `CameraManager.countRedTapeMarks` against the last frame and
+    /// retried the round on a mismatch; removed by explicit request
+    /// ("don't even bother checking... assume we can label tape mark edges
+    /// post calibration"). Every round now unconditionally advances (or
+    /// completes, after round 3) once its clip is saved -- the actual tape-
+    /// mark rows get read off the recorded footage by hand afterward,
+    /// which is also what `DistanceEstimator.fit()` needs regardless (it
+    /// was never fed by the automatic count in the first place).
     private func recordCalibrationRound(round: Int) {
         guard !isCalibrationRecording else { return }
         // Set TRUE immediately, synchronously -- not after
@@ -356,12 +395,12 @@ struct InferenceView: View {
         // 2026-08-09 via debug log: two overlapping "focus: settling"
         // calls 154ms apart, from the Ready button still being visible/
         // tappable during that window -- neither attempt's completion ever
-        // reached the pass/fail comparison, reading as "stuck on round 1
-        // with no error message" (there wasn't a missing-error bug -- the
-        // comparison itself was never being reached). This also means the
-        // "recording" banner now shows the instant Done is tapped instead
-        // of after an unexplained multi-second pause, which was likely why
-        // the user tapped again in the first place.
+        // reached the round-advance logic below, reading as "stuck on
+        // round 1 with no error message" (there wasn't a missing-error bug
+        // -- that logic itself was never being reached). This also means
+        // the "recording" banner now shows the instant Ready is tapped
+        // instead of after an unexplained multi-second pause, which was
+        // likely why the user tapped again in the first place.
         isCalibrationRecording = true
         DebugFileLogger.log("distance-cal: round=\(round) MATCHED start recording")
         cameraManager.startCalibrationRecording { started in
@@ -387,18 +426,13 @@ struct InferenceView: View {
                         // "recording-" (not "calibration-") prefixed file
                         // created mid-flow -- see stopCalibrationRecording's
                         // doc comment for the full explanation.
-                        if detectedCount == tapeMarkCount {
-                            DebugFileLogger.log("distance-cal: round=\(round) PASSED detectedCount=\(detectedCount)")
-                            if round >= 2 {
-                                distanceCalibrationRound = nil
-                                initialCalibrationRoll = nil
-                                flashToast("DISTANCE CALIBRATION\nCOMPLETE (3/3)")
-                            } else {
-                                distanceCalibrationRound = round + 1
-                            }
+                        DebugFileLogger.log("distance-cal: round=\(round) DONE (unchecked, detectedCount=\(detectedCount) for reference only)")
+                        if round >= 2 {
+                            distanceCalibrationRound = nil
+                            initialCalibrationRoll = nil
+                            flashToast("DISTANCE CALIBRATION\nCOMPLETE (3/3)")
                         } else {
-                            DebugFileLogger.log("distance-cal: round=\(round) FAILED detectedCount=\(detectedCount) expected=\(tapeMarkCount)")
-                            flashToast("COULDN'T CLEARLY SEE ALL\n\(tapeMarkCount) TAPE MARKS (found \(detectedCount))\nADJUST AND RETRY")
+                            distanceCalibrationRound = round + 1
                         }
                     }
                 }
@@ -540,19 +574,26 @@ struct InferenceView: View {
             // marks are actually in frame), only sessionPhase's own screen
             // content is swapped out.
             if isChoosingTapeMarkCount {
-                tapeMarkCountPickerOverlay
+                withSessionGestures(tapeMarkCountPickerOverlay)
             } else if let index = tapeMarkDistanceIndex {
-                tapeMarkDistanceScreen(index: index)
+                withSessionGestures(tapeMarkDistanceScreen(index: index))
             } else if isCalibrationRecording {
+                // Deliberately NOT withSessionGestures here -- exiting
+                // mid-recording would race exitSession's cameraManager.stop()
+                // against stopCalibrationRecording's own in-flight
+                // teardown/restart chain, exactly the class of session race
+                // this flow already went through several rounds of fixing
+                // (see [[project-following-distance-measurement]]). Only a
+                // few seconds long either way.
                 distanceCalibrationRecordingBanner
             } else if let round = distanceCalibrationRound {
-                distanceCalibrationPitchScreen(round: round)
+                withSessionGestures(distanceCalibrationPitchScreen(round: round))
             } else {
                 switch sessionPhase {
                 case .calibratePrompt:
-                    calibratePromptScreen
+                    withSessionGestures(calibratePromptScreen)
                 case .level:
-                    levelScreen
+                    withSessionGestures(levelScreen)
                 case .configuring:
                     withSessionGestures(configuringScreen)
                 case .driving:
@@ -580,6 +621,9 @@ struct InferenceView: View {
         }
         .onReceive(thermalBlinkTimer) { _ in
             thermalBlinkOn.toggle()
+        }
+        .onChange(of: wantsFullBrightness) { _, wantsFull in
+            UIScreen.main.brightness = wantsFull ? 1.0 : Self.dimmedBrightness
         }
         .onAppear {
             DebugFileLogger.reset()
@@ -761,6 +805,22 @@ struct InferenceView: View {
     private var levelScreen: some View {
         ZStack {
             YawReferenceLine()
+            // Top-left corner label, same low-key styling and tap trigger
+            // as configuringScreen's -- not wrapped in the full settingsHUD
+            // (its resolution/model/stabilization labels don't apply here,
+            // there's no locked/unlocked settings state to show yet).
+            VStack {
+                HStack {
+                    Text("Distance cal")
+                        .font(.system(size: 28, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.4))
+                        .shadow(color: .black.opacity(0.6), radius: 2)
+                        .onTapGesture { beginDistanceCalibration() }
+                    Spacer()
+                }
+                Spacer()
+            }
+            .padding()
             VStack(spacing: 32) {
                 Text("\(rollDegreesRounded)°")
                     .font(.system(size: 96, weight: .bold, design: .rounded))
@@ -769,6 +829,19 @@ struct InferenceView: View {
                 Text("from level")
                     .font(.system(size: 24, weight: .medium))
                     .foregroundStyle(.white.opacity(0.8))
+                    .shadow(color: .black.opacity(0.7), radius: 4)
+                // Added 2026-08-11 to make the pitch-sign hand-tilt check
+                // (DistanceEstimator.swift's file-level warning: "tilt the
+                // mounted phone's nose down by hand and confirm pitchDegrees
+                // increases") quick to do -- the only other live pitch
+                // readout is buried behind the whole tape-mark-count +
+                // distance-entry flow. One decimal place, not rounded to a
+                // whole degree, so a small hand tilt visibly moves the
+                // number instead of needing a large exaggerated motion to
+                // see any change at all.
+                Text(pitchSensor.pitchDegrees.map { String(format: "pitch %.1f°", $0) } ?? "pitch --")
+                    .font(.system(size: 20, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.6))
                     .shadow(color: .black.opacity(0.7), radius: 4)
                 Button {
                     calibrateAttitude()
@@ -782,13 +855,6 @@ struct InferenceView: View {
                 .padding(.top, 24)
             }
         }
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 1.5)
-                .onEnded { _ in
-                    beginDistanceCalibration()
-                }
-        )
     }
 
     // MARK: — Distance-calibration side-flow (hidden, see beginDistanceCalibration)
@@ -852,14 +918,65 @@ struct InferenceView: View {
 
     /// Shared circular +/- button, matching `tapeMarkCountPickerOverlay`'s
     /// original inline style -- factored out once the meters/cm entry
-    /// screen below tripled the number of call sites.
+    /// screen below tripled the number of call sites. Thin wrapper around
+    /// `StepperButton` so none of the 6 call sites needed to change when
+    /// hold-to-repeat was added.
     private func stepperButton(_ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        StepperButton(label: label, action: action, onHoldChange: { isStepperActive = $0 })
+    }
+
+    /// A single tap fires `action` once, same as before. Holding past 1s
+    /// starts auto-repeating it every 0.15s until released -- added
+    /// 2026-08-11 so running the meters/cm distance steppers up by a lot
+    /// doesn't need dozens of individual taps. Deliberately not built on
+    /// `Button` -- a plain view + `.onTapGesture` for the single-tap case
+    /// plus a `simultaneousGesture(DragGesture(minimumDistance: 0))` to
+    /// track press/release for the hold-repeat timer, which is the more
+    /// reliable combination for a custom hold-repeat control than layering
+    /// extra gestures on a real `Button` (whose own tap recognizer can
+    /// interact unpredictably with a simultaneous one). No double-fire risk
+    /// from combining `.onTapGesture` with the drag-tracked repeat: a quick
+    /// tap's `onEnded` cancels the not-yet-fired repeat task well before
+    /// its 1s delay elapses, and a genuine long hold never satisfies
+    /// `.onTapGesture`'s own short-press recognition in the first place.
+    /// `onHoldChange` reports press/release up to `isStepperActive` so
+    /// `withSessionGestures`'s long-press-to-exit gesture (which lives
+    /// several view levels up, on whichever screen embeds this button) can
+    /// tell a stepper hold apart from an actual exit-intent long-press --
+    /// see that function's doc comment.
+    private struct StepperButton: View {
+        let label: String
+        let action: () -> Void
+        var onHoldChange: (Bool) -> Void = { _ in }
+        @State private var repeatTask: Task<Void, Never>?
+
+        var body: some View {
             Text(label)
                 .font(.system(size: 40, weight: .bold))
                 .foregroundStyle(.white)
                 .frame(width: 64, height: 64)
                 .background(Color.black.opacity(0.5), in: Circle())
+                .contentShape(Circle())
+                .onTapGesture { action() }
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { _ in
+                            guard repeatTask == nil else { return }
+                            onHoldChange(true)
+                            repeatTask = Task {
+                                try? await Task.sleep(for: .seconds(1))
+                                while !Task.isCancelled {
+                                    action()
+                                    try? await Task.sleep(for: .seconds(0.15))
+                                }
+                            }
+                        }
+                        .onEnded { _ in
+                            repeatTask?.cancel()
+                            repeatTask = nil
+                            onHoldChange(false)
+                        }
+                )
         }
     }
 
@@ -1204,8 +1321,23 @@ struct InferenceView: View {
                 // long-press-toggles-lock behavior entirely -- locking is now a
                 // one-time choice made on the configuring screen, not something
                 // re-toggled mid-drive.
+                //
+                // isStepperActive guard added 2026-08-11: this gesture is
+                // `.simultaneousGesture`, which deliberately does NOT get
+                // blocked by inner views' own gestures (so long-press-to-
+                // exit still works no matter where on screen the touch
+                // starts) -- but that means holding a StepperButton past
+                // 1s to trigger its own hold-to-repeat ALSO satisfies this
+                // 0.8s long-press, popping the exit dialog over what was
+                // meant as "keep incrementing the meters/cm value."
+                // StepperButton flips `isStepperActive` true the instant
+                // its own hold begins (well before 0.8s), so checking it
+                // here reliably suppresses this gesture for that case
+                // without needing real gesture-level exclusivity across
+                // several view-hierarchy levels.
                 LongPressGesture(minimumDuration: 0.8)
                     .onEnded { _ in
+                        guard !isStepperActive else { return }
                         DebugFileLogger.log("gesture: MATCHED longPress(exit-prompt)")
                         showExitConfirmation = true
                     }

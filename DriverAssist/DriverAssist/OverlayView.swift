@@ -40,9 +40,13 @@ struct OverlayView: View {
         path.addRect(box)
         context.stroke(path, with: .color(color), lineWidth: 2)
 
-        let pct = Int(detection.confidence * 100)
+        // Falls back to confidence% when distance isn't available yet (no
+        // reference pitch captured -- see Detection.distanceMeters) so the
+        // overlay still shows something useful before "Calibrate" is pressed.
+        let metric = detection.distanceMeters.map { String(format: "%.1fm", $0) }
+            ?? "\(Int(detection.confidence * 100))%"
         let idPrefix = detection.trackID.map { "#\($0) " } ?? ""
-        let label = Text("\(idPrefix)\(detection.label) \(pct)%")
+        let label = Text("\(idPrefix)\(detection.label) \(metric)")
             .font(.system(size: 18, weight: .bold))
             .foregroundStyle(color)
         context.draw(label, at: CGPoint(x: box.minX + 4, y: box.minY + 2), anchor: .topLeading)

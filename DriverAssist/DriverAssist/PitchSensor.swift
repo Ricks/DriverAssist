@@ -196,13 +196,26 @@ final class PitchSensor: ObservableObject {
             // gravity between X and Y, leaving this combined magnitude (and
             // Z itself) unchanged, so atan2(z, sqrt(x^2+y^2)) comes out
             // independent of roll, by the same kind of trig identity as
-            // rollDegrees's own derivation. Sign chosen so nose-down (Z
-            // rotating toward gravity) reads positive, matching
-            // DistanceEstimator's documented convention -- NOT YET BENCH-
-            // CONFIRMED, same "verify before trusting" discipline as every
-            // other sign convention here.
+            // rollDegrees's own derivation.
+            //
+            // SIGN CONFIRMED WRONG 2026-08-11 via hand-tilt bench test (see
+            // [[project-following-distance-measurement]]): the un-negated
+            // formula below read ~0deg held level and DECREASED toward -90deg
+            // tilted nose-down -- backwards from the nose-down-positive
+            // convention this was originally "chosen" for for (see git
+            // history/prior comment) and that DistanceEstimator.swift's
+            // formula assumes. Confirmed via DistanceEstimator.fit() cross-
+            // pitch validation first (un-negated pitch gave up to +3806%
+            // error and a physically-impossible negative fitted focal
+            // length; negating it dropped errors to low double digits),
+            // then verified directly by hand-tilting the mounted phone.
+            // Negated here (not in DistanceEstimator) since this is the
+            // actual root cause -- every consumer of pitchDegrees/
+            // referencePitchDegrees (display, logging, DistanceEstimator)
+            // already expected nose-down-positive, this formula just wasn't
+            // delivering that.
             let gx = motion.gravity.x, gy = motion.gravity.y, gz = motion.gravity.z
-            self?.pitchDegrees = atan2(gz, (gx * gx + gy * gy).squareRoot()) * 180 / .pi
+            self?.pitchDegrees = -atan2(gz, (gx * gx + gy * gy).squareRoot()) * 180 / .pi
             // Rotating about the boresight (device Z) axis exchanges gravity
             // between X and Y while leaving Z untouched, so atan2(y, -x)
             // isolates exactly that rotation -- and, per the small-angle

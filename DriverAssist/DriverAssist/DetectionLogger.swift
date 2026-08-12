@@ -28,6 +28,11 @@ struct DetectionLogEntry: Codable {
         // across drives/app launches — IDs are only stable within one
         // continuous run of the tracker.
         let trackID: Int?
+        // See DistanceEstimator.swift / Detection.distanceMeters -- nil under
+        // the same conditions (no reference pitch captured yet, or invalid
+        // ground-plane geometry). Logged so tomorrow's arc-walking test can
+        // be scored offline against the known sign distances.
+        let distanceMeters: Double?
     }
 
     let t: Double
@@ -224,7 +229,8 @@ enum DetectionLogger {
                     y: $0.boundingBox.minY,
                     w: $0.boundingBox.width,
                     h: $0.boundingBox.height,
-                    trackID: $0.trackID
+                    trackID: $0.trackID,
+                    distanceMeters: $0.distanceMeters
                 )
             }
         )

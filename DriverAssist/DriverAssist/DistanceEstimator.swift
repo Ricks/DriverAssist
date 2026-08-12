@@ -50,17 +50,26 @@
 //  happen once, at one known reference pitch (captured on the same flat
 //  ground as the tape marks) -- not once per pitch, and not once per drive.
 //
-//  *** SIGN CONVENTION WARNING, NOT YET EMPIRICALLY CONFIRMED ***
-//  Every angle here assumes theta is signed positive when the camera's nose
-//  is tilted DOWN toward the road. PitchSensor.pitchDegrees/referencePitchDegrees
-//  are CMAttitude's raw pitch, which depends on this mount's specific
-//  physical orientation (landscape/portrait, which edge faces which way)
-//  composed with CameraManager's own video-rotation handling -- neither of
-//  those compositions has been empirically checked yet. If the real sign is
-//  backwards, this formula doesn't error, it just silently inverts the pitch
-//  correction (amplifying drift instead of cancelling it). Verify by tilting
-//  the mounted phone's nose down by hand and confirming pitchDegrees
-//  increases BEFORE wiring reference pitch in here.
+//  *** PITCH SIGN CONVENTION -- CONFIRMED 2026-08-11 (was previously flagged
+//  *** here as unconfirmed). Every angle here assumes theta is signed
+//  *** positive when the camera's nose is tilted DOWN toward the road.
+//  *** PitchSensor.pitchDegrees/referencePitchDegrees were found NOT to
+//  *** match that convention -- caught via this file's own recommended
+//  *** validation (fit on one pitch, cross-check the prediction at other
+//  *** pitches without refitting: as-shipped gave up to +3806% error and a
+//  *** physically-impossible negative fitted focal length), then confirmed
+//  *** directly with the hand-tilt bench test this comment used to ask for.
+//  *** Fixed at the source in PitchSensor.swift (the sign was already
+//  *** "chosen" there for this exact convention, just implemented
+//  *** backwards) rather than here, so no adjustment is needed in this
+//  *** file -- pitchDegrees/referencePitchDegrees now already read
+//  *** correctly for direct use below.
+//
+//  *** Stale-data note: any referencePitchDegrees captured (and persisted
+//  *** to UserDefaults) BEFORE the 2026-08-11 PitchSensor fix holds the OLD
+//  *** wrong-sign value. `skipCalibration()`'s "No" path reuses whatever's
+//  *** persisted without recapturing -- press "Calibrate" (not skip) at
+//  *** least once after updating to get a correctly-signed value stored.
 //
 //  There are no default calibration constants -- this type can't be
 //  constructed without supplying real ones (via `fit`, from real tape-mark
@@ -103,13 +112,11 @@
 //  roughly-centered targets. Revisit with an exact rotation if either
 //  assumption stops holding in practice.
 //
-//  *** ROLL SIGN CONVENTION, NOT YET EMPIRICALLY CONFIRMED (same caveat as
-//  *** pitch above, independently) *** -- assumes positive
-//  *** referenceRollDegrees corresponds to the image rotating counter-
-//  *** clockwise as the camera sees it. Verify by rolling the mounted phone
-//  *** a known way by hand and confirming a known off-center point's
-//  *** de-rolled position moves the predicted direction, before trusting
-//  *** this for anything safety-relevant.
+//  *** ROLL SIGN CONVENTION -- CONFIRMED 2026-08-11 via bench test on the
+//  *** level/calibrate screen: rolling the phone counter-clockwise reads
+//  *** positive, clockwise reads negative -- matches the assumption below
+//  *** exactly (positive referenceRollDegrees = image rotating counter-
+//  *** clockwise as the camera sees it). No code change needed.
 //
 
 import Foundation
@@ -145,6 +152,41 @@ struct DistanceEstimator {
     /// if the lateral-calibration work referenced in that plan ever gets
     /// built.
     private static let assumedPrincipalColumnNormalized: Double = 0.5
+
+    /// The live app's actual calibrated instance -- fit 2026-08-11 from
+    /// data/26_08_11_DistanceCalibration/ round 0 (near=8.1m/far=19.92m tape
+    /// marks, reference pitch -2.561deg/roll -2.322deg) via the roll-aware
+    /// `DistanceEstimator.fit()`. Tape-mark rows were re-read by hand
+    /// (visual arrow-key line-up tool against the source video frames), and
+    /// columns were read via targeted color-sampling on the same frames.
+    ///
+    /// *** Reference pitch is NEGATIVE here on purpose -- worth flagging
+    /// *** since it looks backwards at a glance. The raw debug-logged pitch
+    /// *** for this round was +2.561deg, captured BEFORE the PitchSensor
+    /// *** sign fix earlier in this file; the corrected value (what a fixed
+    /// *** sensor would have read) is that raw value negated, i.e. -2.561.
+    /// *** A same-session bug (not a formula or hardware issue) came from
+    /// *** re-deriving these constants from a written summary after a
+    /// *** context-compaction boundary and losing track of which pitch
+    /// *** values already had this negation applied vs which were still
+    /// *** raw -- every fit run afterward used the raw (wrong-sign) value
+    /// *** directly, which alone produced the ~20% cross-round v0 spread
+    /// *** that briefly looked like unmodeled roll, or even like each
+    /// *** separate calibration recording having a different effective FOV.
+    /// *** Neither of those was real -- using the correctly-negated pitch
+    /// *** resolves it completely: fitting round0 alone now predicts all 6
+    /// *** held-out points from rounds 1/2 (different pitches, different
+    /// *** recordings) to within 2.9% mean / 6.4% max error, down from the
+    /// *** ~20-30%+ errors seen before this fix. Lesson for next time: when
+    /// *** resuming work on a signed quantity after a compaction boundary,
+    /// *** re-derive the sign from the actual source script/call site, not
+    /// *** from a written description of it.
+    /// cameraHeightMeters is the 2026-08-11 remeasurement with the new mount.
+    static let calibrated = DistanceEstimator(
+        cameraHeightMeters: 1.015,
+        principalRowNormalized: 0.500504,
+        focalLengthNormalized: 1.412226
+    )
 
     /// Distance in meters to the ground-contact point of a detection.
     ///
@@ -216,13 +258,32 @@ struct DistanceEstimator {
     }
 
     /// Solves for `principalRowNormalized`/`focalLengthNormalized` from two
-    /// (row, distance) tape-mark reference points measured on flat ground, at
-    /// whatever reference pitch the phone happens to sit at in the mount --
-    /// record that pitch with `PitchSensor.captureReferenceAttitude()` at the
-    /// same time as the tape-mark measurements and pass it in here. This fit
-    /// itself doesn't take a roll parameter -- it assumes roll was near zero
-    /// at calibration time (bubble-level step of the same routine), same as
-    /// every other tape-mark measurement implicitly assumes a level phone.
+    /// (row, column, distance) tape-mark reference points, at whatever
+    /// reference pitch AND roll the phone happens to sit at in the mount --
+    /// record both with `PitchSensor.captureReferenceAttitude()` at the same
+    /// time as the tape-mark measurements and pass them in here. Ground does
+    /// NOT need to be flat/level for this -- see the file-level comment on
+    /// why a reference (not live) pitch/roll already handles a sloped or
+    /// cambered calibration/test area the same way it handles a hill or
+    /// banked curve at prediction time. What DOES still matter: the tape
+    /// marks and the reference capture should be on the same road surface
+    /// (so the captured pitch/roll genuinely describes the camera's angle
+    /// relative to THAT ground plane), same as every other reference-pitch
+    /// reasoning in this file.
+    ///
+    /// De-rolling a calibration point requires knowing its column
+    /// (`centerX`), not just its row -- CONFIRMED 2026-08-11 as a real gap,
+    /// not a theoretical one: an earlier roll-blind version of this function
+    /// (row-only, roll assumed zero) was fit against real tape-mark data
+    /// captured on a cambered test street (real roll around -2deg, not
+    /// zero), and the resulting v0/f varied by ~20% across three different
+    /// reference pitches in a way that looked like a pitch bug but wasn't
+    /// fully explained by one -- unmodeled roll, correlated with pitch
+    /// across those three rounds, was the leading remaining suspect. This
+    /// version corrects for that by de-rolling each point the same way
+    /// `distanceMeters` does before solving for v0/f, rather than assuming
+    /// away roll's effect during calibration and only correcting for it
+    /// afterward at prediction time.
     ///
     /// With 3+ tape-mark points, fit on two and check the model's prediction
     /// against the held-out one(s) rather than averaging all of them into a
@@ -232,33 +293,49 @@ struct DistanceEstimator {
     ///
     /// Once this is fit, the strongest validation isn't another held-out
     /// point at the SAME reference pitch -- it's retilting the phone in the
-    /// mount (still on the same flat ground), capturing a NEW reference
-    /// pitch, and feeding that through `distanceMeters` with these same
+    /// mount (still on the same ground), capturing a NEW reference
+    /// pitch/roll, and feeding that through `distanceMeters` with these same
     /// v0/f constants to check the prediction against the same tape marks
     /// without refitting anything. That's what actually tests whether v0/f
-    /// are genuinely pitch-independent, not just whether the two-point fit
-    /// is self-consistent at one pitch. Do this on flat ground only --
-    /// retilting on a slope would conflate the thing being tested (pitch
-    /// independence) with the hill-grade effect described at the top of this
-    /// file.
+    /// are genuinely pitch/roll-independent, not just whether the two-point
+    /// fit is self-consistent at one attitude.
     static func fit(
         cameraHeightMeters: Double,
         referencePitchDegreesBelowHorizontal: Double,
-        row1: Double, distance1Meters: Double,
-        row2: Double, distance2Meters: Double
+        referenceRollDegrees: Double,
+        aspectRatio: Double,
+        row1: Double, centerX1: Double, distance1Meters: Double,
+        row2: Double, centerX2: Double, distance2Meters: Double
     ) -> DistanceEstimator? {
         guard distance1Meters > 0, distance2Meters > 0 else { return nil }
         let theta = referencePitchDegreesBelowHorizontal * .pi / 180
-        // v_i = v0 + f * x_i, where x_i = tan(atan(H/D_i) - theta) is fully
-        // known once H, D_i, and theta are -- reduces to the same 2-point
-        // linear solve as the old model, just with this nonlinear x instead
-        // of the old model's 1/D.
-        let x1 = tan(atan(cameraHeightMeters / distance1Meters) - theta)
-        let x2 = tan(atan(cameraHeightMeters / distance2Meters) - theta)
+        let psi = referenceRollDegrees * .pi / 180
+        let cosPsi = cos(psi)
+        guard cosPsi != 0 else { return nil }
+
+        // Same derivation as `distanceMeters`, solved backwards: starting
+        // from derolledY = -x*sin(psi) + y*cos(psi) = tan(alpha), substitute
+        // x = (centerX - 0.5)*aspectRatio/f and y = (row - v0)/f, then solve
+        // for v0 in terms of f. The result stays linear in (v0, f) -- each
+        // point's roll/column contribution folds into an adjusted row and a
+        // rescaled x, after which this is the same 2-point linear solve as
+        // the roll-blind version, just with these adjusted inputs instead of
+        // raw row/x.
+        func knownX(_ distanceMeters: Double) -> Double {
+            tan(atan(cameraHeightMeters / distanceMeters) - theta) / cosPsi
+        }
+        func adjustedRow(_ row: Double, _ centerX: Double) -> Double {
+            row - (centerX - Self.assumedPrincipalColumnNormalized) * aspectRatio * tan(psi)
+        }
+
+        let x1 = knownX(distance1Meters)
+        let x2 = knownX(distance2Meters)
         let denom = x1 - x2
         guard denom != 0 else { return nil }
-        let f = (row1 - row2) / denom
-        let v0 = row1 - f * x1
+        let v1 = adjustedRow(row1, centerX1)
+        let v2 = adjustedRow(row2, centerX2)
+        let f = (v1 - v2) / denom
+        let v0 = v1 - f * x1
         return DistanceEstimator(
             cameraHeightMeters: cameraHeightMeters,
             principalRowNormalized: v0,

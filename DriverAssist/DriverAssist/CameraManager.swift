@@ -136,12 +136,31 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated static let focusRecalibrationInterval: CFAbsoluteTime = 60
     private nonisolated static let maxFocusSettleWait: CFAbsoluteTime = 5
 
+    /// CONFIRMED 2026-08-11 (real outdoor distance-calibration session,
+    /// `data/26_08_11_DistanceCalibration/`): `continuousAutoFocus` under
+    /// `.far` range restriction can report `isAdjustingFocus == false`
+    /// ("settled") at `lensPosition` near 0 -- the near extreme, clearly
+    /// wrong for an 8-20m subject -- with no signal distinguishing that
+    /// from a genuine far-field settle. That bad value then got cached as
+    /// `lastGoodLensPosition` and reused by every later timed-out
+    /// recalibration in the same session, silently propagating a bad focus
+    /// lock across multiple rounds. `minPlausibleFarLensPosition` rejects
+    /// any settled/current reading below this floor rather than trusting
+    /// it. `knownGoodFarLensPosition` is the fallback for when there's
+    /// nothing plausible to use at all -- the empirical middle of every
+    /// genuinely sharp far-field lock's `lensPosition` logged across today's
+    /// session (observed range 0.745-0.788, tightly clustered, never
+    /// remotely close to 0 on any confirmed-sharp round).
+    private nonisolated static let minPlausibleFarLensPosition: Float = 0.5
+    private nonisolated static let knownGoodFarLensPosition: Float = 0.76
+
     /// The last lens position a lock actually settled on with confidence. A
     /// timed-out (unsettled) recalibration re-locks to this instead of
     /// committing to whatever uncertain position the lens happened to be
     /// hunting through -- otherwise a dark/close-range recalibration with
     /// nothing confident to focus on progressively drifts the lock worse
-    /// with every retry.
+    /// with every retry. Never set below `minPlausibleFarLensPosition` --
+    /// see that constant's doc comment.
     private nonisolated(unsafe) var lastGoodLensPosition: Float?
     /// Filename prefix `startNewRecording` uses -- "recording" for a normal
     /// drive, "calibration" while `startCalibrationRecording` is active, so
@@ -336,6 +355,13 @@ final class CameraManager: NSObject, ObservableObject {
     func startCalibrationRecording(completion: @escaping @Sendable (Bool) -> Void) {
         sessionQueue.async { [weak self] in
             guard let self, self.assetWriter == nil else {
+                // CONFIRMED 2026-08-11: this guard and the captureDevice one
+                // below used to fail silently (no log at all before
+                // completion(false)) -- exactly the two paths that could
+                // explain "distance-cal: round=X FAILED to start" with zero
+                // other diagnostic in the pulled debug log. Logging which
+                // one actually fired, if this recurs.
+                DebugFileLogger.log("calibration-recording: FAILED to start, assetWriter still non-nil (previous recording not fully torn down)")
                 DispatchQueue.main.async { completion(false) }
                 return
             }
@@ -347,6 +373,7 @@ final class CameraManager: NSObject, ObservableObject {
             self.configure(startRecording: false, preset: .hd4K3840x2160, settleFocus: false)
             guard let device = self.captureDevice else {
                 self.activeRecordingFilenamePrefix = "recording"
+                DebugFileLogger.log("calibration-recording: FAILED to start, captureDevice nil after configure()")
                 DispatchQueue.main.async { completion(false) }
                 return
             }
@@ -363,10 +390,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// frame, then fully tears the session down -- see this section's
     /// file-level comment for why the teardown matters. `completion` fires
     /// on the main queue with the detected tape-mark count (0 if no frame
-    /// was captured at all) -- the caller compares it against however many
-    /// were actually placed and decides pass/retry, and can also use the
-    /// call landing as "teardown is complete, safe to restart the normal
-    /// preview-only session" (needed on the configuring screen, which would
+    /// was captured at all) -- as of 2026-08-11 the caller (`ContentView
+    /// .recordCalibrationRound`) no longer branches on this at all (tape
+    /// marks are read off the recorded footage by hand afterward instead),
+    /// so it's logged for reference only now. `completion` firing is still
+    /// used as "teardown is complete, safe to restart the normal preview-
+    /// only session" (needed on the configuring screen, which would
     /// otherwise be left with a dead camera preview).
     func stopCalibrationRecording(completion: @escaping @Sendable (Int) -> Void) {
         let sessionBox = UncheckedSendableBox(value: session)
@@ -583,12 +612,24 @@ final class CameraManager: NSObject, ObservableObject {
             self.lastFocusLockTime = CFAbsoluteTimeGetCurrent()
 
             let lockPosition: Float
-            if settled {
+            if settled, device.lensPosition >= Self.minPlausibleFarLensPosition {
                 lockPosition = device.lensPosition
                 self.lastGoodLensPosition = lockPosition
                 DebugFileLogger.log(String(
                     format: "focus: settled after %.2fs at lensPosition=%.3f",
                     CFAbsoluteTimeGetCurrent() - settleStart, lockPosition
+                ))
+            } else if settled {
+                // CONFIRMED 2026-08-11: continuousAutoFocus under .far can
+                // report "not adjusting" at an implausibly near lensPosition
+                // (observed: 0.000, repeatedly, for a whole outdoor session)
+                // -- treated the same as an unsettled timeout below rather
+                // than trusted, so it can never get cached as
+                // lastGoodLensPosition and silently poison later rounds.
+                lockPosition = self.lastGoodLensPosition ?? Self.knownGoodFarLensPosition
+                DebugFileLogger.log(String(
+                    format: "focus: settled at implausible lensPosition=%.3f (< %.2f floor), rejected -- using %.3f instead",
+                    device.lensPosition, Self.minPlausibleFarLensPosition, lockPosition
                 ))
             } else if let goodPosition = self.lastGoodLensPosition {
                 lockPosition = goodPosition
@@ -596,11 +637,23 @@ final class CameraManager: NSObject, ObservableObject {
                     format: "focus: settle timed out after %.0fs, keeping previous good lensPosition=%.3f instead of unconfirmed=%.3f",
                     Self.maxFocusSettleWait, goodPosition, device.lensPosition
                 ))
-            } else {
+            } else if device.lensPosition >= Self.minPlausibleFarLensPosition {
                 lockPosition = device.lensPosition
                 DebugFileLogger.log(String(
                     format: "focus: settle timed out after %.0fs, no prior good lock, locking at lensPosition=%.3f anyway",
                     Self.maxFocusSettleWait, lockPosition
+                ))
+            } else {
+                // No prior good lock AND the current (unconfirmed) reading
+                // is also implausible -- same 0.000-poisoning risk as the
+                // rejected-settle case above, just reached via timeout
+                // instead. Fall back to the known-good empirical default
+                // rather than locking at whatever the lens happens to be
+                // sitting at.
+                lockPosition = Self.knownGoodFarLensPosition
+                DebugFileLogger.log(String(
+                    format: "focus: settle timed out after %.0fs, no prior good lock and current lensPosition=%.3f implausible -- using known-good default %.3f",
+                    Self.maxFocusSettleWait, device.lensPosition, lockPosition
                 ))
             }
             do {
@@ -954,6 +1007,17 @@ final class CameraManager: NSObject, ObservableObject {
         ) { [weak self] notification in
             let reasonValue = (notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue
             let reason = reasonValue.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
+            // CONFIRMED 2026-08-11: these three handlers used `print` only,
+            // never `DebugFileLogger.log` -- meaning a session interruption
+            // or runtime error (e.g. .videoDeviceNotAvailableDueToSystemPressure,
+            // plausible here given `logThermalState`'s "serious" readings were
+            // already showing throughout that session) was completely invisible
+            // outside a live-attached Xcode console. Confirmed as the actual
+            // cause of "distance-cal: round=2 FAILED to start" repeating 5x
+            // with no other diagnostic in the pulled debug log -- not
+            // literally unknowable, just never captured. Fixed by also
+            // logging here.
+            DebugFileLogger.log("session: MATCHED interrupted reason=\(String(describing: reason))")
             print("[CameraManager] session interrupted: \(String(describing: reason))")
             self?.setRecordingActive(false)
         }
@@ -961,6 +1025,7 @@ final class CameraManager: NSObject, ObservableObject {
         NotificationCenter.default.addObserver(
             forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: nil
         ) { _ in
+            DebugFileLogger.log("session: MATCHED interruption ended")
             print("[CameraManager] session interruption ended")
         }
 
@@ -969,6 +1034,7 @@ final class CameraManager: NSObject, ObservableObject {
         ) { [weak self] notification in
             guard let self else { return }
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+            DebugFileLogger.log("session: MATCHED runtimeError \(error?.localizedDescription ?? "unknown") code=\(error?.code ?? -1) domain=\(error?.domain ?? "?")")
             print("[CameraManager] session runtime error: \(error?.localizedDescription ?? "unknown")")
             self.sessionQueue.async {
                 guard !self.session.isRunning else { return }

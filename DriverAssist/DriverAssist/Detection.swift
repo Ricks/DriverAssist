@@ -20,4 +20,9 @@ struct Detection: Identifiable, Equatable {
     /// SwiftUI's Identifiable; `trackID` is what stays stable across frames
     /// for the same real-world object.
     var trackID: Int? = nil
+    /// Estimated ground-plane distance to this detection, meters -- see
+    /// DistanceEstimator.swift. nil until InferenceEngine attaches it (not
+    /// computed here), and stays nil whenever the estimator itself returns
+    /// nil (no reference pitch captured yet, or invalid geometry).
+    var distanceMeters: Double? = nil
 }
