@@ -15,6 +15,8 @@ enum OverlayStyle {
         switch label {
         case "person":                return UIColor.systemYellow.cgColor
         case "bicycle", "motorcycle":  return UIColor.systemCyan.cgColor
+        case "cyclist", "motorcyclist": return UIColor.systemOrange.cgColor
+        case "skateboard", "horse":    return UIColor.systemPurple.cgColor
         case "car":                    return UIColor.systemGreen.cgColor
         case "bus", "truck":           return UIColor.systemRed.cgColor
         default:                       return UIColor.white.cgColor

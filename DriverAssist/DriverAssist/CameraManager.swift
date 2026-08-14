@@ -46,6 +46,16 @@ final class CameraManager: NSObject, ObservableObject {
     /// below for applying the mode to the capture connection.
     @Published private(set) var isStabilizationEnabled = false
 
+    /// Whether normal (non-calibration) recording uses 4K instead of the default
+    /// 1080p -- added 2026-08-11 for the cone calibration test, where pixel
+    /// precision matters more than the thermal risk that ruled out 4K for real
+    /// long drives (see `configure`'s own thermal comment: confirmed 10-15x
+    /// throttling on a 23-minute 4K/30fps drive). Defaults off/1080p and is
+    /// deliberately NOT persisted (see init's comment) -- always starts back at
+    /// 1080p on a fresh launch, so a deliberate choice for one short calibration
+    /// recording can't silently carry over into a later real drive.
+    @Published private(set) var isFourKEnabled = false
+
     /// Current system thermal state. Published so the HUD can warn when the device
     /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
     /// sustained heat with no other visible symptom, so this is the only in-the-moment
@@ -100,10 +110,18 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentStabilizationEnabled = newValue; overlayLock.unlock() }
     }
 
+    /// Nonisolated mirror of `isFourKEnabled`, readable from `sessionQueue` when
+    /// choosing the preset in `configure()`/`start(recording:)`.
+    private nonisolated var currentFourKEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentFourKEnabled }
+        set { overlayLock.lock(); _currentFourKEnabled = newValue; overlayLock.unlock() }
+    }
+
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
+    private nonisolated(unsafe) var _currentFourKEnabled: Bool = false
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -234,10 +252,13 @@ final class CameraManager: NSObject, ObservableObject {
     override init() {
         super.init()
         let defaults = UserDefaults.standard
-        // isAutoLowLightEnabled is deliberately NOT persisted — every launch starts
-        // back in auto regardless of whatever manual override was last in effect, so
-        // a prior drive's "low light off" doesn't silently carry over and suppress
-        // auto-detection on a new one.
+        // isAutoLowLightEnabled and isFourKEnabled are deliberately NOT persisted —
+        // every launch starts back at the default (auto / 1080p) regardless of
+        // whatever manual override was last in effect, so a prior drive/test's
+        // choice doesn't silently carry over into an unrelated later one. `exitSession`
+        // always terminates the app outright (see its own comment) rather than looping
+        // back to the level screen, so "every launch" and "every session" are the same
+        // thing here -- no separate per-session reset path is needed beyond this.
         if defaults.object(forKey: Self.lowLightBoostDefaultsKey) != nil {
             isLowLightBoostEnabled = defaults.bool(forKey: Self.lowLightBoostDefaultsKey)
         }
@@ -250,6 +271,29 @@ final class CameraManager: NSObject, ObservableObject {
         currentAutoLowLightEnabled = isAutoLowLightEnabled
         currentLowLightEnabled = isLowLightBoostEnabled
         currentStabilizationEnabled = isStabilizationEnabled
+        currentFourKEnabled = isFourKEnabled
+    }
+
+    /// Toggles the normal-drive recording preset between 1080p (default) and 4K.
+    /// If the session is already running but NOT actively writing a real
+    /// recording (level/configuring screens, or driving before Lock Settings),
+    /// this takes effect immediately via the same full teardown-then-fresh-
+    /// configure sequence `stopCalibrationRecording` already uses (`teardownSession`
+    /// + `configure`) -- safe specifically because nothing real is being written
+    /// yet, so there's no in-progress file to race against. If a real recording
+    /// IS already in progress, the new value is only saved -- it takes effect on
+    /// the next session start rather than interrupting footage already being
+    /// written. NOT persisted to UserDefaults -- see init's comment; this always
+    /// starts back at 1080p on a fresh launch.
+    func setFourKEnabled(_ enabled: Bool) {
+        isFourKEnabled = enabled
+        currentFourKEnabled = enabled
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning, self.assetWriter == nil else { return }
+            self.session.stopRunning()
+            self.teardownSession()
+            self.configure(startRecording: false, preset: enabled ? .hd4K3840x2160 : .hd1920x1080, settleFocus: true)
+        }
     }
 
     /// `recording: false` starts the session (live preview + inference feed)
@@ -268,10 +312,18 @@ final class CameraManager: NSObject, ObservableObject {
             let status = AVCaptureDevice.authorizationStatus(for: .video)
             switch status {
             case .authorized:
-                sessionQueue.async { [weak self] in self?.configure(startRecording: recording) }
+                sessionQueue.async { [weak self] in
+                    guard let self else { return }
+                    self.configure(startRecording: recording, preset: self.currentFourKEnabled ? .hd4K3840x2160 : .hd1920x1080)
+                }
             case .notDetermined:
                 let granted = await AVCaptureDevice.requestAccess(for: .video)
-                if granted { self.sessionQueue.async { [weak self] in self?.configure(startRecording: recording) } }
+                if granted {
+                    self.sessionQueue.async { [weak self] in
+                        guard let self else { return }
+                        self.configure(startRecording: recording, preset: self.currentFourKEnabled ? .hd4K3840x2160 : .hd1920x1080)
+                    }
+                }
             default:
                 break
             }

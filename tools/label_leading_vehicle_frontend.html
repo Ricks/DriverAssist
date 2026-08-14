@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Leading Vehicle Ground Truth Labeling</title>
+<title>DriverAssist Ground Truth Labeling</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -16,6 +16,10 @@
   }
   #video { display: block; max-width: 100%; background: #000; }
   #overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
+  #modes {
+    width: 100%; max-width: 1400px;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 4px;
+  }
   #controls {
     width: 100%; max-width: 1400px; margin-top: 10px;
     display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
@@ -26,11 +30,13 @@
   }
   button:hover { background: #2d323b; }
   button.active { background: #5a3a7a; border-color: #8a5ac0; }
+  .modeBtn.active { background: #1f5a4a; border-color: #3ac08a; }
   #status {
     width: 100%; max-width: 1400px; margin-top: 8px;
     display: flex; gap: 20px; font-size: 13px; color: #9aa; flex-wrap: wrap;
   }
   #status b { color: #e6e6e6; }
+  #hint { color: #e0b040; font-size: 13px; min-height: 16px; }
   #timeline {
     width: 100%; max-width: 1400px; height: 28px; margin-top: 10px;
     background: #23262d; position: relative; border-radius: 4px; cursor: pointer;
@@ -49,6 +55,8 @@
 </style>
 </head>
 <body>
+
+<div id="modes"></div>
 
 <div id="stage">
   <video id="video" preload="auto"></video>
@@ -73,16 +81,17 @@
   </select>
   <span class="hint">step size (s)</span>
   <input type="number" id="stepSize" value="0.067" step="0.001" min="0.001" style="width:70px">
-  <span class="hint">| click a box to follow it &middot; click the highlighted box to trim start/end here &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu</span>
+  <span class="hint" id="modeHint">| click a box to follow it &middot; click the highlighted box to trim start/end here &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu</span>
 </div>
 
 <div id="status">
   <span>t = <b id="curTime">0.00</b>s</span>
   <span>frame dets: <b id="detCount">0</b></span>
-  <span>active label: <b id="activeLabel">none</b></span>
+  <span id="activeLine">active: <b id="activeLabel">none</b></span>
   <span>segments: <b id="segCount">0</b></span>
   <span id="saveState">saved</span>
 </div>
+<div id="hint"></div>
 
 <div id="timeline"></div>
 
@@ -91,27 +100,81 @@ const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
 const timeline = document.getElementById('timeline');
+const modesEl = document.getElementById('modes');
+const hintEl = document.getElementById('hint');
 
-let frames = [];       // [{t, detections:[{trackID,label,confidence,x,y,w,h}]}]
-let groundTruth = [];  // [{start_t, end_t|null, trackID}]
+// --- Mode registry ---------------------------------------------------
+// 'single': one clicked box = the labeled thing for this time segment
+// (followed_vehicle's original behavior; false_positive reuses it
+// unchanged -- both are just "this one trackID, this time range").
+// 'combo': pair a "vehicle"-class box with 1+ "rider"-class boxes over a
+// time range -- click the vehicle box to open/select a segment, then
+// click rider boxes to attach/detach them (toggle). maxRiders is where
+// the motorcycle-passenger case (2 riders, not 1) plugs in declaratively,
+// same shape as the Swift ComboAssociationStrategy design this data
+// eventually validates.
+const MODES = {
+  followed_vehicle: { kind: 'single', label: 'Followed Vehicle',
+    hint: 'click a box to follow it &middot; click the highlighted box to trim start/end here' },
+  false_positive: { kind: 'single', label: 'False Positive',
+    hint: 'click any box to flag it as a spurious detection &middot; click the highlighted box to trim start/end here' },
+  cyclist: { kind: 'combo', label: 'Cyclist', vehicleLabel: 'bicycle', riderLabel: 'person', maxRiders: 1,
+    hint: 'click a bicycle to start/select a pairing, then click its rider &middot; click a rider again to unpair' },
+  motorcyclist: { kind: 'combo', label: 'Motorcyclist', vehicleLabel: 'motorcycle', riderLabel: 'person', maxRiders: 2,
+    hint: 'click a motorcycle to start/select a pairing, then click up to 2 riders (driver + passenger)' },
+  skateboarder: { kind: 'combo', label: 'Skateboarder', vehicleLabel: 'skateboard', riderLabel: 'person', maxRiders: 1,
+    hint: 'click a skateboard to start/select a pairing, then click its rider' },
+  equestrian: { kind: 'combo', label: 'Equestrian', vehicleLabel: 'horse', riderLabel: 'person', maxRiders: 1,
+    hint: 'click a horse to start/select a pairing, then click its rider' },
+};
+const MODE_ORDER = ['followed_vehicle', 'false_positive', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
+let activeMode = 'followed_vehicle';
+
+let frames = [];              // [{t, detections:[{trackID,label,confidence,x,y,w,h}]}]
+let store = {};                // mode -> ground-truth array (see MODES kind for shape)
+for (const m of MODE_ORDER) store[m] = [];
 let duration = 0;
 let saveTimer = null;
 let reverseTimer = null;
+let hintTimer = null;
 
 const LABEL_COLORS = {
   person: '#ffff00', bicycle: '#00ffff', motorcycle: '#00ffff',
+  skateboard: '#cc66ff', horse: '#cc66ff',
   car: '#00ff00', bus: '#ff3333', truck: '#ff3333',
 };
-const HIGHLIGHT_COLOR = '#ff33ff';
+const HIGHLIGHT_COLOR = '#ff33ff';   // selected/followed/flagged box, or a combo's vehicle box
+const RIDER_COLOR = '#33ff99';       // a combo's matched rider box(es)
+const BAD_COLOR = '#ff4444';         // false_positive highlight
+
+// --- Mode selector UI ---------------------------------------------------
+for (const m of MODE_ORDER) {
+  const b = document.createElement('button');
+  b.className = 'modeBtn' + (m === activeMode ? ' active' : '');
+  b.textContent = MODES[m].label;
+  b.dataset.mode = m;
+  b.addEventListener('click', () => switchMode(m));
+  modesEl.appendChild(b);
+}
+function switchMode(m) {
+  activeMode = m;
+  for (const b of modesEl.querySelectorAll('.modeBtn')) {
+    b.classList.toggle('active', b.dataset.mode === m);
+  }
+  document.getElementById('modeHint').innerHTML = '| ' + MODES[m].hint + ' &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu';
+  draw();
+  renderTimeline();
+}
+switchMode(activeMode);
 
 video.src = '/video';
 
 Promise.all([
   fetch('/api/detections').then(r => r.json()),
-  fetch('/api/ground_truth').then(r => r.json()),
-]).then(([detData, gt]) => {
+  ...MODE_ORDER.map(m => fetch(`/api/ground_truth/${m}`).then(r => r.json())),
+]).then(([detData, ...gts]) => {
   frames = detData.frames;
-  groundTruth = gt;
+  MODE_ORDER.forEach((m, i) => { store[m] = gts[i]; });
   updateStatus();
   renderTimeline();
 });
@@ -145,20 +208,24 @@ function frameAt(t) {
   return frames[ans];
 }
 
-function activeAssignmentAt(t) {
-  // Prefer the LATEST-starting match, not the first one found by array
-  // order -- array insertion order doesn't reliably track timeline order
-  // once assignments get created out of sequence (going back to trim/edit
-  // an earlier segment after later ones already exist), so a stale open
-  // assignment from much earlier in the video could otherwise permanently
-  // shadow every correct, newer assignment covering the same later time --
-  // the root cause of clicks appearing to silently do nothing.
+// Shared "most-recently-created wins among ties" tie-break -- without it a
+// stale open segment from earlier in the video can permanently shadow a
+// correct newer one covering the same later time (found the hard way in
+// followed_vehicle mode; applies identically to combo mode's vehicleTrackID
+// keying).
+function activeSingleAt(mode, t) {
   let best = null;
-  for (const a of groundTruth) {
+  for (const a of store[mode]) {
     if (a.start_t <= t && (a.end_t === null || t < a.end_t)) {
-      // >= (not >): among ties on start_t, the array's later entry is the
-      // more-recently-created one (new assignments are always appended),
-      // so it should win, not lose to whichever happened to be visited first.
+      if (!best || a.start_t >= best.start_t) best = a;
+    }
+  }
+  return best;
+}
+function activeComboAt(mode, t) {
+  let best = null;
+  for (const a of store[mode]) {
+    if (a.start_t <= t && (a.end_t === null || t < a.end_t)) {
       if (!best || a.start_t >= best.start_t) best = a;
     }
   }
@@ -168,47 +235,88 @@ function activeAssignmentAt(t) {
 function draw() {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   const f = frameAt(video.currentTime);
+  const cfg = MODES[activeMode];
   if (!f) { updateStatus(f); return; }
-  const active = activeAssignmentAt(video.currentTime);
   const w = overlay.width, h = overlay.height;
 
-  for (const d of f.detections) {
-    const isActive = active && d.trackID === active.trackID;
-    const color = isActive ? HIGHLIGHT_COLOR : (LABEL_COLORS[d.label] || '#ffffff');
-    const x = d.x * w, y = d.y * h, bw = d.w * w, bh = d.h * h;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = isActive ? 4 : 2;
-    ctx.strokeRect(x, y, bw, bh);
-    if (isActive) {
-      ctx.fillStyle = HIGHLIGHT_COLOR + '55';
-      ctx.fillRect(x, y, bw, bh);
+  if (cfg.kind === 'single') {
+    const active = activeSingleAt(activeMode, video.currentTime);
+    const isFP = activeMode === 'false_positive';
+    for (const d of f.detections) {
+      const isActive = active && d.trackID === active.trackID;
+      const color = isActive ? (isFP ? BAD_COLOR : HIGHLIGHT_COLOR) : (LABEL_COLORS[d.label] || '#ffffff');
+      drawBox(d, w, h, color, isActive ? 4 : 2, isActive);
     }
-    ctx.fillStyle = color;
-    ctx.font = '13px monospace';
-    ctx.fillText(`#${d.trackID} ${d.label} ${Math.round(d.confidence*100)}%`, x + 3, y > 14 ? y - 4 : y + bh + 14);
+    updateStatus(f, active);
+  } else {
+    const active = activeComboAt(activeMode, video.currentTime);
+    let vehicleBox = null;
+    const riderBoxes = [];
+    for (const d of f.detections) {
+      const isVehicle = active && d.label === cfg.vehicleLabel && d.trackID === active.vehicleTrackID;
+      const isRider = active && d.label === cfg.riderLabel && active.riderTrackIDs.includes(d.trackID);
+      const color = isVehicle ? HIGHLIGHT_COLOR : (isRider ? RIDER_COLOR : (LABEL_COLORS[d.label] || '#ffffff'));
+      drawBox(d, w, h, color, (isVehicle || isRider) ? 4 : 2, isVehicle || isRider);
+      if (isVehicle) vehicleBox = d;
+      if (isRider) riderBoxes.push(d);
+    }
+    // Connecting lines make the pairing legible in crowded frames (several
+    // people/bikes at once) where color alone is ambiguous.
+    if (vehicleBox && riderBoxes.length) {
+      const vx = (vehicleBox.x + vehicleBox.w / 2) * w, vy = (vehicleBox.y + vehicleBox.h / 2) * h;
+      ctx.strokeStyle = RIDER_COLOR;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 4]);
+      for (const r of riderBoxes) {
+        const rx = (r.x + r.w / 2) * w, ry = (r.y + r.h / 2) * h;
+        ctx.beginPath(); ctx.moveTo(vx, vy); ctx.lineTo(rx, ry); ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
+    updateStatus(f, active);
   }
-  updateStatus(f, active);
   renderPlayhead();
+}
+
+function drawBox(d, w, h, color, lineWidth, filled) {
+  const x = d.x * w, y = d.y * h, bw = d.w * w, bh = d.h * h;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.strokeRect(x, y, bw, bh);
+  if (filled) {
+    ctx.fillStyle = color + '55';
+    ctx.fillRect(x, y, bw, bh);
+  }
+  ctx.fillStyle = color;
+  ctx.font = '13px monospace';
+  ctx.fillText(`#${d.trackID} ${d.label} ${Math.round(d.confidence * 100)}%`, x + 3, y > 14 ? y - 4 : y + bh + 14);
 }
 
 function updateStatus(f, active) {
   document.getElementById('curTime').textContent = video.currentTime.toFixed(2);
   document.getElementById('detCount').textContent = f ? f.detections.length : 0;
-  document.getElementById('activeLabel').textContent = active ? ('#' + active.trackID) : 'none';
-  document.getElementById('segCount').textContent = groundTruth.length;
+  const cfg = MODES[activeMode];
+  let label = 'none';
+  if (active) {
+    if (cfg.kind === 'single') {
+      label = '#' + active.trackID;
+    } else {
+      const riders = active.riderTrackIDs.length ? active.riderTrackIDs.map(id => '#' + id).join(', ') : 'none yet';
+      label = `vehicle #${active.vehicleTrackID} — riders: ${riders}`;
+    }
+  }
+  document.getElementById('activeLabel').textContent = label;
+  document.getElementById('segCount').textContent = store[activeMode].length;
 }
 
-// --- Click to add / trim / delete ---
-overlay.addEventListener('click', (e) => {
-  // Dismiss any stale trim menu, but don't swallow the click -- it should
-  // still act on whatever box is under the cursor in the same click. (The
-  // menu's own buttons live outside #overlay in the DOM, so clicks on them
-  // never reach this listener at all -- this only ever fires for clicks on
-  // the video/overlay itself.) Previously this returned early on any click
-  // while a menu was open, which meant a leftover menu silently ate the
-  // next click entirely -- the real cause of "takes two clicks" reports.
-  hideTrimMenu();
+function flashHint(msg) {
+  hintEl.textContent = msg;
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => { hintEl.textContent = ''; }, 1800);
+}
 
+// --- Click to add / trim / delete / pair ---
+function hitTestBox(e) {
   const rect = overlay.getBoundingClientRect();
   // Pixel space, not normalized -- a fixed padding/tolerance in normalized
   // coordinates shrinks to almost nothing on screen for small/distant
@@ -217,9 +325,17 @@ overlay.addEventListener('click', (e) => {
   // Padding in actual pixels keeps small boxes comfortably clickable
   // regardless of the video's displayed zoom level.
   const px = e.clientX - rect.left, py = e.clientY - rect.top;
-  const PAD_PX = 10, FALLBACK_PX = 25;
+  // Combo mode's two boxes (rider + vehicle) are typically small and
+  // tightly overlapping (a person on a bike, not two separated cars) --
+  // confirmed via testing that the original 10px pad, tuned for picking
+  // one of several well-separated vehicles, can swallow almost the entire
+  // smaller box's own footprint when both boxes are this close together,
+  // making the rider effectively unclickable except in a sliver a couple
+  // pixels tall. Single-select modes keep the original tuning unchanged.
+  const PAD_PX = MODES[activeMode].kind === 'combo' ? 4 : 10;
+  const FALLBACK_PX = 25;
   const f = frameAt(video.currentTime);
-  if (!f) return;
+  if (!f) return { box: null, rect };
 
   // Prefer smallest-area box (padded) containing the click; fall back to
   // nearest center within a pixel-space tolerance.
@@ -240,33 +356,78 @@ overlay.addEventListener('click', (e) => {
       if (dist < bestDist) { bestDist = dist; best = d; }
     }
   }
+  return { box: best, rect };
+}
+
+overlay.addEventListener('click', (e) => {
+  // Dismiss any stale trim menu, but don't swallow the click -- it should
+  // still act on whatever box is under the cursor in the same click. (The
+  // menu's own buttons live outside #overlay in the DOM, so clicks on them
+  // never reach this listener at all -- this only ever fires for clicks on
+  // the video/overlay itself.) Previously this returned early on any click
+  // while a menu was open, which meant a leftover menu silently ate the
+  // next click entirely -- the real cause of "takes two clicks" reports.
+  hideTrimMenu();
+
+  const { box: best } = hitTestBox(e);
   if (!best) return;
-
   const t = video.currentTime;
-  const active = activeAssignmentAt(t);
+  const cfg = MODES[activeMode];
 
-  if (active && active.trackID === best.trackID) {
-    // Clicked the currently-highlighted box: offer to trim from either end,
-    // frame-by-frame -- "this car's now too far / changed lanes" (trim end)
-    // or "I started following it too early" (trim start).
-    showTrimMenu(e.clientX, e.clientY, active, t);
-  } else {
-    // Clicked a different box: implicitly end any open assignment now, start a new one.
-    if (active && active.end_t === null) active.end_t = t;
-    groundTruth.push({ start_t: t, end_t: null, trackID: best.trackID });
-    scheduleSave();
-    draw();
-    renderTimeline();
+  if (cfg.kind === 'single') {
+    const arr = store[activeMode];
+    const active = activeSingleAt(activeMode, t);
+    if (active && active.trackID === best.trackID) {
+      // Clicked the currently-highlighted box: offer to trim from either
+      // end, frame-by-frame.
+      showTrimMenu(e.clientX, e.clientY, arr, active, t);
+    } else {
+      // Clicked a different box: implicitly end any open assignment now,
+      // start a new one.
+      if (active && active.end_t === null) active.end_t = t;
+      arr.push({ start_t: t, end_t: null, trackID: best.trackID });
+      scheduleSave(); draw(); renderTimeline();
+    }
+    return;
   }
+
+  // combo mode
+  const arr = store[activeMode];
+  const active = activeComboAt(activeMode, t);
+
+  if (best.label === cfg.vehicleLabel) {
+    if (active && active.vehicleTrackID === best.trackID) {
+      showTrimMenu(e.clientX, e.clientY, arr, active, t);
+    } else {
+      if (active && active.end_t === null) active.end_t = t;
+      arr.push({ start_t: t, end_t: null, vehicleTrackID: best.trackID, riderTrackIDs: [] });
+      scheduleSave(); draw(); renderTimeline();
+    }
+  } else if (best.label === cfg.riderLabel) {
+    if (!active) { flashHint(`click a ${cfg.vehicleLabel} first to start a pairing`); return; }
+    const idx = active.riderTrackIDs.indexOf(best.trackID);
+    if (idx >= 0) {
+      active.riderTrackIDs.splice(idx, 1);
+    } else if (active.riderTrackIDs.length < cfg.maxRiders) {
+      active.riderTrackIDs.push(best.trackID);
+    } else {
+      flashHint(`already at max ${cfg.maxRiders} rider(s) for this pairing`);
+      return;
+    }
+    scheduleSave(); draw(); renderTimeline();
+  }
+  // else: clicked a box that's neither this mode's vehicle nor rider label -- ignore.
 });
 
 // --- Trim menu: appears at the click point when clicking the currently-
-// highlighted box, offering to cut the segment from either end at the
-// current frame. Snipping a boundary past the other one removes the
-// segment entirely rather than leaving something inverted/empty.
+// highlighted (single mode) or selected-vehicle (combo mode) box, offering
+// to cut the segment from either end at the current frame. Snipping a
+// boundary past the other one removes the segment entirely rather than
+// leaving something inverted/empty. Generic over which array/item it
+// operates on so both single and combo modes share it.
 let trimMenuEl = null;
 
-function showTrimMenu(clientX, clientY, assignment, t) {
+function showTrimMenu(clientX, clientY, arr, item, t) {
   hideTrimMenu();
   trimMenuEl = document.createElement('div');
   trimMenuEl.style.cssText = `position:fixed; left:${clientX}px; top:${clientY}px; ` +
@@ -282,18 +443,18 @@ function showTrimMenu(clientX, clientY, assignment, t) {
   };
 
   trimMenuEl.appendChild(mkBtn('◀ trim start', () => {
-    if (assignment.end_t !== null && t >= assignment.end_t) {
-      groundTruth = groundTruth.filter(a => a !== assignment);
+    if (item.end_t !== null && t >= item.end_t) {
+      store[activeMode] = arr.filter(a => a !== item);
     } else {
-      assignment.start_t = t;
+      item.start_t = t;
     }
     scheduleSave(); draw(); renderTimeline();
   }));
   trimMenuEl.appendChild(mkBtn('trim end ▶', () => {
-    if (t <= assignment.start_t) {
-      groundTruth = groundTruth.filter(a => a !== assignment);
+    if (t <= item.start_t) {
+      store[activeMode] = arr.filter(a => a !== item);
     } else {
-      assignment.end_t = t;
+      item.end_t = t;
     }
     scheduleSave(); draw(); renderTimeline();
   }));
@@ -306,12 +467,13 @@ function hideTrimMenu() {
 }
 
 function scheduleSave() {
+  const mode = activeMode;
   document.getElementById('saveState').textContent = 'saving...';
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    fetch('/api/ground_truth', {
+    fetch(`/api/ground_truth/${mode}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(groundTruth),
+      body: JSON.stringify(store[mode]),
     }).then(() => { document.getElementById('saveState').textContent = 'saved'; });
   }, 400);
 }
@@ -320,13 +482,17 @@ function scheduleSave() {
 function renderTimeline() {
   timeline.querySelectorAll('.seg').forEach(el => el.remove());
   if (!duration) return;
-  for (const a of groundTruth) {
+  const cfg = MODES[activeMode];
+  for (const a of store[activeMode]) {
     const end = a.end_t === null ? duration : a.end_t;
     const el = document.createElement('div');
     el.className = 'seg';
     el.style.left = (a.start_t / duration * 100) + '%';
     el.style.width = Math.max(0.15, (end - a.start_t) / duration * 100) + '%';
-    el.title = `#${a.trackID}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}`;
+    const tag = cfg.kind === 'single'
+      ? `#${a.trackID}`
+      : `vehicle #${a.vehicleTrackID} riders:${a.riderTrackIDs.map(id => '#' + id).join(',') || 'none'}`;
+    el.title = `${tag}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}`;
     timeline.appendChild(el);
   }
 }

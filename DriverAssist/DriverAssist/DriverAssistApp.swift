@@ -23,7 +23,11 @@ struct DriverAssistApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            // TEMPORARY 2026-08-12: voice-warning test bench, swapped in for
+            // ContentView() while auditioning AVSpeechSynthesizer voices/
+            // accents for the verbal-warnings feature. Swap back to
+            // ContentView() before resuming normal app testing.
+            VoiceTestView()
         }
     }
 }

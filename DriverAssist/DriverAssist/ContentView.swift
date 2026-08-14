@@ -526,6 +526,20 @@ struct InferenceView: View {
         cameraManager.setStabilizationEnabled(enabled)
     }
 
+    /// 2026-08-11: added for the cone calibration test -- lets recording switch
+    /// to 4K for the row/column precision it needs, without leaving 4K on for a
+    /// real drive (defaults off, see CameraManager.isFourKEnabled's own comment).
+    /// Deliberately NOT gated by `parametersLocked` the way the other settings
+    /// are -- those stay live-adjustable through Unlocked recording because they
+    /// don't need a session reconfigure, but this one does (see
+    /// `setFourKEnabled`), so it's only meaningful before Lock Settings/Unlocked
+    /// is tapped anyway (level/configuring screens).
+    private func toggleFourK() {
+        let enabled = !cameraManager.isFourKEnabled
+        DebugFileLogger.log("tap: MATCHED setFourK(\(enabled))")
+        cameraManager.setFourKEnabled(enabled)
+    }
+
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         let pitchSensor = PitchSensor()
@@ -716,6 +730,7 @@ struct InferenceView: View {
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.white.opacity(0.6))
                     .multilineTextAlignment(.center)
+                calibrationDriftText
                 HStack(spacing: 16) {
                     Button {
                         confirmCalibrate()
@@ -740,6 +755,28 @@ struct InferenceView: View {
                 }
                 .padding(.top, 8)
             }
+        }
+    }
+
+    /// 2026-08-12: shows live pitch/roll against whatever's persisted from the
+    /// last calibration, right at the Yes/No decision -- turns "No" from a
+    /// blind trust into an informed one. Deliberately NOT auto-capturing a
+    /// fresh reference on skip instead (a tempting simpler alternative):
+    /// that would silently bake in whatever grade/camber the car happens to
+    /// be sitting on right now, exactly the hill/camber misattribution the
+    /// reference-not-live design exists to avoid -- see DistanceEstimator.swift's
+    /// file-level comment. Showing the drift preserves the user's own judgment
+    /// call instead of replacing it. nil (no text shown) until there's both a
+    /// live reading and a previously-persisted reference to compare against --
+    /// e.g. the very first launch, before any calibration has ever happened.
+    @ViewBuilder
+    private var calibrationDriftText: some View {
+        if let pitchDrift = pitchSensor.pitchDriftDegrees {
+            let rollDrift = pitchSensor.rollDriftDegrees ?? 0
+            let notable = abs(pitchDrift) > 0.3 || abs(rollDrift) > 0.3
+            Text(String(format: "drift since last calibration: pitch %+.1f°, roll %+.1f°", pitchDrift, rollDrift))
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(notable ? .yellow : .white.opacity(0.5))
         }
     }
 
@@ -843,6 +880,14 @@ struct InferenceView: View {
                     .font(.system(size: 20, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.6))
                     .shadow(color: .black.opacity(0.7), radius: 4)
+            }
+
+            // 2026-08-12: moved out to the far left, vertically centered --
+            // was previously stacked centered with the roll/pitch readout
+            // above, which covered YawReferenceLine's dot right when the
+            // user needs an unobstructed view of it (this screen's whole
+            // point is checking yaw alignment against that dot).
+            HStack {
                 Button {
                     calibrateAttitude()
                 } label: {
@@ -852,7 +897,8 @@ struct InferenceView: View {
                         .frame(width: 220, height: 80)
                         .background(Color.yellow, in: Capsule())
                 }
-                .padding(.top, 24)
+                .padding(.leading, 12)
+                Spacer()
             }
         }
     }
@@ -1202,6 +1248,8 @@ struct InferenceView: View {
                     .onTapGesture { beginDistanceCalibration() }
             }
 
+            fourKLabelOverlay(interactive: true)
+
             if cameraOrientationWarning {
                 VStack {
                     Text("⚠ Camera may be mounted upside down\n(rotated 90° from the top)")
@@ -1264,6 +1312,8 @@ struct InferenceView: View {
                         .shadow(color: .black.opacity(0.6), radius: 2)
                 }
             }
+
+            fourKLabelOverlay(interactive: false)
         }
     }
 
@@ -1305,6 +1355,30 @@ struct InferenceView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 12)
         .ignoresSafeArea(edges: [.top, .bottom])
+    }
+
+    /// Left side, vertically centered -- deliberately NOT inside `settingsHUD`
+    /// (whose slots are all corner-anchored), used by both configuring and
+    /// driving screens. `interactive` is only true on the configuring screen:
+    /// toggling needs a session reconfigure (see `setFourKEnabled`), which only
+    /// does something immediately when no real recording is in progress yet --
+    /// on the driving screen this is display-only (2026-08-12, for visual
+    /// confirmation of which resolution is actually recording), not tappable,
+    /// so there's no dead tap that looks like it should do something mid-drive.
+    @ViewBuilder
+    private func fourKLabelOverlay(interactive: Bool) -> some View {
+        HStack {
+            Group {
+                if interactive {
+                    Text(fourKLabel).onTapGesture { toggleFourK() }
+                } else {
+                    Text(fourKLabel)
+                }
+            }
+            .hudLabelStyle()
+            Spacer()
+        }
+        .padding(.leading, 12)
     }
 
     /// Long-press-to-exit, shared by both configuringScreen and
@@ -1380,6 +1454,10 @@ struct InferenceView: View {
 
     private var stabilizationLabel: String {
         "stabilization: \(cameraManager.isStabilizationEnabled ? "on" : "off")"
+    }
+
+    private var fourKLabel: String {
+        "video: \(cameraManager.isFourKEnabled ? "4K" : "1080p")"
     }
 
     private var thermalLabel: String {

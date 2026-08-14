@@ -40,7 +40,9 @@ struct YOLODecoder: Sendable {
         2: "car",
         3: "motorcycle",
         5: "bus",
-        7: "truck"
+        7: "truck",
+        17: "horse",
+        36: "skateboard"
     ]
 
     private let confidenceThreshold: Float = 0.25
@@ -264,6 +266,17 @@ final class InferenceEngine: ObservableObject {
     let trackingManager: TrackingManager
     let egoSpeedManager: EgoSpeedManager
     let pitchSensor: PitchSensor
+    /// Combines person + bicycle/motorcycle detections into cyclist/
+    /// motorcyclist detections for display -- see ComboManager.swift.
+    /// Applied AFTER DetectionLogger.log (see finishSuccess) so the raw,
+    /// per-object detections keep getting logged unchanged; only the
+    /// published `detections` (overlay/UI) reflect the merge. Combo
+    /// detections currently publish `distanceMeters == nil` -- recomputing
+    /// a real distance for a synthesized union box needs pitch/roll/
+    /// aspectRatio context ComboManager doesn't have yet, deliberately
+    /// deferred rather than restructuring attachDistances' ordering for it
+    /// in this pass.
+    private let comboManager = ComboManager(strategies: [BicycleComboStrategy(), MotorcycleComboStrategy()])
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
     private var isBusy = false
@@ -371,7 +384,6 @@ final class InferenceEngine: ObservableObject {
             sourceSize: sourceSize,
             pitchSensor: pitchSensor
         )
-        self.detections = rangedDetections
         self.lastError = nil
         self.isBusy = false
         self.lastFrameElapsedMs = elapsedMs + trackingElapsedMs
@@ -411,6 +423,10 @@ final class InferenceEngine: ObservableObject {
             gravityZ: pitchSensor.gravityZ,
             detections: rangedDetections
         )
+        // Combo merge happens AFTER logging, so detections.jsonl always
+        // has the raw per-object detections -- see comboManager's doc
+        // comment above.
+        self.detections = comboManager.combine(rangedDetections)
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {
             print(String(format: "[InferenceEngine] frame %d: %.0fms model=%@ twoPass=%@ detections=%d",
