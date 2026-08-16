@@ -15,6 +15,25 @@ data, switched via a mode selector in the frontend:
     object -- e.g. the daylight-glare dashboard false positive found during
     the leading-vehicle classifier work. Written to
     <session_dir>/ground_truth_false_positive.json.
+  - hood_truncation: same single-track segment shape again, for marking the
+    interval during which a real object's box is being clipped specifically
+    by the ego vehicle's own hood/dashboard (bottom edge cut off by OUR car,
+    not a natural box edge). Segment start_t is the truncation *onset* --
+    the frame where clipping first becomes visible -- which is the useful
+    number: look up that trackID's box in detections.jsonl at start_t to
+    get the row/bottom-y truncation is first visible at, feeding both the
+    width-based-distance-override's near-minimum-distance pitch threshold
+    and the ego-hood rejection gate's max_bottom_y cutoff (DriverAssist
+    currently has no on-device equivalent of leading_vehicle.py's own such
+    gate). Written to <session_dir>/ground_truth_hood_truncation.json.
+  - other_truncation: same shape, for a box being clipped by anything that
+    ISN'T our hood -- another object in frame, or simply leaving the image
+    at a side/top edge. This is a different failure mode from
+    hood_truncation: it doesn't inform the pitch/max_bottom_y thresholds
+    (there's no fixed geometric boundary to solve for), but it's still
+    useful as a generic "don't trust this box's width" signal wherever
+    ground truth is used to validate width-based estimates or box quality.
+    Written to <session_dir>/ground_truth_other_truncation.json.
   - cyclist / motorcyclist / skateboarder / equestrian: pair a "vehicle"
     class detection (bicycle/motorcycle/skateboard/horse) with one or more
     "person" detections riding it. Segments: {start_t, end_t,
@@ -104,7 +123,10 @@ def build_app(session_dir: Path, video: Path, detections_path: Path, debug_log: 
     # renamed default here would silently break them. The combo modes are
     # new, so their filenames are just "ground_truth_<mode>.json"; no
     # existing tool reads these yet.
-    valid_modes = {"followed_vehicle", "false_positive", "cyclist", "motorcyclist", "skateboarder", "equestrian"}
+    valid_modes = {
+        "followed_vehicle", "false_positive", "hood_truncation", "other_truncation",
+        "cyclist", "motorcyclist", "skateboarder", "equestrian",
+    }
 
     def path_for_mode(mode: str) -> Path:
         if mode not in valid_modes:

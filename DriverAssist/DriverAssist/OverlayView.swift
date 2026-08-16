@@ -43,8 +43,12 @@ struct OverlayView: View {
         // Falls back to confidence% when distance isn't available yet (no
         // reference pitch captured -- see Detection.distanceMeters) so the
         // overlay still shows something useful before "Calibrate" is pressed.
-        let metric = detection.distanceMeters.map { String(format: "%.1fm", $0) }
-            ?? "\(Int(detection.confidence * 100))%"
+        // "w" suffix marks a width-based override (see WidthDistanceOverride
+        // .swift) so it's visually distinguishable on a live drive from an
+        // ordinary row-based reading, not just in the logs afterward.
+        let metric = detection.distanceMeters.map {
+            String(format: "%.1fm\(detection.distanceMetersIsWidthOverridden ? "w" : "")", $0)
+        } ?? "\(Int(detection.confidence * 100))%"
         let idPrefix = detection.trackID.map { "#\($0) " } ?? ""
         let label = Text("\(idPrefix)\(detection.label) \(metric)")
             .font(.system(size: 18, weight: .bold))

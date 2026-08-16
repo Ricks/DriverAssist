@@ -154,6 +154,62 @@ def write_session_logs(video: Path, session_dir: Path, logs_dir: Path) -> tuple:
     return detections_path, debug_log_path
 
 
+def existing_logs_cover_video(video: Path, detections_path: Path, debug_log_path: Path, logs_dir: Path) -> bool:
+    """True if the ALREADY-PRESENT detections.jsonl/overlay-debug.log's own
+    logged time range actually overlaps this video's -- guards against a
+    session directory being reused for a re-recorded take (same directory
+    name, different physical recording). CONFIRMED 2026-08-15 (a walkaround
+    retest): package_session.py saw detections.jsonl/overlay-debug.log
+    already present (from the FIRST recording), skipped extraction per its
+    documented "safe to re-run" behavior, then happily annotated the NEW
+    video against the OLD, temporally unrelated detection data -- no crash,
+    no warning, just a plausible-looking but silently wrong reconstruction.
+    Only peeks at each file's first/last line (not a full parse) since all
+    that's needed is "roughly the right neighborhood in time", not exact
+    coverage.
+    """
+    start_epoch, _ = resolve_start_epoch(video, logs_dir)
+    duration = video_duration_seconds(video)
+    range_start = start_epoch - RANGE_BUFFER_BEFORE_SECONDS
+    range_end = start_epoch + duration + RANGE_BUFFER_AFTER_SECONDS if duration is not None else float("inf")
+
+    def line_epoch(line: str):
+        try:
+            return float(line.split(" ", 1)[0])
+        except ValueError:
+            pass
+        try:
+            return json.loads(line)["t"]
+        except Exception:
+            return None
+
+    def file_time_range(path: Path):
+        times = []
+        with open(path) as f:
+            first = f.readline()
+        t = line_epoch(first)
+        if t is not None:
+            times.append(t)
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            block = min(size, 4096)
+            f.seek(-block, 2)
+            tail = f.read().decode(errors="ignore")
+        lines = tail.strip().splitlines()
+        if lines:
+            t = line_epoch(lines[-1])
+            if t is not None:
+                times.append(t)
+        return (min(times), max(times)) if times else None
+
+    existing_range = file_time_range(detections_path) or file_time_range(debug_log_path)
+    if existing_range is None:
+        return True  # Inconclusive (e.g. an empty file) -- don't block on it.
+    existing_start, existing_end = existing_range
+    return existing_start <= range_end and existing_end >= range_start
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("session_dir", type=Path, help="Directory containing exactly one raw recording")
@@ -192,16 +248,27 @@ def main() -> None:
     detections_path = session_dir / "detections.jsonl"
     debug_log_path = session_dir / "overlay-debug.log"
     if detections_path.exists() and debug_log_path.exists():
-        print(f"{detections_path.name}/{debug_log_path.name} already present -- skipping extraction "
-              "(delete them to force re-extraction).")
+        if existing_logs_cover_video(video, detections_path, debug_log_path, args.logs_dir):
+            print(f"{detections_path.name}/{debug_log_path.name} already present -- skipping extraction "
+                  "(delete them to force re-extraction).")
+        else:
+            sys.exit(
+                f"{detections_path.name}/{debug_log_path.name} already exist in {session_dir}, but their "
+                f"logged time range doesn't overlap {video.name}'s at all. This almost certainly means "
+                "the directory was reused for a re-recorded take (same name, different session) and "
+                "these are stale data from the PREVIOUS recording, not this one -- annotating against "
+                "them would silently produce a plausible-looking but wrong reconstruction. Delete "
+                f"{detections_path.name}/{debug_log_path.name} (and any stale {video.stem}-annotated.mp4) "
+                "and re-run to extract the correct data for this video."
+            )
     else:
         detections_path, debug_log_path = write_session_logs(video, session_dir, args.logs_dir)
 
     annotated_path = session_dir / f"{video.stem}-annotated.mp4"
     if args.skip_annotate:
         print(f"--skip-annotate passed -- not generating {annotated_path.name}.")
-    elif annotated_path.exists():
-        print(f"{annotated_path.name} already exists -- skipping (delete it to force regeneration).")
+    elif annotated_path.exists() and annotated_path.stat().st_mtime >= debug_log_path.stat().st_mtime:
+        print(f"{annotated_path.name} already exists and is newer than its inputs -- skipping (delete it to force regeneration).")
     else:
         print("Generating annotated reconstruction...")
         subprocess.run(

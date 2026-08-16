@@ -46,16 +46,6 @@ final class CameraManager: NSObject, ObservableObject {
     /// below for applying the mode to the capture connection.
     @Published private(set) var isStabilizationEnabled = false
 
-    /// Whether normal (non-calibration) recording uses 4K instead of the default
-    /// 1080p -- added 2026-08-11 for the cone calibration test, where pixel
-    /// precision matters more than the thermal risk that ruled out 4K for real
-    /// long drives (see `configure`'s own thermal comment: confirmed 10-15x
-    /// throttling on a 23-minute 4K/30fps drive). Defaults off/1080p and is
-    /// deliberately NOT persisted (see init's comment) -- always starts back at
-    /// 1080p on a fresh launch, so a deliberate choice for one short calibration
-    /// recording can't silently carry over into a later real drive.
-    @Published private(set) var isFourKEnabled = false
-
     /// Current system thermal state. Published so the HUD can warn when the device
     /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
     /// sustained heat with no other visible symptom, so this is the only in-the-moment
@@ -110,18 +100,10 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentStabilizationEnabled = newValue; overlayLock.unlock() }
     }
 
-    /// Nonisolated mirror of `isFourKEnabled`, readable from `sessionQueue` when
-    /// choosing the preset in `configure()`/`start(recording:)`.
-    private nonisolated var currentFourKEnabled: Bool {
-        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentFourKEnabled }
-        set { overlayLock.lock(); _currentFourKEnabled = newValue; overlayLock.unlock() }
-    }
-
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
-    private nonisolated(unsafe) var _currentFourKEnabled: Bool = false
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -153,6 +135,23 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var lastFocusLockTime: CFAbsoluteTime = 0
     private nonisolated static let focusRecalibrationInterval: CFAbsoluteTime = 60
     private nonisolated static let maxFocusSettleWait: CFAbsoluteTime = 5
+
+    /// Set for the duration of a `startWalkaroundRecording` session --
+    /// suppresses `recalibrateFocusIfDue`'s periodic re-settle entirely
+    /// (rather than just relying on `.far` range restriction), because this
+    /// test deliberately keeps a tape-measure marker in near-field view for
+    /// its whole duration (how the tester holds the correct tethered
+    /// distance) -- a permanent close-range distractor normal driving never
+    /// has to contend with. CONFIRMED 2026-08-15 via a real walkaround
+    /// session (data/26_08_15_Walkaround): focus was visibly inconsistent
+    /// across the recording despite the same settle-then-lock-far machinery
+    /// that works fine for normal drives, most plausibly because each
+    /// periodic re-settle switches back to `.continuousAutoFocus` (still
+    /// `.far`-restricted) for a moment, and re-exposes that brief window to
+    /// the marker. The one settle-then-lock `startWalkaroundRecording` does
+    /// at the very start is left in place -- only the periodic re-runs are
+    /// skipped.
+    private nonisolated(unsafe) var suppressPeriodicFocusRecalibration = false
 
     /// CONFIRMED 2026-08-11 (real outdoor distance-calibration session,
     /// `data/26_08_11_DistanceCalibration/`): `continuousAutoFocus` under
@@ -252,10 +251,10 @@ final class CameraManager: NSObject, ObservableObject {
     override init() {
         super.init()
         let defaults = UserDefaults.standard
-        // isAutoLowLightEnabled and isFourKEnabled are deliberately NOT persisted —
-        // every launch starts back at the default (auto / 1080p) regardless of
-        // whatever manual override was last in effect, so a prior drive/test's
-        // choice doesn't silently carry over into an unrelated later one. `exitSession`
+        // isAutoLowLightEnabled is deliberately NOT persisted — every launch
+        // starts back at the default (auto) regardless of whatever manual
+        // override was last in effect, so a prior drive/test's choice doesn't
+        // silently carry over into an unrelated later one. `exitSession`
         // always terminates the app outright (see its own comment) rather than looping
         // back to the level screen, so "every launch" and "every session" are the same
         // thing here -- no separate per-session reset path is needed beyond this.
@@ -271,29 +270,6 @@ final class CameraManager: NSObject, ObservableObject {
         currentAutoLowLightEnabled = isAutoLowLightEnabled
         currentLowLightEnabled = isLowLightBoostEnabled
         currentStabilizationEnabled = isStabilizationEnabled
-        currentFourKEnabled = isFourKEnabled
-    }
-
-    /// Toggles the normal-drive recording preset between 1080p (default) and 4K.
-    /// If the session is already running but NOT actively writing a real
-    /// recording (level/configuring screens, or driving before Lock Settings),
-    /// this takes effect immediately via the same full teardown-then-fresh-
-    /// configure sequence `stopCalibrationRecording` already uses (`teardownSession`
-    /// + `configure`) -- safe specifically because nothing real is being written
-    /// yet, so there's no in-progress file to race against. If a real recording
-    /// IS already in progress, the new value is only saved -- it takes effect on
-    /// the next session start rather than interrupting footage already being
-    /// written. NOT persisted to UserDefaults -- see init's comment; this always
-    /// starts back at 1080p on a fresh launch.
-    func setFourKEnabled(_ enabled: Bool) {
-        isFourKEnabled = enabled
-        currentFourKEnabled = enabled
-        sessionQueue.async { [weak self] in
-            guard let self, self.session.isRunning, self.assetWriter == nil else { return }
-            self.session.stopRunning()
-            self.teardownSession()
-            self.configure(startRecording: false, preset: enabled ? .hd4K3840x2160 : .hd1920x1080, settleFocus: true)
-        }
     }
 
     /// `recording: false` starts the session (live preview + inference feed)
@@ -314,14 +290,14 @@ final class CameraManager: NSObject, ObservableObject {
             case .authorized:
                 sessionQueue.async { [weak self] in
                     guard let self else { return }
-                    self.configure(startRecording: recording, preset: self.currentFourKEnabled ? .hd4K3840x2160 : .hd1920x1080)
+                    self.configure(startRecording: recording)
                 }
             case .notDetermined:
                 let granted = await AVCaptureDevice.requestAccess(for: .video)
                 if granted {
                     self.sessionQueue.async { [weak self] in
                         guard let self else { return }
-                        self.configure(startRecording: recording, preset: self.currentFourKEnabled ? .hd4K3840x2160 : .hd1920x1080)
+                        self.configure(startRecording: recording)
                     }
                 }
             default:
@@ -473,6 +449,79 @@ final class CameraManager: NSObject, ObservableObject {
             // sequence one atomic chain -- nothing else can interleave.
             self.configure(startRecording: false, settleFocus: true)
             DispatchQueue.main.async { completion(detectedCount) }
+        }
+    }
+
+    // MARK: - Walkaround recording (tethered-distance distance-cal test)
+    //
+    // A long-form, real drive-style recording (1080p, "recording-" prefixed,
+    // recoverable like any other drive) for the walkaround distance-cal
+    // test: the tester walks to several tethered distances in front of the
+    // parked car while a tape-measure marker stays in near-field view the
+    // whole time. Two ways this differs from a normal drive recording:
+    // - Focus is explicitly settled and LOCKED far/infinity before the
+    //   first frame is written, same mechanism `startCalibrationRecording`
+    //   uses -- necessary because the near-field marker is a permanent
+    //   fixture of this test (unlike the tape-marks flow, it can't just be
+    //   framed out).
+    // - `recalibrateFocusIfDue`'s periodic re-settle is suppressed for the
+    //   whole recording (`suppressPeriodicFocusRecalibration`) -- CONFIRMED
+    //   2026-08-15 via a real session (data/26_08_15_Walkaround) that even
+    //   with the same settle-then-lock-far machinery normal driving uses,
+    //   focus drifted inconsistently, most plausibly during one of the
+    //   periodic re-settles' brief continuous-AF windows.
+    //
+    // Unlike the tape-marks clip, there's no fixed duration or auto-stop --
+    // `stopWalkaroundRecording` ends it whenever the tester is done.
+
+    /// `completion` reports whether the recording actually started -- same
+    /// failure semantics as `startCalibrationRecording`.
+    func startWalkaroundRecording(completion: @escaping @Sendable (Bool) -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self, self.assetWriter == nil else {
+                DebugFileLogger.log("walkaround-recording: FAILED to start, assetWriter still non-nil (previous recording not fully torn down)")
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+            self.teardownSession()
+            self.suppressPeriodicFocusRecalibration = true
+            self.configure(startRecording: false, preset: .hd1920x1080, settleFocus: false)
+            guard let device = self.captureDevice else {
+                self.suppressPeriodicFocusRecalibration = false
+                DebugFileLogger.log("walkaround-recording: FAILED to start, captureDevice nil after configure()")
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            self.settleAndLockFarFieldFocus(device: device) { [weak self] in
+                guard let self else { return }
+                self.startNewRecording()
+                DispatchQueue.main.async { completion(true) }
+            }
+        }
+    }
+
+    /// Ends a walkaround recording, saving to Photos same as a normal
+    /// `stop()` -- also tears the session down (see this section's own
+    /// comment on why `stopCalibrationRecording` does the same) and clears
+    /// `suppressPeriodicFocusRecalibration`, so neither the locked-far focus
+    /// nor the suppressed periodic recalibration leaks into whatever session
+    /// starts next. `completion` fires on the main queue once finalize +
+    /// teardown are done.
+    func stopWalkaroundRecording(completion: (@Sendable () -> Void)? = nil) {
+        let sessionBox = UncheckedSendableBox(value: session)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.finishRecording()
+            sessionBox.value.stopRunning()
+            self.teardownSession()
+            self.suppressPeriodicFocusRecalibration = false
+            self.configure(startRecording: false, settleFocus: true)
+            if let completion {
+                DispatchQueue.main.async { completion() }
+            }
         }
     }
 
@@ -733,9 +782,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// `focusRecalibrationInterval` -- called from every captured frame,
     /// matching how `sampleAutoLowLightIfDue` self-throttles instead of
     /// needing its own timer. Bounds how long a bad one-shot lock can stay
-    /// wrong for -- see `settleAndLockFarFieldFocus`'s doc comment.
+    /// wrong for -- see `settleAndLockFarFieldFocus`'s doc comment. Skipped
+    /// entirely during a walkaround recording -- see
+    /// `suppressPeriodicFocusRecalibration`'s doc comment for why.
     private nonisolated func recalibrateFocusIfDue() {
         guard
+            !suppressPeriodicFocusRecalibration,
             let device = captureDevice,
             focusSettleObservation == nil,
             CFAbsoluteTimeGetCurrent() - lastFocusLockTime >= Self.focusRecalibrationInterval

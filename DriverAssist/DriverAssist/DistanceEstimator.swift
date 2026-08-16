@@ -153,39 +153,75 @@ struct DistanceEstimator {
     /// built.
     private static let assumedPrincipalColumnNormalized: Double = 0.5
 
-    /// The live app's actual calibrated instance -- fit 2026-08-11 from
-    /// data/26_08_11_DistanceCalibration/ round 0 (near=8.1m/far=19.92m tape
-    /// marks, reference pitch -2.561deg/roll -2.322deg) via the roll-aware
-    /// `DistanceEstimator.fit()`. Tape-mark rows were re-read by hand
-    /// (visual arrow-key line-up tool against the source video frames), and
-    /// columns were read via targeted color-sampling on the same frames.
+    /// The live app's actual calibrated instance.
     ///
-    /// *** Reference pitch is NEGATIVE here on purpose -- worth flagging
-    /// *** since it looks backwards at a glance. The raw debug-logged pitch
-    /// *** for this round was +2.561deg, captured BEFORE the PitchSensor
-    /// *** sign fix earlier in this file; the corrected value (what a fixed
-    /// *** sensor would have read) is that raw value negated, i.e. -2.561.
-    /// *** A same-session bug (not a formula or hardware issue) came from
-    /// *** re-deriving these constants from a written summary after a
-    /// *** context-compaction boundary and losing track of which pitch
-    /// *** values already had this negation applied vs which were still
-    /// *** raw -- every fit run afterward used the raw (wrong-sign) value
-    /// *** directly, which alone produced the ~20% cross-round v0 spread
-    /// *** that briefly looked like unmodeled roll, or even like each
-    /// *** separate calibration recording having a different effective FOV.
-    /// *** Neither of those was real -- using the correctly-negated pitch
-    /// *** resolves it completely: fitting round0 alone now predicts all 6
-    /// *** held-out points from rounds 1/2 (different pitches, different
-    /// *** recordings) to within 2.9% mean / 6.4% max error, down from the
-    /// *** ~20-30%+ errors seen before this fix. Lesson for next time: when
-    /// *** resuming work on a signed quantity after a compaction boundary,
-    /// *** re-derive the sign from the actual source script/call site, not
-    /// *** from a written description of it.
-    /// cameraHeightMeters is the 2026-08-11 remeasurement with the new mount.
+    /// *** UPDATED 2026-08-15 -- v0/f refit from the SHAPE clamp mount's
+    /// *** cone-calibration session (data/26_08_14_ConeCalibration/), NOT
+    /// *** just the height. This corrects an assumption stated here until
+    /// *** today: that v0/f are purely lens-intrinsic and never need
+    /// *** re-fitting for a mount change alone. That assumption is still
+    /// *** correct IN PRINCIPLE -- mount position/orientation only affects
+    /// *** height/pitch/roll/lever-arm, all handled separately -- but this
+    /// *** specific refit wasn't actually about the mount. Investigated
+    /// *** because the new cone data, checked against the OLD v0/f with the
+    /// *** real (device-logged) reference pitch/roll/height for this
+    /// *** session, predicted distances 21-55% too far, growing with
+    /// *** distance -- too large and too systematic to be noise. Root
+    /// *** cause, confirmed by pulling both sessions' actual device logs
+    /// *** (not assumed): the 2026-08-11 tape-mark session was recorded at
+    /// *** 4K with video stabilization OFF; this cone session was recorded
+    /// *** at 1080p with stabilization ON (`stabilizationEnabled: true`
+    /// *** throughout, confirmed in detections.jsonl) -- forgot to switch
+    /// *** to the 4K calibration-recording mode that day. `.standard`
+    /// *** stabilization crops the frame (see `setStabilizationEnabled`'s
+    /// *** own comment), which shifts the effective FOV and therefore v0/f
+    /// *** in normalized terms even though it's the same physical lens --
+    /// *** resolution alone (4K vs 1080p) would NOT do this, normalizing
+    /// *** cancels out pixel count; the crop from stabilization is what
+    /// *** actually moved. `isStabilizationEnabled` is a persisted setting,
+    /// *** not session-scoped, so `true` here is very likely just this
+    /// *** app's normal current driving configuration, not something
+    /// *** specially set for calibration -- meaning this cone-based fit,
+    /// *** not the old tape-mark one, is probably the one that actually
+    /// *** matches real drives. Lesson: when two calibration sessions
+    /// *** disagree, check what was actually DIFFERENT about how each was
+    /// *** captured (resolution, stabilization, crop) before assuming a
+    /// *** constant that's supposed to be fixed has drifted for no reason.
+    /// ***
+    /// *** Fit method: least-squares over all 8 real cone points (4 near:
+    /// *** 8/10/12/14m, 4 far: 14/16/18/20m, marked via
+    /// *** tools/cone_pinpoint_tool.html against extracted frames), using
+    /// *** the session's actual logged reference pitch -1.5137deg / roll
+    /// *** -0.4506deg (both confirmed constant across the whole recording
+    /// *** except a stale value in the first ~3s before Calibrate was
+    /// *** pressed) and cameraHeightMeters=1.02. Same linear reduction
+    /// *** `fit()` already uses for 2 points, extended to 8 via ordinary
+    /// *** least squares instead of an exact solve. Residuals: -3.65% to
+    /// *** +2.74% per point, no systematic pattern by distance -- mean 1.59%
+    /// *** / max 3.65%, comparable to (slightly better than) the original
+    /// *** tape-mark fit's 2.9%/6.4%. Column-axis principal point is still
+    /// *** the assumed 0.5, not independently fit -- this was a v0/f-only
+    /// *** regression, same two unknowns as the original 2-point fit.
+    ///
+    /// (2026-08-11 tape-mark fit, superseded above -- kept for the
+    /// pitch-sign-bug history, not current values: v0=0.500504, f=1.412226,
+    /// from data/26_08_11_DistanceCalibration/ round 0, reference pitch
+    /// -2.561deg/roll -2.322deg. That session's own real lesson, still
+    /// valid: the raw debug-logged pitch for round 0 was +2.561deg, logged
+    /// BEFORE the PitchSensor sign fix earlier in this file -- the
+    /// corrected value is that raw value negated. Re-deriving this from a
+    /// written summary after a context-compaction boundary once lost track
+    /// of which pitch values already had the negation applied, silently
+    /// reintroducing the same sign bug one level removed. Fit on that
+    /// round alone predicted 6 held-out points from other rounds/pitches
+    /// to 2.9% mean / 6.4% max error once the sign was actually correct.)
+    ///
+    /// cameraHeightMeters=1.02 -- measured 2026-08-15 for the SHAPE clamp
+    /// mount (supersedes the 1.015m RAM-mount figure).
     static let calibrated = DistanceEstimator(
-        cameraHeightMeters: 1.015,
-        principalRowNormalized: 0.500504,
-        focalLengthNormalized: 1.412226
+        cameraHeightMeters: 1.02,
+        principalRowNormalized: 0.481681,
+        focalLengthNormalized: 1.322673
     )
 
     /// Distance in meters to the ground-contact point of a detection.
@@ -256,6 +292,73 @@ struct DistanceEstimator {
             aspectRatio: aspectRatio
         ).map { $0 * 3.28084 }
     }
+
+    /// Distance implied by a detection's box WIDTH instead of its ground-
+    /// contact row -- see WidthDistanceOverride.swift for why this exists
+    /// (row-based distance is unreliable below the hood-truncation cutoff,
+    /// see `hoodCutoffAngleDegrees`) and how this is actually used (one-
+    /// directional override, sanity-capped against real per-class width
+    /// stats, confidence-gated, hysteresis-confirmed -- none of that lives
+    /// here, this is just the geometry).
+    ///
+    /// Pinhole similar-triangles formula: `boxWidthNormalized ≈
+    /// focalLengthColumnNormalized * realWidthMeters / distanceMeters`,
+    /// solved for distance. Small-angle approximation (treats the object's
+    /// angular width as `width/distance` rather than `2*atan(width/(2*
+    /// distance))`) -- acceptable here since this is only ever consulted at
+    /// close range where a wrong-but-plausible row-based reading needs
+    /// correcting, not as a general-purpose replacement for the row-based
+    /// model at all distances. Reuses `focalLengthNormalized` from the SAME
+    /// calibrated instance `distanceMeters` uses -- one calibration, two
+    /// consumers, not a second independent fit.
+    ///
+    /// - Parameters:
+    ///   - boxWidthNormalized: a detection's `boundingBox.width` (normalized
+    ///     [0, 1], same convention as `distanceMeters`' `bottomY`/`centerX`).
+    ///   - realWidthMeters: the object class's real-world width -- see
+    ///     `ObjectWidthPriors` for real (KITTI-derived, not guessed) values.
+    ///   - aspectRatio: same as `distanceMeters` -- whichever was actually
+    ///     active for this detection.
+    /// - Returns: nil if the box has no width (shouldn't happen for a real
+    ///   detection, but a zero-width box would otherwise divide by zero).
+    func widthBasedDistanceMeters(
+        boxWidthNormalized: Double,
+        realWidthMeters: Double,
+        aspectRatio: Double
+    ) -> Double? {
+        guard boxWidthNormalized > 0 else { return nil }
+        let focalLengthColumnNormalized = focalLengthNormalized / aspectRatio
+        return focalLengthColumnNormalized * realWidthMeters / boxWidthNormalized
+    }
+
+    /// Angle below horizontal (degrees) at which the ego vehicle's own hood
+    /// clips a detection's box -- below this, a detection's row-based
+    /// distance no longer reflects real ground contact (the box bottom is
+    /// pinned to the hood edge, not the object's actual feet/wheels), so
+    /// `distanceMeters` reads a "phantom" distance around 5.9m regardless of
+    /// how much closer the real object actually is.
+    ///
+    /// MEASURED 2026-08-15 from real walkaround-test footage
+    /// (data/26_08_15_Walkaround), NOT the earlier tape/eye-measured "~7m
+    /// minimum distance" figure it supersedes for this purpose -- that
+    /// figure was measured differently and disagreed with this one by over
+    /// a meter; this is the one that matches what the detector itself
+    /// actually produces, which is what a code-level cutoff needs to agree
+    /// with. Method: pooled 107 real YOLO person-detection boxes from the
+    /// confirmed-tethered 3m and 5m windows (both well below any plausible
+    /// true minimum, so every box in both windows is genuinely hood-
+    /// clipped, not just close) -- each box's bottom row was converted to
+    /// an angle via `atan(cameraHeightMeters / distanceMeters)`, the exact
+    /// inverse of `distanceMeters`' own `height / tan(phi)`. Binned across
+    /// the full horizontal width of the frame (5 column bins) to check for
+    /// hood-slope dependence: found remarkably flat (row varies by only
+    /// ~0.019 normalized units across the ENTIRE frame width), so a single
+    /// scalar threshold is adequate -- no column-dependent function needed.
+    /// Result: mean 9.899°, std 0.771° (n=107). This constant is the mean;
+    /// callers needing a margin above it (e.g. the near-minimum-distance
+    /// tier switch) should add their own buffer on top, not treat this as
+    /// already-padded.
+    static let hoodCutoffAngleDegrees: Double = 9.899
 
     /// Solves for `principalRowNormalized`/`focalLengthNormalized` from two
     /// (row, column, distance) tape-mark reference points, at whatever
@@ -363,19 +466,32 @@ struct DistanceEstimator {
     //     v = omega x r = (-omega_z * r_y, omega_z * r_x, 0)
     // -- camera height plays no part, only the horizontal offsets do.
     //
-    // r_x: MEASURED 2026-08-09 with a tape measure -- 2.03m forward of the
-    // rear axle (also measured: 82cm to the front axle, i.e. ~2.85m
-    // wheelbase -- a sanity-check figure, not itself used here).
-    // r_y: DERIVED 2026-08-09, not an independent measurement -- computed
-    // by assuming the iPhone itself (not the camera lens) is centered on
-    // the dash, then adding the confirmed 5.92cm lens-to-phone-body lateral
-    // offset (see PitchSensor/ContentView's camera-orientation-warning
-    // history). ~6cm to the driver's-left of the vehicle's true centerline,
-    // +/-1cm combined uncertainty -- softer than r_x, since the dash-
-    // centering half is still an assumption, not a caliper measurement.
+    // UPDATED 2026-08-15 for the SHAPE clamp mount -- supersedes the
+    // 2026-08-09 figures below (old RAM mount), which are kept here for
+    // history/context, not current use.
+    //
+    // r_x: MEASURED 2026-08-15 with a tape measure -- 2.17m forward of the
+    // rear axle (also measured: 68cm to the front axle, i.e. 2.85m implied
+    // wheelbase -- a sanity-check figure, not itself used here. Matches the
+    // published 2021 Nissan Altima SR wheelbase, 282.4cm, to within 2.6cm --
+    // same margin as the old mount's equivalent check, a good consistency
+    // sign for both measurements).
+    // r_y: MEASURED 2026-08-15 -- 26cm to the driver's-left of center.
+    // Methodology (direct centerline measurement vs. an assumption-based
+    // derivation, as the old 6cm figure was) not specified this time --
+    // taken at face value as given, not re-derived. The jump from 6cm to
+    // 26cm is real and expected, not a red flag -- this mount physically
+    // positions the camera differently than the old dash-centered RAM
+    // mount did, not a measurement error.
+    //
+    // (2026-08-09, old RAM mount, superseded: r_x=2.03m forward of rear
+    // axle, 82cm to front axle, ~2.85m implied wheelbase. r_y=6cm left of
+    // center, derived not measured -- assumed the iPhone itself, not the
+    // lens, was centered on the dash, then added the confirmed 5.92cm
+    // lens-to-phone-body lateral offset.)
     enum LeverArm {
-        static let forwardOfRearAxleMeters: Double = 2.03
-        static let leftOfCenterlineMeters: Double = 0.06
+        static let forwardOfRearAxleMeters: Double = 2.17
+        static let leftOfCenterlineMeters: Double = 0.26
 
         /// Camera's own velocity due to yaw rotation about the rear axle,
         /// in the vehicle's body frame (x = forward, y = left, meters/

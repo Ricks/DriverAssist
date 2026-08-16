@@ -277,6 +277,7 @@ final class InferenceEngine: ObservableObject {
     /// deferred rather than restructuring attachDistances' ordering for it
     /// in this pass.
     private let comboManager = ComboManager(strategies: [BicycleComboStrategy(), MotorcycleComboStrategy()])
+    private let widthDistanceOverrideManager = WidthDistanceOverrideManager()
     private let queue = DispatchQueue(label: "InferenceEngine.queue", qos: .userInitiated)
     private let decoder = YOLODecoder()
     private var isBusy = false
@@ -384,6 +385,14 @@ final class InferenceEngine: ObservableObject {
             sourceSize: sourceSize,
             pitchSensor: pitchSensor
         )
+        // Runs BEFORE DetectionLogger.log below, so the override's effect
+        // (widthDistanceMeters/distanceMetersIsWidthOverridden) is itself
+        // logged -- see WidthDistanceOverrideManager.apply's doc comment.
+        let overriddenDetections = widthDistanceOverrideManager.apply(
+            to: rangedDetections,
+            cameraHeightMeters: DistanceEstimator.calibrated.cameraHeightMeters,
+            aspectRatio: Double(sourceSize.width / sourceSize.height)
+        )
         self.lastError = nil
         self.isBusy = false
         self.lastFrameElapsedMs = elapsedMs + trackingElapsedMs
@@ -421,12 +430,12 @@ final class InferenceEngine: ObservableObject {
             gravityX: pitchSensor.gravityX,
             gravityY: pitchSensor.gravityY,
             gravityZ: pitchSensor.gravityZ,
-            detections: rangedDetections
+            detections: overriddenDetections
         )
         // Combo merge happens AFTER logging, so detections.jsonl always
         // has the raw per-object detections -- see comboManager's doc
         // comment above.
-        self.detections = comboManager.combine(rangedDetections)
+        self.detections = comboManager.combine(overriddenDetections)
         frameCount += 1
         if frameCount % 60 == 1 || !detections.isEmpty {
             print(String(format: "[InferenceEngine] frame %d: %.0fms model=%@ twoPass=%@ detections=%d",

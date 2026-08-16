@@ -103,10 +103,23 @@ const timeline = document.getElementById('timeline');
 const modesEl = document.getElementById('modes');
 const hintEl = document.getElementById('hint');
 
+const LABEL_COLORS = {
+  person: '#ffff00', bicycle: '#00ffff', motorcycle: '#00ffff',
+  skateboard: '#cc66ff', horse: '#cc66ff',
+  car: '#00ff00', bus: '#ff3333', truck: '#ff3333',
+};
+const HIGHLIGHT_COLOR = '#ff33ff';        // selected/followed/flagged box, or a combo's vehicle box
+const RIDER_COLOR = '#33ff99';            // a combo's matched rider box(es)
+const BAD_COLOR = '#ff4444';              // false_positive highlight
+const HOOD_TRUNCATION_COLOR = '#ff9900';  // hood_truncation highlight
+const OTHER_TRUNCATION_COLOR = '#3399ff'; // other_truncation highlight
+
 // --- Mode registry ---------------------------------------------------
 // 'single': one clicked box = the labeled thing for this time segment
-// (followed_vehicle's original behavior; false_positive reuses it
-// unchanged -- both are just "this one trackID, this time range").
+// (followed_vehicle's original behavior; false_positive/hood_truncation/
+// other_truncation reuse it unchanged -- all four are just "this one
+// trackID, this time range", distinguished only by highlightColor and
+// where they're saved).
 // 'combo': pair a "vehicle"-class box with 1+ "rider"-class boxes over a
 // time range -- click the vehicle box to open/select a segment, then
 // click rider boxes to attach/detach them (toggle). maxRiders is where
@@ -114,10 +127,14 @@ const hintEl = document.getElementById('hint');
 // same shape as the Swift ComboAssociationStrategy design this data
 // eventually validates.
 const MODES = {
-  followed_vehicle: { kind: 'single', label: 'Followed Vehicle',
+  followed_vehicle: { kind: 'single', label: 'Followed Vehicle', highlightColor: HIGHLIGHT_COLOR,
     hint: 'click a box to follow it &middot; click the highlighted box to trim start/end here' },
-  false_positive: { kind: 'single', label: 'False Positive',
+  false_positive: { kind: 'single', label: 'False Positive', highlightColor: BAD_COLOR,
     hint: 'click any box to flag it as a spurious detection &middot; click the highlighted box to trim start/end here' },
+  hood_truncation: { kind: 'single', label: 'Hood Truncation', highlightColor: HOOD_TRUNCATION_COLOR,
+    hint: 'click a box the instant OUR hood/dashboard starts clipping its bottom edge &middot; click the highlighted box to trim start/end here' },
+  other_truncation: { kind: 'single', label: 'Other Truncation', highlightColor: OTHER_TRUNCATION_COLOR,
+    hint: 'click a box the instant anything else (another object, frame edge) starts clipping it &middot; click the highlighted box to trim start/end here' },
   cyclist: { kind: 'combo', label: 'Cyclist', vehicleLabel: 'bicycle', riderLabel: 'person', maxRiders: 1,
     hint: 'click a bicycle to start/select a pairing, then click its rider &middot; click a rider again to unpair' },
   motorcyclist: { kind: 'combo', label: 'Motorcyclist', vehicleLabel: 'motorcycle', riderLabel: 'person', maxRiders: 2,
@@ -127,7 +144,7 @@ const MODES = {
   equestrian: { kind: 'combo', label: 'Equestrian', vehicleLabel: 'horse', riderLabel: 'person', maxRiders: 1,
     hint: 'click a horse to start/select a pairing, then click its rider' },
 };
-const MODE_ORDER = ['followed_vehicle', 'false_positive', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
+const MODE_ORDER = ['followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
 let activeMode = 'followed_vehicle';
 
 let frames = [];              // [{t, detections:[{trackID,label,confidence,x,y,w,h}]}]
@@ -137,15 +154,6 @@ let duration = 0;
 let saveTimer = null;
 let reverseTimer = null;
 let hintTimer = null;
-
-const LABEL_COLORS = {
-  person: '#ffff00', bicycle: '#00ffff', motorcycle: '#00ffff',
-  skateboard: '#cc66ff', horse: '#cc66ff',
-  car: '#00ff00', bus: '#ff3333', truck: '#ff3333',
-};
-const HIGHLIGHT_COLOR = '#ff33ff';   // selected/followed/flagged box, or a combo's vehicle box
-const RIDER_COLOR = '#33ff99';       // a combo's matched rider box(es)
-const BAD_COLOR = '#ff4444';         // false_positive highlight
 
 // --- Mode selector UI ---------------------------------------------------
 for (const m of MODE_ORDER) {
@@ -241,10 +249,9 @@ function draw() {
 
   if (cfg.kind === 'single') {
     const active = activeSingleAt(activeMode, video.currentTime);
-    const isFP = activeMode === 'false_positive';
     for (const d of f.detections) {
       const isActive = active && d.trackID === active.trackID;
-      const color = isActive ? (isFP ? BAD_COLOR : HIGHLIGHT_COLOR) : (LABEL_COLORS[d.label] || '#ffffff');
+      const color = isActive ? cfg.highlightColor : (LABEL_COLORS[d.label] || '#ffffff');
       drawBox(d, w, h, color, isActive ? 4 : 2, isActive);
     }
     updateStatus(f, active);

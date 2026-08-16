@@ -31,8 +31,20 @@ struct DetectionLogEntry: Codable {
         // See DistanceEstimator.swift / Detection.distanceMeters -- nil under
         // the same conditions (no reference pitch captured yet, or invalid
         // ground-plane geometry). Logged so tomorrow's arc-walking test can
-        // be scored offline against the known sign distances.
+        // be scored offline against the known sign distances. May be the
+        // width-based reading, not the row-based one -- see
+        // distanceMetersIsWidthOverridden.
         let distanceMeters: Double?
+        // See WidthDistanceOverride.swift / Detection.widthDistanceMeters --
+        // the width-implied distance, logged regardless of whether the
+        // override actually activated, so its accuracy can be validated
+        // offline against real drive data independent of the hysteresis
+        // gating (see WidthDistanceOverrideManager's PROVISIONAL confidence-
+        // floor doc comment for why this validation matters).
+        let widthDistanceMeters: Double?
+        // True if `distanceMeters` above is currently the width-based
+        // reading rather than the original row-based one.
+        let distanceMetersIsWidthOverridden: Bool
     }
 
     let t: Double
@@ -230,7 +242,9 @@ enum DetectionLogger {
                     w: $0.boundingBox.width,
                     h: $0.boundingBox.height,
                     trackID: $0.trackID,
-                    distanceMeters: $0.distanceMeters
+                    distanceMeters: $0.distanceMeters,
+                    widthDistanceMeters: $0.widthDistanceMeters,
+                    distanceMetersIsWidthOverridden: $0.distanceMetersIsWidthOverridden
                 )
             }
         )

@@ -177,7 +177,15 @@ def draw_hud(frame, entry: dict, thermal: Optional[tuple], frame_index: Optional
             color = HUD_RED_BGR  # blinking on-device isn't reproduced here
         put(f"thermal: {state_text} {percent}%", 12, TOP_ROW_Y, color)
 
-    put(f"two-pass: {'on' if entry['twoPass'] else 'off'}", 12, h - 50, HUD_DEFAULT_COLOR_BGR)
+    # Replaced the old "two-pass" line (2026-08-15, by request -- twoPass is
+    # stale/no longer a meaningful setting to surface here) with the same
+    # "res: ..." reading the live app HUD shows (ContentView.resolutionLabel
+    # / modelManager.currentResolutionLabel, logged per-frame here as
+    # entry["resolution"]) -- this is the detector's input-buffer size
+    # (e.g. "1152x640"/"1920x1088"), NOT the video's raw capture resolution;
+    # matching the live screen's own label was the explicit ask, not adding
+    # a new reading that has no on-screen counterpart.
+    put(f"res: {entry['resolution']}", 12, h - 50, HUD_DEFAULT_COLOR_BGR)
     model_text = MODEL_DISPLAY_NAMES.get(entry["model"], entry["model"])
     put(model_text, 12, h - 12, HUD_DEFAULT_COLOR_BGR)
 

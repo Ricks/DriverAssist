@@ -89,8 +89,8 @@ struct InferenceView: View {
     @State private var showExitConfirmation = false
     /// True while any `StepperButton` is mid-hold (repeat timer running) --
     /// lets `withSessionGestures`'s long-press-to-exit gesture ignore a
-    /// stepper hold-to-repeat past 0.8s instead of popping the exit dialog
-    /// over it. See `withSessionGestures`'s doc comment.
+    /// stepper hold-to-repeat past its ~2s threshold instead of popping the
+    /// exit dialog over it. See `withSessionGestures`'s doc comment.
     @State private var isStepperActive = false
 
     // Drives the critical-thermal blink — `cameraManager.thermalState` only changes
@@ -99,11 +99,12 @@ struct InferenceView: View {
     @State private var thermalBlinkOn = true
     private let thermalBlinkTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
-    // Dashcam usage means the screen is mounted and glanced at, not stared at —
-    // dimming it saves real power over a long drive without losing the HUD's
-    // legibility. Restored on disappear rather than left dim system-wide.
+    // Full brightness for the whole session, by explicit request (2026-08-14)
+    // -- overrides the earlier dashcam-dimming tradeoff (dim while driving to
+    // save power, full only for the level/calibration screens that need to
+    // resolve fine detail). Restored on disappear rather than left changed
+    // system-wide.
     @State private var previousBrightness: CGFloat = UIScreen.main.brightness
-    private static let dimmedBrightness: CGFloat = 0.6
 
     // Freezes model/resolution/low-light/stabilization for the whole drive once
     // chosen on the settings screen -- a one-time decision now (via "Lock
@@ -157,26 +158,29 @@ struct InferenceView: View {
     @State private var currentDistanceMeters = 0
     @State private var currentDistanceCentimeters = 0
 
-    /// True for the whole "Calibration" (`.level`) phase and the whole
-    /// "Distance Calibration" side-flow (however it was entered -- long-
-    /// press from the level screen or the tap toggle on the configuring
-    /// screen -- and through every one of its sub-screens), so the screen
-    /// can go to full brightness for both: both involve eyeballing the live
-    /// camera feed against a real-world dash point (the yaw-reference line,
-    /// or the tape marks themselves), which is much harder to see at the
-    /// normal dimmed dashcam brightness. Deliberately a single derived
-    /// value read by one `onChange` in `body`, rather than threading
-    /// explicit brightness sets through every entry/exit point of this
-    /// side-flow (tap toggle, long-press, Cancel from several different
-    /// screens, natural 3-round completion) -- fewer places to get a
-    /// conditional restore wrong.
-    private var wantsFullBrightness: Bool {
-        sessionPhase == .level
-            || isChoosingTapeMarkCount
-            || tapeMarkDistanceIndex != nil
-            || isCalibrationRecording
-            || distanceCalibrationRound != nil
-    }
+    /// Long-press-on-"Distance cal" menu (see `withDistanceCalGesture`) --
+    /// offers "Tape marks" (the original flow, `beginDistanceCalibration`)
+    /// vs "Walkaround" (`beginWalkaroundRecording`), added 2026-08-15 once
+    /// both flows existed and needed a single shared entry point.
+    @State private var isShowingDistanceCalModePicker = false
+    /// True while the "Distance cal" label is physically being pressed --
+    /// mirrors `isStepperActive`'s exact role: `withSessionGestures`'s
+    /// long-press-to-exit is `.simultaneousGesture`, so it fires
+    /// independently of whatever gesture is attached directly to this
+    /// label, including a plain tap held slightly too long. Without this
+    /// guard, opening the long-press menu on the configuring/driving
+    /// screens (both wrapped in `withSessionGestures`) would also pop the
+    /// exit-confirmation dialog at the same time. Set true on touch-down
+    /// (not after any duration), so it's already up by the time the outer
+    /// gesture's own ~2s could complete.
+    @State private var isDistanceCalLabelPressActive = false
+    /// Long-form recording for the "Walkaround" distance-cal flow -- see
+    /// `beginWalkaroundRecording`. Deliberately separate from
+    /// `isCalibrationRecording` (the tape-marks flow's own state): a
+    /// walkaround recording is manually stopped, minutes long, and doesn't
+    /// go through the tape-marks state machine's rounds/pitch-adjustment
+    /// screens at all.
+    @State private var isWalkaroundRecording = false
 
     private func flashToast(_ text: String) {
         withAnimation { toastText = text }
@@ -244,15 +248,19 @@ struct InferenceView: View {
         withAnimation { sessionPhase = .configuring }
     }
 
-    /// Deliberate, hidden-in-plain-sight tap on either screen's small
-    /// "Distance cal" label -- NOT part of the normal session lifecycle
-    /// (`sessionPhase` doesn't change). 2026-08-11: the level screen's
-    /// trigger used to be a 1.5s long-press instead of a tap, specifically
-    /// so it wouldn't collide with the level screen also needing the
-    /// standard 0.8s long-press-to-exit gesture (`withSessionGestures`) --
-    /// switched to match the configuring screen's tap trigger once that
-    /// was the actual ask, which also freed the level screen up to get the
-    /// exit gesture like every other screen. Kicks off
+    /// Reached only via "Tape marks" on the long-press Distance-cal mode
+    /// picker (`withDistanceCalGesture` / `isShowingDistanceCalModePicker`)
+    /// -- NOT part of the normal session lifecycle (`sessionPhase` doesn't
+    /// change). 2026-08-11: the level screen's trigger used to be a 1.5s
+    /// long-press instead of a tap, specifically so it wouldn't collide with
+    /// the level screen also needing the standard 0.8s long-press-to-exit
+    /// gesture (`withSessionGestures`) -- switched to a tap once that was
+    /// the actual ask. 2026-08-15: replaced by the long-press mode picker,
+    /// then (per explicit request) the plain-tap shortcut into this
+    /// function was removed entirely -- a quick accidental tap on this
+    /// small, permanently-visible label used to drop straight into the
+    /// tape-marks flow with no confirmation, which was the actual problem.
+    /// The label is now inert except for the deliberate long-press. Kicks off
     /// the tape-mark distance-calibration flow: how many tape marks were
     /// placed, then three rounds of "adjust pitch, confirm, record a ~1s
     /// clip" -- gathering reference footage at three different pitches is
@@ -263,9 +271,104 @@ struct InferenceView: View {
     /// later, offline -- this only captures the video + the reference
     /// pitch/roll for each round.
     private func beginDistanceCalibration() {
-        guard !isCalibrationRecording, distanceCalibrationRound == nil else { return }
+        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording else { return }
         initialCalibrationRoll = pitchSensor.rollDegrees
         isChoosingTapeMarkCount = true
+    }
+
+    /// "Walkaround" choice from the Distance-cal long-press menu (see
+    /// `withDistanceCalGesture`) -- added 2026-08-15 after a real
+    /// walkaround session (data/26_08_15_Walkaround) came back unusable:
+    /// accidentally recorded at 4K, and focus drifted onto the near-field
+    /// tape-measure marker the tester holds to maintain each tethered
+    /// distance (that marker is a deliberate, permanent part of this
+    /// test's methodology -- unlike the tape-marks flow, it can't just be
+    /// kept out of frame). Starts a real drive-style recording (1080p,
+    /// "recording-" prefixed, manually stopped, no fixed duration) with
+    /// focus explicitly settled and LOCKED far/infinity for the whole
+    /// clip -- see `CameraManager.startWalkaroundRecording`'s doc comment
+    /// for why normal driving's periodic focus recalibration isn't
+    /// sufficient here. `isWalkaroundRecording` swaps the current screen
+    /// for `walkaroundRecordingBanner` (mirroring `isCalibrationRecording`
+    /// -> `distanceCalibrationRecordingBanner`) until `endWalkaroundRecording`
+    /// is tapped.
+    private func beginWalkaroundRecording() {
+        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording else { return }
+        DebugFileLogger.log("distance-cal: MATCHED beginWalkaroundRecording")
+        cameraManager.startWalkaroundRecording { success in
+            Task { @MainActor in
+                if success {
+                    isWalkaroundRecording = true
+                } else {
+                    DebugFileLogger.log("distance-cal: beginWalkaroundRecording FAILED to start")
+                    flashToast("FAILED TO START RECORDING")
+                }
+            }
+        }
+    }
+
+    /// "Stop" on `walkaroundRecordingBanner`. Deliberately not wrapped in
+    /// `withSessionGestures`'s exit flow -- same reasoning as
+    /// `isCalibrationRecording`'s own banner: exiting the session mid-
+    /// recording would race `exitSession`'s `cameraManager.stop()` against
+    /// this function's own in-flight stop/teardown.
+    private func endWalkaroundRecording() {
+        DebugFileLogger.log("distance-cal: MATCHED endWalkaroundRecording")
+        cameraManager.stopWalkaroundRecording {
+            Task { @MainActor in
+                isWalkaroundRecording = false
+            }
+        }
+    }
+
+    /// Attaches the "Distance cal" label's gesture: ONLY a 0.5s long-press
+    /// reaches it, opening `isShowingDistanceCalModePicker`'s "Tape
+    /// marks"/"Walkaround" choice -- a plain tap is a no-op. 2026-08-15:
+    /// used to also fire `beginDistanceCalibration` directly on a plain tap
+    /// (via `.exclusively(before:)`, so a short tap and a long-press stayed
+    /// mutually exclusive on the same view), but that meant a quick,
+    /// accidental tap on this small, permanently-visible label silently
+    /// dropped straight into the tape-marks flow -- removed by request, so
+    /// the label is now inert except for the deliberate long-press.
+    ///
+    /// Blocked entirely on the level screen (2026-08-15, by request):
+    /// `beginDistanceCalibration`/`beginWalkaroundRecording` only read
+    /// `pitchSensor`'s LIVE roll for their own on-screen display -- the
+    /// actual `referencePitchDegrees`/`referenceRollDegrees`
+    /// `DistanceEstimator` uses for every distance calculation only gets
+    /// (re)captured by `calibrateAttitude()` ("Calibrate" on the level
+    /// screen), or is deliberately reused from whatever was persisted last
+    /// session (`skipCalibration`). Neither tape-marks nor walkaround
+    /// recapture it, so starting either from the level screen -- before
+    /// Calibrate -- would silently record against a stale reference from
+    /// however long ago calibration last actually ran. Reaching the
+    /// configuring screen means calibration already either ran fresh or was
+    /// a deliberate, conscious skip, so this only guards `.level`.
+    ///
+    /// The `.simultaneousGesture(DragGesture(minimumDistance: 0))` exists
+    /// only to flip `isDistanceCalLabelPressActive` -- see that property's
+    /// doc comment for why `withSessionGestures`'s exit gesture needs it
+    /// (same pattern as `StepperButton`/`isStepperActive`).
+    @ViewBuilder
+    private func withDistanceCalGesture<Content: View>(_ label: Content) -> some View {
+        label
+            .gesture(
+                LongPressGesture(minimumDuration: 0.5)
+                    .onEnded { _ in
+                        guard sessionPhase != .level else {
+                            DebugFileLogger.log("gesture: IGNORED longPress(distanceCalModePicker) -- sessionPhase == .level, calibration not complete")
+                            flashToast("CALIBRATE FIRST")
+                            return
+                        }
+                        DebugFileLogger.log("gesture: MATCHED longPress(distanceCalModePicker)")
+                        isShowingDistanceCalModePicker = true
+                    }
+            )
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in isDistanceCalLabelPressActive = true }
+                    .onEnded { _ in isDistanceCalLabelPressActive = false }
+            )
     }
 
     private func cancelDistanceCalibration() {
@@ -526,20 +629,6 @@ struct InferenceView: View {
         cameraManager.setStabilizationEnabled(enabled)
     }
 
-    /// 2026-08-11: added for the cone calibration test -- lets recording switch
-    /// to 4K for the row/column precision it needs, without leaving 4K on for a
-    /// real drive (defaults off, see CameraManager.isFourKEnabled's own comment).
-    /// Deliberately NOT gated by `parametersLocked` the way the other settings
-    /// are -- those stay live-adjustable through Unlocked recording because they
-    /// don't need a session reconfigure, but this one does (see
-    /// `setFourKEnabled`), so it's only meaningful before Lock Settings/Unlocked
-    /// is tapped anyway (level/configuring screens).
-    private func toggleFourK() {
-        let enabled = !cameraManager.isFourKEnabled
-        DebugFileLogger.log("tap: MATCHED setFourK(\(enabled))")
-        cameraManager.setFourKEnabled(enabled)
-    }
-
     init(modelManager: ModelManager) {
         self.modelManager = modelManager
         let pitchSensor = PitchSensor()
@@ -574,7 +663,7 @@ struct InferenceView: View {
             // focus while adjusting pitch and recording -- see
             // beginDistanceCalibration.
             if sessionPhase == .level || sessionPhase == .configuring || sessionPhase == .driving
-                || isCalibrationRecording || distanceCalibrationRound != nil {
+                || isCalibrationRecording || distanceCalibrationRound != nil || isWalkaroundRecording {
                 CameraPreviewView(session: cameraManager.session)
                     .ignoresSafeArea()
             }
@@ -600,6 +689,13 @@ struct InferenceView: View {
                 // (see [[project-following-distance-measurement]]). Only a
                 // few seconds long either way.
                 distanceCalibrationRecordingBanner
+            } else if isWalkaroundRecording {
+                // Deliberately NOT withSessionGestures here either -- same
+                // race-avoidance reasoning as isCalibrationRecording above,
+                // just for endWalkaroundRecording's stop/teardown chain
+                // instead. Unlike that banner, this one has no fixed
+                // duration -- it's up to the user to tap Stop.
+                walkaroundRecordingBanner
             } else if let round = distanceCalibrationRound {
                 withSessionGestures(distanceCalibrationPitchScreen(round: round))
             } else {
@@ -622,6 +718,26 @@ struct InferenceView: View {
             if let toastText {
                 toastView(toastText)
             }
+
+            // Hoisted once here (like toastView above) rather than duplicated
+            // on both levelScreen and configuringScreen -- the two are the
+            // only places `withDistanceCalGesture` attaches, but the picker
+            // itself doesn't care which one triggered it, and a single shared
+            // instance avoids duplicating this exact button list twice in
+            // sync. CONFIRMED 2026-08-15 via a real device screenshot: a
+            // system `.confirmationDialog` here rendered "Tape marks" and
+            // "Walkaround" but silently dropped its own `role: .cancel`
+            // button -- the exact same pattern works fine for the unrelated
+            // exit-confirmation dialog elsewhere in this file (its "No" shows
+            // up correctly), so this wasn't a general role:.cancel bug, just
+            // something specific to this one dialog that wasn't worth
+            // chasing further blind. Replaced with a plain custom overlay
+            // instead, matching every other picker in this app
+            // (`tapeMarkCountPickerOverlay`, etc.) -- fully self-drawn, so
+            // there's no system component left to silently misbehave.
+            if isShowingDistanceCalModePicker {
+                distanceCalModePickerOverlay
+            }
         }
         .onChange(of: inferenceEngine.lastFrameElapsedMs) { _, newValue in
             let configKey = "\(modelManager.selectedModel.rawValue)|\(inferenceEngine.isTwoPassEnabled)"
@@ -636,9 +752,6 @@ struct InferenceView: View {
         .onReceive(thermalBlinkTimer) { _ in
             thermalBlinkOn.toggle()
         }
-        .onChange(of: wantsFullBrightness) { _, wantsFull in
-            UIScreen.main.brightness = wantsFull ? 1.0 : Self.dimmedBrightness
-        }
         .onAppear {
             DebugFileLogger.reset()
             DetectionLogger.reset()
@@ -646,7 +759,7 @@ struct InferenceView: View {
             // drive instead of auto-locking after the idle timeout.
             UIApplication.shared.isIdleTimerDisabled = true
             previousBrightness = UIScreen.main.brightness
-            UIScreen.main.brightness = Self.dimmedBrightness
+            UIScreen.main.brightness = 1.0
             UIDevice.current.isBatteryMonitoringEnabled = true
             batteryLevel = UIDevice.current.batteryLevel
             batteryState = UIDevice.current.batteryState
@@ -788,15 +901,42 @@ struct InferenceView: View {
     /// until that same real-world point sits back on this line, instead of
     /// needing the laser-in-the-V-groove routine every time (see
     /// [[project-following-distance-measurement]]'s yaw-alignment entries).
-    /// `referenceNormalizedX` is the measured X position (as a fraction of
-    /// frame width) of the yellow laser-dot mark in
-    /// `data/26_08_11_YawCalibration/recording-20260811-130522.MOV` --
-    /// captured with yaw zeroed via laser AND roll at zero, in the same
-    /// `.hd1920x1080` preset the live preview uses (`CameraManager.configure`'s
-    /// default), so no FOV/crop mismatch between that reference clip and
-    /// what's on screen now. Measured as the centroid of the dot's pixels
-    /// across two frames 7s apart (1016.6/1920 and 1016.6/1920, i.e.
-    /// stable) -- not eyeballed.
+    ///
+    /// `referenceNormalizedX` was RE-MEASURED 2026-08-15 against
+    /// `data/26_08_15_Walkaround/recording-20260815-123041.MOV` -- a yellow
+    /// stick added to the dash for exactly this purpose, captured with yaw
+    /// deliberately at zero. Superseded the original 2026-08-11 measurement
+    /// (0.5295, from a laser dot in `data/26_08_11_YawCalibration/
+    /// recording-20260811-130522.MOV`) because that clip had
+    /// `stabilizationEnabled: false` logged, while the walkaround clip (and
+    /// the currently-persisted, presumed-normal-driving setting) has it
+    /// `true` -- the same stabilization-crop mismatch already root-caused
+    /// for the tape-mark-vs-cone distance-calibration discrepancy applies
+    /// here too, so the old value was likely already slightly off from what
+    /// the live preview (which runs with whatever stabilization is
+    /// currently persisted) actually shows.
+    ///
+    /// Measurement method: the stick's windshield reflection appears
+    /// directly above the real stick in frame, separated by the dark wiper-
+    /// arm band -- confirmed by visual inspection that the real (bottom,
+    /// sharply-focused, ridged) stick and its (blurrier, offset) reflection
+    /// are distinguishable, and only the real stick's pixels were used.
+    /// Centroid of yellow pixels (`r>180, g>130, b<100`) pooled across 6
+    /// frames (t=150/250/350/450/550/650s, ~192k pixels total) from a
+    /// confirmed-stable window -- frames near the start (t=20-60s) and end
+    /// (t=750-800s) of the recording showed the stick's screen position
+    /// shifted by several percent of frame width, almost certainly from the
+    /// mount/car being disturbed while getting in/out for the test rather
+    /// than during the actual tethered-distance measurements themselves
+    /// (all of which fall inside the stable t=150-650s window). Result:
+    /// centroid x=2482.95 of 3840, normalized 0.6466 -- NOT eyeballed.
+    ///
+    /// Resolution (3840x2160 vs the original 1920x1080) doesn't matter here
+    /// -- both share the same 16:9 aspect ratio, and a normalized X fraction
+    /// is resolution-independent as long as the field of view matches
+    /// (already established: pure resolution changes don't shift normalized
+    /// geometry, only a stabilization/crop change does -- see this file's
+    /// own DistanceEstimator.calibrated history for the precedent).
     ///
     /// `CameraPreviewView`'s `.resizeAspectFill` means this can't just be
     /// `referenceNormalizedX * screenWidth` -- the buffer is scaled to fill
@@ -804,7 +944,7 @@ struct InferenceView: View {
     /// offset has to be computed from the actual runtime view size (device
     /// screen aspect ratio isn't assumed/hardcoded here).
     private struct YawReferenceLine: View {
-        static let referenceNormalizedX: CGFloat = 0.5295
+        static let referenceNormalizedX: CGFloat = 0.6466
         private static let videoWidth: CGFloat = 1920
         private static let videoHeight: CGFloat = 1080
 
@@ -816,7 +956,7 @@ struct InferenceView: View {
                 let x = originX + Self.referenceNormalizedX * displayedWidth
                 Rectangle()
                     .fill(Color.yellow.opacity(0.85))
-                    .frame(width: 2, height: geo.size.height)
+                    .frame(width: 4, height: geo.size.height)
                     .position(x: x, y: geo.size.height / 2)
             }
             // Without this, GeometryReader is only proposed the safe-area-
@@ -848,11 +988,12 @@ struct InferenceView: View {
             // there's no locked/unlocked settings state to show yet).
             VStack {
                 HStack {
-                    Text("Distance cal")
-                        .font(.system(size: 28, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.4))
-                        .shadow(color: .black.opacity(0.6), radius: 2)
-                        .onTapGesture { beginDistanceCalibration() }
+                    withDistanceCalGesture(
+                        Text("Distance cal")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                    )
                     Spacer()
                 }
                 Spacer()
@@ -1211,6 +1352,90 @@ struct InferenceView: View {
         }
     }
 
+    /// Shown in place of sessionPhase's own screen for the whole
+    /// "Walkaround" recording -- see `beginWalkaroundRecording`. Unlike
+    /// `distanceCalibrationRecordingBanner`'s fixed ~1s auto-stop, this has
+    /// no set duration, so it needs its own explicit Stop control.
+    private var walkaroundRecordingBanner: some View {
+        VStack {
+            Text("● WALKAROUND RECORDING (1080p, focus locked far)")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .padding()
+                .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.top, 50)
+            Spacer()
+            Button {
+                endWalkaroundRecording()
+            } label: {
+                Text("Stop")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 32)
+                    .frame(height: 64)
+                    .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 16))
+            }
+            .padding(.bottom, 60)
+        }
+    }
+
+    /// Custom replacement for the system `.confirmationDialog` that used to
+    /// live here -- see body's comment (2026-08-15) for why. A dimmed scrim
+    /// (tap anywhere on it to cancel, matching an action sheet's swipe-down/
+    /// tap-outside dismiss) behind a centered card, styled like every other
+    /// two-choice-plus-cancel screen in this file (`configuringScreen`'s
+    /// "Lock Settings"/"Unlocked" for the two real choices,
+    /// `tapeMarkCountPickerOverlay`'s plain-text Cancel for the third).
+    /// Each button flips `isShowingDistanceCalModePicker` off itself before
+    /// calling its action -- unlike a system dialog, a plain `Button` here
+    /// doesn't auto-dismiss anything.
+    private var distanceCalModePickerOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.6)
+                .ignoresSafeArea()
+                .onTapGesture { isShowingDistanceCalModePicker = false }
+            VStack(spacing: 20) {
+                Text("Distance calibration")
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundStyle(.white)
+                Button {
+                    isShowingDistanceCalModePicker = false
+                    beginDistanceCalibration()
+                } label: {
+                    Text("Tape marks")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 60)
+                        .background(Color.yellow, in: RoundedRectangle(cornerRadius: 16))
+                }
+                Button {
+                    isShowingDistanceCalModePicker = false
+                    beginWalkaroundRecording()
+                } label: {
+                    Text("Walkaround")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 60)
+                        .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 16))
+                }
+                Button {
+                    isShowingDistanceCalModePicker = false
+                } label: {
+                    Text("Cancel")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.top, 4)
+            }
+            .padding(28)
+            .frame(maxWidth: 340)
+            .background(Color(white: 0.12), in: RoundedRectangle(cornerRadius: 20))
+        }
+    }
+
     // MARK: — Configuring screen
 
     /// Sign CONFIRMED 2026-08-08 via bench test: gravityX read -0.99 with the
@@ -1241,14 +1466,13 @@ struct InferenceView: View {
             // doesn't need Lock Settings/Unlocked pressed yet), then start
             // the distance calibration once there.
             settingsHUD {
-                Text(isCalibrationRecording ? "● Recording" : "Distance cal")
-                    .font(.system(size: 28, weight: .medium))
-                    .foregroundStyle(isCalibrationRecording ? .red : .white.opacity(0.4))
-                    .shadow(color: .black.opacity(0.6), radius: 2)
-                    .onTapGesture { beginDistanceCalibration() }
+                withDistanceCalGesture(
+                    Text(isCalibrationRecording ? "● Recording" : "Distance cal")
+                        .font(.system(size: 28, weight: .medium))
+                        .foregroundStyle(isCalibrationRecording ? .red : .white.opacity(0.4))
+                        .shadow(color: .black.opacity(0.6), radius: 2)
+                )
             }
-
-            fourKLabelOverlay(interactive: true)
 
             if cameraOrientationWarning {
                 VStack {
@@ -1312,8 +1536,6 @@ struct InferenceView: View {
                         .shadow(color: .black.opacity(0.6), radius: 2)
                 }
             }
-
-            fourKLabelOverlay(interactive: false)
         }
     }
 
@@ -1357,30 +1579,6 @@ struct InferenceView: View {
         .ignoresSafeArea(edges: [.top, .bottom])
     }
 
-    /// Left side, vertically centered -- deliberately NOT inside `settingsHUD`
-    /// (whose slots are all corner-anchored), used by both configuring and
-    /// driving screens. `interactive` is only true on the configuring screen:
-    /// toggling needs a session reconfigure (see `setFourKEnabled`), which only
-    /// does something immediately when no real recording is in progress yet --
-    /// on the driving screen this is display-only (2026-08-12, for visual
-    /// confirmation of which resolution is actually recording), not tappable,
-    /// so there's no dead tap that looks like it should do something mid-drive.
-    @ViewBuilder
-    private func fourKLabelOverlay(interactive: Bool) -> some View {
-        HStack {
-            Group {
-                if interactive {
-                    Text(fourKLabel).onTapGesture { toggleFourK() }
-                } else {
-                    Text(fourKLabel)
-                }
-            }
-            .hudLabelStyle()
-            Spacer()
-        }
-        .padding(.leading, 12)
-    }
-
     /// Long-press-to-exit, shared by both configuringScreen and
     /// drivingScreen -- not levelScreen, where no session exists yet to
     /// exit. Factored out rather than duplicated so both screens stay in
@@ -1400,18 +1598,37 @@ struct InferenceView: View {
                 // `.simultaneousGesture`, which deliberately does NOT get
                 // blocked by inner views' own gestures (so long-press-to-
                 // exit still works no matter where on screen the touch
-                // starts) -- but that means holding a StepperButton past
-                // 1s to trigger its own hold-to-repeat ALSO satisfies this
-                // 0.8s long-press, popping the exit dialog over what was
-                // meant as "keep incrementing the meters/cm value."
-                // StepperButton flips `isStepperActive` true the instant
-                // its own hold begins (well before 0.8s), so checking it
-                // here reliably suppresses this gesture for that case
-                // without needing real gesture-level exclusivity across
-                // several view-hierarchy levels.
-                LongPressGesture(minimumDuration: 0.8)
+                // starts) -- but that means holding a StepperButton long
+                // enough to trigger its own hold-to-repeat could ALSO
+                // satisfy this long-press, popping the exit dialog over what
+                // was meant as "keep incrementing the meters/cm value."
+                // StepperButton flips `isStepperActive` true the instant its
+                // own hold begins, so checking it here reliably suppresses
+                // this gesture for that case without needing real gesture-
+                // level exclusivity across several view-hierarchy levels.
+                // isDistanceCalLabelPressActive (2026-08-15) does the
+                // identical job for the "Distance cal" label's own
+                // long-press menu -- see its doc comment.
+                //
+                // CONFIRMED bug 2026-08-15: isDistanceCalLabelPressActive
+                // alone wasn't enough -- the label's own long-press fires at
+                // 0.5s and presents `isShowingDistanceCalModePicker`'s
+                // confirmationDialog, which (unlike StepperButton's plain
+                // counter-increment) disrupts the DragGesture(minimumDistance:
+                // 0) the flag depends on, so it could read back false by the
+                // time this gesture's own onEnded fires -- "Exit this
+                // session?" popped up right behind the picker. Checking
+                // `isShowingDistanceCalModePicker` directly closes that gap:
+                // it flips true at the SAME 0.5s mark, from real state (is the
+                // picker actually showing), not from touch-tracking that a
+                // dialog presentation can interrupt.
+                //
+                // Duration raised 0.8s -> 2s (2026-08-15, by request) -- a
+                // deliberate exit action shouldn't be this easy to trigger by
+                // accident during normal handling of the phone.
+                LongPressGesture(minimumDuration: 2.0)
                     .onEnded { _ in
-                        guard !isStepperActive else { return }
+                        guard !isStepperActive, !isDistanceCalLabelPressActive, !isShowingDistanceCalModePicker else { return }
                         DebugFileLogger.log("gesture: MATCHED longPress(exit-prompt)")
                         showExitConfirmation = true
                     }
@@ -1454,10 +1671,6 @@ struct InferenceView: View {
 
     private var stabilizationLabel: String {
         "stabilization: \(cameraManager.isStabilizationEnabled ? "on" : "off")"
-    }
-
-    private var fourKLabel: String {
-        "video: \(cameraManager.isFourKEnabled ? "4K" : "1080p")"
     }
 
     private var thermalLabel: String {
