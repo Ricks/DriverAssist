@@ -319,14 +319,29 @@ struct DistanceEstimator {
     ///     `ObjectWidthPriors` for real (KITTI-derived, not guessed) values.
     ///   - aspectRatio: same as `distanceMeters` -- whichever was actually
     ///     active for this detection.
-    /// - Returns: nil if the box has no width (shouldn't happen for a real
-    ///   detection, but a zero-width box would otherwise divide by zero).
+    /// CONFIRMED 2026-08-16 (real 69-minute test drive,
+    /// data/26_08_16_TestDrive_LowRes_Nano_Day): a plain `> 0` floor isn't
+    /// enough -- a pathologically thin box (a decode/tracking edge case, not
+    /// a real detection: a track about to be dropped, a heavily truncated
+    /// box at the frame edge) divides down to an absurd distance (observed:
+    /// single detections implying tens of thousands of meters, one track's
+    /// distance std alone was over 1000m against a ~55m mean). This floor
+    /// rejects any box wide enough to be a real division-by-near-zero risk
+    /// but not wide enough to plausibly be a real car/pedestrian/cyclist at
+    /// any distance the detector could actually resolve one at.
+    private static let minPlausibleBoxWidthNormalized: Double = 0.003
+
+    /// - Returns: nil if the box has no meaningful width -- either exactly
+    ///   zero (shouldn't happen for a real detection, but would divide by
+    ///   zero) or below `minPlausibleBoxWidthNormalized` (see its own doc
+    ///   comment -- a real division-by-near-zero risk from a degenerate
+    ///   box, not a genuine detection).
     func widthBasedDistanceMeters(
         boxWidthNormalized: Double,
         realWidthMeters: Double,
         aspectRatio: Double
     ) -> Double? {
-        guard boxWidthNormalized > 0 else { return nil }
+        guard boxWidthNormalized >= Self.minPlausibleBoxWidthNormalized else { return nil }
         let focalLengthColumnNormalized = focalLengthNormalized / aspectRatio
         return focalLengthColumnNormalized * realWidthMeters / boxWidthNormalized
     }
@@ -495,10 +510,14 @@ struct DistanceEstimator {
 
         /// Camera's own velocity due to yaw rotation about the rear axle,
         /// in the vehicle's body frame (x = forward, y = left, meters/
-        /// second). Pass `PitchSensor.yawRateDegreesPerSecond` (a live
-        /// reading, unlike pitch/roll's reference-not-live values -- yaw
-        /// RATE is a dynamic quantity, there's no "hill grade" equivalent
-        /// misattribution risk the way a static angle has).
+        /// second). Pass `PitchSensor.smoothedYawRateDegreesPerSecond`, NOT
+        /// the raw `yawRateDegreesPerSecond` -- both are live readings
+        /// (unlike pitch/roll's reference-not-live values -- yaw RATE is a
+        /// dynamic quantity, there's no "hill grade" equivalent
+        /// misattribution risk a static angle has), but CONFIRMED 2026-08-16
+        /// against a real drive that the raw per-frame signal is too noisy
+        /// for a per-frame consumer like this one (see that property's own
+        /// doc comment) -- this is exactly the smoothed value's intended use.
         ///
         /// This is only the rotational term -- for the camera's TOTAL
         /// body-frame velocity, add the vehicle's own forward (translational)

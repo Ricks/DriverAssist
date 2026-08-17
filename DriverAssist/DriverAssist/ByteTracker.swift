@@ -61,6 +61,12 @@ final class ByteTracker {
     private let gmc: GMC?
     private let embedder: AppearanceEmbedder?
 
+    /// Wall-clock time of the previous `update` call -- used only to size the
+    /// yaw-rate fallback transform below (needs an actual elapsed-seconds dt,
+    /// not an assumed fixed frame interval, since inference cadence isn't
+    /// perfectly regular). nil before the first call.
+    private var lastUpdateTime: CFAbsoluteTime?
+
     init(
         iouThreshold: Double = 0.2,
         maxAge: Int = 5,
@@ -88,11 +94,22 @@ final class ByteTracker {
     /// extend an existing track), plus this frame's GMC quality stats.
     /// `pixelBuffer`, if given, feeds GMC and appearance embedding -- omit it
     /// (or pass useGMC:false / embedder:nil at init) to run geometry-only.
-    func update(_ detections: [Detection], pixelBuffer: CVPixelBuffer?) -> TrackingResult {
+    /// `yawRateDegreesPerSecond`, if given, should be
+    /// `PitchSensor.smoothedYawRateDegreesPerSecond` -- see
+    /// `yawFallbackTransform` below for how (and how narrowly) it's used.
+    func update(
+        _ detections: [Detection],
+        pixelBuffer: CVPixelBuffer?,
+        yawRateDegreesPerSecond: Double? = nil
+    ) -> TrackingResult {
         for t in tracks {
             t.kf.predict()
             t.age += 1
         }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let dt = lastUpdateTime.map { now - $0 }
+        lastUpdateTime = now
 
         var gmcStats: GMCStats?
         if let gmc, let pixelBuffer, !tracks.isEmpty {
@@ -100,8 +117,24 @@ final class ByteTracker {
             gmcStats = result.stats
             let w = Double(CVPixelBufferGetWidth(pixelBuffer))
             let h = Double(CVPixelBufferGetHeight(pixelBuffer))
+
+            // GMC reports transform == .identity (no compensation at all)
+            // whenever it didn't trust its own optical-flow fit (see
+            // GMC.minTrustedInlierCount) -- that's exactly the gap the
+            // CoreMotion-derived fallback below fills, rather than silently
+            // matching against un-compensated predictions during a real turn.
+            let gmcUntrusted = result.stats == nil || result.stats!.inlierCount < GMC.minTrustedInlierCount
+            var transform = result.transform
+            if gmcUntrusted, let yawRateDegreesPerSecond, let dt, dt > 0, dt < 1.0 {
+                transform = Self.yawFallbackTransform(
+                    yawRateDegreesPerSecond: yawRateDegreesPerSecond,
+                    dt: dt,
+                    frameHeightPx: h
+                )
+            }
+
             for t in tracks {
-                t.kf.applyGMC(result.transform, frameWidth: w, frameHeight: h)
+                t.kf.applyGMC(transform, frameWidth: w, frameHeight: h)
             }
         }
 
@@ -258,6 +291,52 @@ final class ByteTracker {
         let unmatchedTracks = trackBoxes.indices.filter { !matchedTracks.contains($0) }
         let unmatchedDets = detBoxes.indices.filter { !matchedDets.contains($0) }
         return (matches, unmatchedTracks, unmatchedDets)
+    }
+
+    /// Rotation-only camera-pan estimate built from gyro yaw rate instead of
+    /// GMC's own optical flow -- used ONLY when GMC didn't trust its fit for
+    /// this frame (see the `gmcUntrusted` check above), never to override a
+    /// trusted vision-based result. Vision-based GMC stays the primary
+    /// source because it observes the ACTUAL pixel motion (real lens/crop/
+    /// stabilization behavior included); this fallback is a coarser model
+    /// that only exists so a low-texture or fast-optical-flow-failure frame
+    /// doesn't fall all the way back to *no* compensation (.identity) during
+    /// a genuine turn, which is exactly when GMC is most likely to strain
+    /// (large frame-to-frame motion) and a missed compensation would most
+    /// hurt matching.
+    ///
+    /// Deliberately rotation-only (no translation/scale term), matching
+    /// GMC's own file-level scope note ("Only rotation/pan/tilt is corrected
+    /// this way -- forward-motion parallax needs per-object depth to
+    /// compensate properly and isn't attempted here"): the vehicle's own
+    /// forward speed and the lever-arm's translational yaw component (see
+    /// DistanceEstimator.LeverArm) both shift each background point by an
+    /// amount that depends on that point's own depth, so neither can be
+    /// expressed as a single frame-wide pixel transform the way a pure
+    /// rotation can -- only the rotational term is used here, deliberately
+    /// dropping the (depth-dependent, unmodelable this way) translational
+    /// ones rather than approximating them badly.
+    ///
+    /// Derivation: a camera yaw of dTheta radians (positive = turning left,
+    /// matching PitchSensor's convention) rotates every world point's
+    /// bearing by -dTheta in the camera's own frame, which -- for the
+    /// small per-frame angles this is actually evaluated at -- shifts a
+    /// point's image column by approximately +pixelFocalLength * dTheta
+    /// (turning left => the background shifts right in frame, same as
+    /// turning your own head left makes the world appear to slide right).
+    /// `pixelFocalLength` reuses DistanceEstimator's calibrated
+    /// (row-normalized) focal length directly against the actual pixel
+    /// buffer height -- valid for the column axis too under the same
+    /// square-pixel assumption DistanceEstimator itself already makes
+    /// (see its `focalLengthColumnNormalized` comment).
+    private static func yawFallbackTransform(
+        yawRateDegreesPerSecond: Double,
+        dt: Double,
+        frameHeightPx: Double
+    ) -> SimilarityTransform {
+        let dThetaRadians = yawRateDegreesPerSecond * .pi / 180 * dt
+        let pixelFocalLength = DistanceEstimator.calibrated.focalLengthNormalized * frameHeightPx
+        return SimilarityTransform(a: 1, b: 0, tx: pixelFocalLength * dThetaRadians, ty: 0)
     }
 
     private func diagonal(_ box: TrackedBox) -> Double {

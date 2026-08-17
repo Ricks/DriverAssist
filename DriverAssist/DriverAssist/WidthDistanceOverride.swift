@@ -112,6 +112,12 @@ final class WidthDistanceOverrideManager {
     /// would neuter the feature's actual purpose. This just guards against
     /// an absurd claim (e.g. "0.3m away"), not ordinary large corrections.
     private let maxOverrideCloserFraction: Double
+    /// Absolute plausibility ceiling (meters) for EITHER candidate distance
+    /// before the override is even considered -- see the CONFIRMED comment
+    /// in `evaluateGate`. This feature exists for near-field correction; a
+    /// candidate this far out is never something the override should be
+    /// deciding between, regardless of which formula produced it.
+    private static let maxPlausibleDistanceMeters: Double = 150
     private let confirmFrames: Int
     private let graceFrames: Int
 
@@ -225,6 +231,20 @@ final class WidthDistanceOverrideManager {
             aspectRatio: aspectRatio
         ) else { return false }
         detection.widthDistanceMeters = widthDistance
+
+        // CONFIRMED 2026-08-16 (real test drive): the trigger below is a pure
+        // RATIO comparison (is width closer than row) -- it has no absolute
+        // sense of "plausible". `widthBasedDistanceMeters`'s own floor
+        // catches a degenerate box width, but row-based can independently
+        // degenerate too (phi near zero, from a detection near the modeled
+        // horizon), and a "closer than an already-absurd row reading" result
+        // is still absurd. This is a near-field correction tool -- neither
+        // candidate belongs anywhere near this range regardless of which
+        // formula produced it, so reject the frame outright rather than let
+        // the ratio check compare two nonsense numbers and pick a winner.
+        guard rowDistance <= Self.maxPlausibleDistanceMeters, widthDistance <= Self.maxPlausibleDistanceMeters else {
+            return false
+        }
 
         let phiDegrees = atan(cameraHeightMeters / rowDistance) * 180 / .pi
         let isNearCutoff = phiDegrees <= DistanceEstimator.hoodCutoffAngleDegrees + nearCutoffMarginDegrees

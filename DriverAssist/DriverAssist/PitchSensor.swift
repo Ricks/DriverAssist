@@ -93,10 +93,45 @@ final class PitchSensor: ObservableObject {
     /// of mount tilt/orientation -- unlike picking one of the three raw axes
     /// by guessing, it doesn't assume anything about how the phone sits in
     /// the mount, since `attitude` already captures that. Sign confirmed via
-    /// bench test 2026-08-06 (see the top-of-file note) -- magnitude/accuracy
-    /// still needs real-drive validation before this is trustworthy for
-    /// anything quantitative.
+    /// bench test 2026-08-06 (see the top-of-file note).
+    ///
+    /// MAGNITUDE VALIDATED 2026-08-16 against a real 69-minute test drive
+    /// (data/26_08_16_TestDrive_LowRes_Nano_Day): the signal is real -- a
+    /// genuine sustained turn showed a clean multi-second cluster of
+    /// consistently-signed readings, correlated with a matching roll
+    /// excursion from the same turn. But at the single-frame level it's
+    /// noisy: even during calm, mostly-straight driving, frame-to-frame
+    /// swings as large as +-25 deg/s showed up, about the same magnitude as
+    /// during the rest of the drive. Raw, this is NOT smooth enough for
+    /// anything that consumes per-frame values (e.g. per-frame tracking
+    /// position correction) -- see `smoothedYawRateDegreesPerSecond` for the
+    /// filtered version meant for that. This raw property stays unfiltered
+    /// on purpose ("log raw, don't pre-resolve" -- same reasoning as
+    /// `rotationRate`'s three axes above).
     @Published private(set) var yawRateDegreesPerSecond: Double?
+
+    /// Exponential moving average of `yawRateDegreesPerSecond`, meant for
+    /// any future per-frame consumer (e.g. `DistanceEstimator.LeverArm
+    /// .cameraVelocityFromYaw`-driven tracking-position correction) that
+    /// raw, per-frame yaw rate is too noisy for -- see that property's own
+    /// doc comment for the real-drive evidence this responds to. nil until
+    /// the first sample arrives (seeded directly from it, not blended from
+    /// an arbitrary starting value).
+    ///
+    /// `yawRateSmoothingAlpha`'s value: derived from a chosen ~0.3s time
+    /// constant at the sensor's 15Hz update rate (`alpha = 1 -
+    /// exp(-dt/tau)`, dt=1/15s, tau=0.3s -> alpha ~= 0.2). Picked to sit
+    /// comfortably below the several-second timescale the real turn event
+    /// unfolded over (so real cornering isn't smeared out) while still
+    /// meaningfully suppressing frame-level noise -- for i.i.d. noise an EMA
+    /// reduces variance by a factor of alpha/(2-alpha), i.e. this should cut
+    /// the measured ~3.6 deg/s calm-driving noise std down to roughly a
+    /// third of that, ~1.2 deg/s. Not yet independently confirmed against a
+    /// second real drive -- if this turns out too laggy or too noisy once
+    /// there's an actual consumer to judge it against, retune `tau`, not
+    /// the EMA structure itself.
+    @Published private(set) var smoothedYawRateDegreesPerSecond: Double?
+    private static let yawRateSmoothingAlpha: Double = 0.2
 
     /// Rotation about the camera's own forward (boresight) axis -- how
     /// tilted the video frame's horizon is, i.e. "degrees from level" for
@@ -236,7 +271,14 @@ final class PitchSensor: ObservableObject {
             let r = motion.attitude.rotationMatrix
             let omega = motion.rotationRate
             let yawRateRadPerSecond = r.m31 * omega.x + r.m32 * omega.y + r.m33 * omega.z
-            self?.yawRateDegreesPerSecond = yawRateRadPerSecond * 180 / .pi
+            let rawYawRate = yawRateRadPerSecond * 180 / .pi
+            self?.yawRateDegreesPerSecond = rawYawRate
+            if let previousSmoothed = self?.smoothedYawRateDegreesPerSecond {
+                self?.smoothedYawRateDegreesPerSecond = Self.yawRateSmoothingAlpha * rawYawRate
+                    + (1 - Self.yawRateSmoothingAlpha) * previousSmoothed
+            } else {
+                self?.smoothedYawRateDegreesPerSecond = rawYawRate
+            }
             self?.userAccelerationX = motion.userAcceleration.x
             self?.userAccelerationY = motion.userAcceleration.y
             self?.userAccelerationZ = motion.userAcceleration.z

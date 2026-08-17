@@ -378,7 +378,11 @@ final class InferenceEngine: ObservableObject {
         parametersLocked: Bool
     ) {
         let trackingStart = CFAbsoluteTimeGetCurrent()
-        let result = trackingManager.track(detections, pixelBuffer: pixelBuffer)
+        let result = trackingManager.track(
+            detections,
+            pixelBuffer: pixelBuffer,
+            yawRateDegreesPerSecond: pitchSensor.smoothedYawRateDegreesPerSecond
+        )
         let trackingElapsedMs = (CFAbsoluteTimeGetCurrent() - trackingStart) * 1000
         let rangedDetections = Self.attachDistances(
             to: result.detections,
@@ -421,6 +425,7 @@ final class InferenceEngine: ObservableObject {
             rotationRateYDegreesPerSecond: pitchSensor.rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: pitchSensor.rotationRateZDegreesPerSecond,
             yawRateDegreesPerSecond: pitchSensor.yawRateDegreesPerSecond,
+            smoothedYawRateDegreesPerSecond: pitchSensor.smoothedYawRateDegreesPerSecond,
             rollDegrees: pitchSensor.rollDegrees,
             rollDriftDegrees: pitchSensor.rollDriftDegrees,
             referenceRollDegrees: pitchSensor.referenceRollDegrees,

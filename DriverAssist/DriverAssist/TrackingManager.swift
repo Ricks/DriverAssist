@@ -40,9 +40,15 @@ final class TrackingManager: ObservableObject {
 
     /// Returns detections with `trackID` populated, plus this frame's GMC
     /// stats. Call once per completed inference, in chronological order --
-    /// the tracker is stateful.
-    func track(_ detections: [Detection], pixelBuffer: CVPixelBuffer?) -> TrackingResult {
-        tracker.update(detections, pixelBuffer: pixelBuffer)
+    /// the tracker is stateful. Pass `PitchSensor.smoothedYawRateDegreesPerSecond`
+    /// as `yawRateDegreesPerSecond` -- see `ByteTracker.update`'s doc comment
+    /// for exactly how (and how narrowly) it's used.
+    func track(
+        _ detections: [Detection],
+        pixelBuffer: CVPixelBuffer?,
+        yawRateDegreesPerSecond: Double? = nil
+    ) -> TrackingResult {
+        tracker.update(detections, pixelBuffer: pixelBuffer, yawRateDegreesPerSecond: yawRateDegreesPerSecond)
     }
 
     private static func makeTracker(for level: TrackingLevel) -> ByteTracker {

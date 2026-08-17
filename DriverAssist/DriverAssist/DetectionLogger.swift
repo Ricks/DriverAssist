@@ -118,6 +118,12 @@ struct DetectionLogEntry: Codable {
     // Logged alongside the raw axes (not instead of) so the resolved value
     // can be cross-checked against real observed turns.
     let yawRateDegreesPerSecond: Double?
+    // See PitchSensor.smoothedYawRateDegreesPerSecond -- logged alongside
+    // the raw value (not instead of) so the EMA's tuning (alpha, chosen
+    // 2026-08-16 from one real drive's noise characteristics) can be
+    // validated/retuned against a real turn in a FUTURE drive without
+    // needing to guess from the raw signal alone.
+    let smoothedYawRateDegreesPerSecond: Double?
     // Same gravity-derived, non-drifting property as pitch -- see PitchSensor.swift.
     let rollDegrees: Double?
     // Same idea as pitchDriftDegrees/referencePitchDegrees above, for roll.
@@ -186,6 +192,7 @@ enum DetectionLogger {
         rotationRateYDegreesPerSecond: Double?,
         rotationRateZDegreesPerSecond: Double?,
         yawRateDegreesPerSecond: Double?,
+        smoothedYawRateDegreesPerSecond: Double?,
         rollDegrees: Double?,
         rollDriftDegrees: Double?,
         referenceRollDegrees: Double?,
@@ -224,6 +231,7 @@ enum DetectionLogger {
             rotationRateYDegreesPerSecond: rotationRateYDegreesPerSecond,
             rotationRateZDegreesPerSecond: rotationRateZDegreesPerSecond,
             yawRateDegreesPerSecond: yawRateDegreesPerSecond,
+            smoothedYawRateDegreesPerSecond: smoothedYawRateDegreesPerSecond,
             rollDegrees: rollDegrees,
             rollDriftDegrees: rollDriftDegrees,
             referenceRollDegrees: referenceRollDegrees,

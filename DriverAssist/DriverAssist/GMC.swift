@@ -78,6 +78,16 @@ final class GMC {
     private let ransacIterations = 50
     private let inlierThresholdPx: Double = 2.0
 
+    /// Minimum inlier count for a fitted transform to be trusted -- below
+    /// this, `estimate` falls back to `.identity` rather than a fit it
+    /// doesn't trust (see both call sites below). Exposed (not just a local
+    /// magic number) so ByteTracker can recognize this same "GMC gave up"
+    /// condition from `GMCStats.inlierCount` and swap in its own yaw-rate-
+    /// based fallback instead of silently accepting identity (no
+    /// compensation at all) on frames where vision-based GMC is degraded --
+    /// see ByteTracker.update's yaw fallback.
+    static let minTrustedInlierCount = 6
+
     private let sequenceHandler = VNSequenceRequestHandler()
     private var havePreviousFrame = false
 
@@ -113,7 +123,7 @@ final class GMC {
         }
 
         let correspondences = sampleFlowGrid(from: observation.pixelBuffer, sourceWidth: CVPixelBufferGetWidth(pixelBuffer), sourceHeight: CVPixelBufferGetHeight(pixelBuffer))
-        guard correspondences.count >= 6 else {
+        guard correspondences.count >= Self.minTrustedInlierCount else {
             return (.identity, correspondences.count, 0)
         }
 
@@ -183,7 +193,7 @@ final class GMC {
             }
         }
 
-        guard let bestModel = best, bestInlierCount >= 6 else { return (nil, bestInlierCount) }
+        guard let bestModel = best, bestInlierCount >= Self.minTrustedInlierCount else { return (nil, bestInlierCount) }
         let inliers = correspondences.filter { residual($0, bestModel) < inlierThresholdPx }
         return (leastSquaresFit(inliers) ?? bestModel, bestInlierCount)
     }

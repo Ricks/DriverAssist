@@ -22,11 +22,18 @@ struct ContentView: View {
 private extension View {
     /// Shared look for the settings HUD's text labels — legible over live
     /// video, dimmed slightly so it doesn't compete with detection overlays.
+    /// The translucent black backing (2026-08-16, by request) is what
+    /// actually carries readability at a glance while driving -- text
+    /// shadow alone wasn't enough contrast against a bright/busy background
+    /// (sky, pavement, oncoming headlights).
     func hudLabelStyle() -> some View {
         self
             .font(.system(size: 36, weight: .medium))
-            .foregroundStyle(.white.opacity(0.75))
+            .foregroundStyle(.white.opacity(0.9))
             .shadow(color: .black.opacity(0.6), radius: 2)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
