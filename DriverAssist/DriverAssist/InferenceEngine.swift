@@ -255,11 +255,16 @@ final class InferenceEngine: ObservableObject {
     /// across the screen bounds.
     @Published private(set) var sourceSize: CGSize = .zero
     @Published private(set) var isTwoPassEnabled = false
-    /// Wall-clock time the most recently completed frame took end to end --
-    /// decoder inference plus tracking/GMC (see `finishSuccess`), in ms —
-    /// feeds `CameraManager.recordInferenceLatency` for the thermal "% of
-    /// full speed" metric. Includes tracking so GMC's real cost shows up in
-    /// that number instead of silently going uncounted.
+    /// Wall-clock time the most recently completed frame took end to end,
+    /// in ms -- feeds `CameraManager.recordInferenceLatency` for the
+    /// thermal "% of full speed" metric. UPDATED 2026-08-16: measured
+    /// directly as (now - startTime) in `finishSuccess`, not as
+    /// elapsedMs + trackingElapsedMs -- inference and GMC now run
+    /// CONCURRENTLY (see `process`'s `gmcTask`), so summing their
+    /// individually-measured costs would double-count the overlapped
+    /// portion and overstate real latency. A direct start-to-finish
+    /// measurement stays correct regardless of how much internal overlap
+    /// there is.
     @Published private(set) var lastFrameElapsedMs: Double = 0
 
     private let modelManager: ModelManager
@@ -334,6 +339,25 @@ final class InferenceEngine: ObservableObject {
         let modelLabel = modelManager.selectedModel.rawValue
         let resolutionLabel = modelManager.actualInputResolutionLabel
 
+        // Kicked off now, CONCURRENTLY with the CoreML inference dispatched
+        // below -- GMC (see TrackingManager.computeGMC) only ever needs
+        // this frame's pixel buffer, never the detections inference
+        // produces, so there's no real dependency forcing these to run one
+        // after the other. Runs on MainActor, same as tracking always has
+        // (this only changes WHEN GMC runs, not what thread it runs on),
+        // so it genuinely overlaps with inference's background `queue`
+        // work below without requiring ByteTracker/TrackingManager to
+        // become thread-safe for arbitrary background-queue access.
+        //
+        // CONFIRMED 2026-08-16 against real drive data: before this split,
+        // GMC only started once inference's detections already existed --
+        // pure unforced serialization, costing roughly 40% more combined
+        // per-frame latency than necessary (mean 80.9ms measured vs.
+        // ~46.5ms estimated once overlapped).
+        let gmcTask = Task { @MainActor [weak self] in
+            self?.trackingManager.computeGMC(pixelBuffer: pixelBufferBox.value)
+        }
+
         queue.async { [weak self] in
             do {
                 let detections = try decoder.run(
@@ -344,10 +368,13 @@ final class InferenceEngine: ObservableObject {
                 let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
 
                 Task { @MainActor [weak self] in
+                    let gmcResult = await gmcTask.value
                     self?.finishSuccess(
                         detections,
                         pixelBuffer: pixelBufferBox.value,
+                        gmcResult: gmcResult,
                         elapsedMs: elapsedMs,
+                        startTime: startTime,
                         modelLabel: modelLabel,
                         resolutionLabel: resolutionLabel,
                         twoPass: twoPass,
@@ -358,6 +385,19 @@ final class InferenceEngine: ObservableObject {
                     )
                 }
             } catch {
+                // gmcTask still runs to completion on its own even though
+                // its result is discarded here -- GMC's internal
+                // "previous frame" reference advances regardless of
+                // whether inference succeeded, which is a small,
+                // deliberate behavior change from before this split (GMC
+                // used to only run inside a successful finishSuccess, so
+                // it silently skipped frames where inference failed).
+                // Camera motion between two real captured frames doesn't
+                // depend on whether the detector managed to run on them,
+                // so this is arguably more correct, not less -- and
+                // inference failures are rare (a genuine CoreML runtime
+                // error, not the "no model loaded yet" case, which returns
+                // before isBusy/gmcTask even start).
                 Task { @MainActor [weak self] in
                     self?.finishFailure(error)
                 }
@@ -368,7 +408,9 @@ final class InferenceEngine: ObservableObject {
     private func finishSuccess(
         _ detections: [Detection],
         pixelBuffer: CVPixelBuffer,
+        gmcResult: GMCResult?,
         elapsedMs: Double,
+        startTime: CFAbsoluteTime,
         modelLabel: String,
         resolutionLabel: String,
         twoPass: Bool,
@@ -381,6 +423,7 @@ final class InferenceEngine: ObservableObject {
         let result = trackingManager.track(
             detections,
             pixelBuffer: pixelBuffer,
+            gmcResult: gmcResult,
             yawRateDegreesPerSecond: pitchSensor.smoothedYawRateDegreesPerSecond
         )
         let trackingElapsedMs = (CFAbsoluteTimeGetCurrent() - trackingStart) * 1000
@@ -399,7 +442,11 @@ final class InferenceEngine: ObservableObject {
         )
         self.lastError = nil
         self.isBusy = false
-        self.lastFrameElapsedMs = elapsedMs + trackingElapsedMs
+        // Real overlapped wall-clock latency (startTime -> now), NOT
+        // elapsedMs + trackingElapsedMs -- see this property's own doc
+        // comment for why that sum would overstate real latency now that
+        // GMC runs concurrently with inference instead of inside tracking.
+        self.lastFrameElapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
         DetectionLogger.log(
             timestamp: Date().timeIntervalSince1970,
             drivingSide: DrivingSideSetting.current,

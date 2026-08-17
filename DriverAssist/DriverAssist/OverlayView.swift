@@ -47,7 +47,7 @@ struct OverlayView: View {
         // .swift) so it's visually distinguishable on a live drive from an
         // ordinary row-based reading, not just in the logs afterward.
         let metric = detection.distanceMeters.map {
-            String(format: "%.1fm\(detection.distanceMetersIsWidthOverridden ? "w" : "")", $0)
+            String(format: "%.2fm\(detection.distanceMetersIsWidthOverridden ? "w" : "")", $0)
         } ?? "\(Int(detection.confidence * 100))%"
         let idPrefix = detection.trackID.map { "#\($0) " } ?? ""
         let label = Text("\(idPrefix)\(detection.label) \(metric)")

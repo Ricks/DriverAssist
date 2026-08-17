@@ -38,17 +38,33 @@ final class TrackingManager: ObservableObject {
         tracker = Self.makeTracker(for: level)
     }
 
+    /// Runs GMC's optical-flow motion estimate for `pixelBuffer` -- see
+    /// `ByteTracker.computeGMC`'s doc comment. Call this CONCURRENTLY with
+    /// this frame's inference (see InferenceEngine.process's `gmcTask`),
+    /// then pass the result into `track(...)`'s `gmcResult` parameter once
+    /// both are ready.
+    func computeGMC(pixelBuffer: CVPixelBuffer) -> GMCResult? {
+        tracker.computeGMC(pixelBuffer: pixelBuffer)
+    }
+
     /// Returns detections with `trackID` populated, plus this frame's GMC
     /// stats. Call once per completed inference, in chronological order --
-    /// the tracker is stateful. Pass `PitchSensor.smoothedYawRateDegreesPerSecond`
-    /// as `yawRateDegreesPerSecond` -- see `ByteTracker.update`'s doc comment
-    /// for exactly how (and how narrowly) it's used.
+    /// the tracker is stateful. Pass `computeGMC`'s result as `gmcResult`
+    /// and `PitchSensor.smoothedYawRateDegreesPerSecond` as
+    /// `yawRateDegreesPerSecond` -- see `ByteTracker.update`'s doc comment
+    /// for exactly how (and how narrowly) each is used.
     func track(
         _ detections: [Detection],
         pixelBuffer: CVPixelBuffer?,
+        gmcResult: GMCResult?,
         yawRateDegreesPerSecond: Double? = nil
     ) -> TrackingResult {
-        tracker.update(detections, pixelBuffer: pixelBuffer, yawRateDegreesPerSecond: yawRateDegreesPerSecond)
+        tracker.update(
+            detections,
+            pixelBuffer: pixelBuffer,
+            gmcResult: gmcResult,
+            yawRateDegreesPerSecond: yawRateDegreesPerSecond
+        )
     }
 
     private static func makeTracker(for level: TrackingLevel) -> ByteTracker {

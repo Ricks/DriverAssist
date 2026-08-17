@@ -31,6 +31,16 @@ private extension View {
             .font(.system(size: 36, weight: .medium))
             .foregroundStyle(.white.opacity(0.9))
             .shadow(color: .black.opacity(0.6), radius: 2)
+            .hudBoxBackground()
+    }
+
+    /// Just the translucent box from `hudLabelStyle` above, without the
+    /// fixed white foreground -- for HUD labels (recording/thermal status,
+    /// 2026-08-16, by request) that need their own dynamic color (red when
+    /// unhealthy, thermal-state color) but should still get the same
+    /// at-a-glance-while-driving readability treatment.
+    func hudBoxBackground() -> some View {
+        self
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
             .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
@@ -909,41 +919,62 @@ struct InferenceView: View {
     /// needing the laser-in-the-V-groove routine every time (see
     /// [[project-following-distance-measurement]]'s yaw-alignment entries).
     ///
-    /// `referenceNormalizedX` was RE-MEASURED 2026-08-15 against
-    /// `data/26_08_15_Walkaround/recording-20260815-123041.MOV` -- a yellow
-    /// stick added to the dash for exactly this purpose, captured with yaw
-    /// deliberately at zero. Superseded the original 2026-08-11 measurement
-    /// (0.5295, from a laser dot in `data/26_08_11_YawCalibration/
-    /// recording-20260811-130522.MOV`) because that clip had
-    /// `stabilizationEnabled: false` logged, while the walkaround clip (and
-    /// the currently-persisted, presumed-normal-driving setting) has it
-    /// `true` -- the same stabilization-crop mismatch already root-caused
-    /// for the tape-mark-vs-cone distance-calibration discrepancy applies
-    /// here too, so the old value was likely already slightly off from what
-    /// the live preview (which runs with whatever stabilization is
-    /// currently persisted) actually shows.
+    /// `referenceNormalizedX` was RE-MEASURED 2026-08-16 against
+    /// `data/26_08_16_TestDrive_LowRes_Nano_Day/recording-20260816-132942.MOV`
+    /// -- the same dash-mounted yellow stick, after Rick slightly realigned
+    /// the mount's yaw before this drive (confirmed: the realignment was
+    /// done before recording started, not mid-drive, so the whole clip
+    /// reflects the one, current alignment). Superseded the 2026-08-15
+    /// measurement below because the mount was physically touched since
+    /// then -- same reasoning as that entry superseding 2026-08-11's: a
+    /// screen-space reference line is only as good as the last time the
+    /// real mount was measured, not assumed stable indefinitely.
     ///
-    /// Measurement method: the stick's windshield reflection appears
-    /// directly above the real stick in frame, separated by the dark wiper-
-    /// arm band -- confirmed by visual inspection that the real (bottom,
-    /// sharply-focused, ridged) stick and its (blurrier, offset) reflection
-    /// are distinguishable, and only the real stick's pixels were used.
-    /// Centroid of yellow pixels (`r>180, g>130, b<100`) pooled across 6
-    /// frames (t=150/250/350/450/550/650s, ~192k pixels total) from a
-    /// confirmed-stable window -- frames near the start (t=20-60s) and end
-    /// (t=750-800s) of the recording showed the stick's screen position
-    /// shifted by several percent of frame width, almost certainly from the
-    /// mount/car being disturbed while getting in/out for the test rather
-    /// than during the actual tethered-distance measurements themselves
-    /// (all of which fall inside the stable t=150-650s window). Result:
-    /// centroid x=2482.95 of 3840, normalized 0.6466 -- NOT eyeballed.
+    /// Measurement method: same as 2026-08-15 below -- centroid of yellow
+    /// pixels (`r>180, g>130, b<100`) within a fixed ROI around the real
+    /// (bottom, sharply-focused) stick, avoiding its blurrier windshield
+    /// reflection above the wiper-arm band. Pooled across 11 frames (t=600/
+    /// 800/1000/1200/1500/2100/2400/3000/3600/3900/4000s, ~125k pixels
+    /// total) spanning nearly the full 69-minute drive. 5 other candidate
+    /// frames were excluded: one (t=200s, near the start) read notably off
+    /// from the rest of the cluster (cx 1194.8 vs. a ~1245-1257 cluster,
+    /// consistent with the same "unstable near the start" pattern the
+    /// 2026-08-15 measurement found); four others (t=400/1800/2700/3300s)
+    /// returned under 5k yellow pixels each (one as low as 324) against a
+    /// healthy ~11k on good frames -- almost certainly glare or a passing
+    /// shadow partially washing out the stick, not a real position change,
+    /// but their centroids were also visibly biased (lower cy) so excluded
+    /// rather than trusted. Result: pooled centroid x=1251.35 of 1920,
+    /// normalized 0.6517 -- NOT eyeballed. Only ~10px (~0.5%) from the
+    /// prior 0.6466, consistent with Rick's own description of the
+    /// adjustment as "slight."
     ///
-    /// Resolution (3840x2160 vs the original 1920x1080) doesn't matter here
-    /// -- both share the same 16:9 aspect ratio, and a normalized X fraction
-    /// is resolution-independent as long as the field of view matches
-    /// (already established: pure resolution changes don't shift normalized
-    /// geometry, only a stabilization/crop change does -- see this file's
-    /// own DistanceEstimator.calibrated history for the precedent).
+    /// (2026-08-15 measurement, superseded above -- kept for history:
+    /// against `data/26_08_15_Walkaround/recording-20260815-123041.MOV`, a
+    /// yellow stick added to the dash for exactly this purpose, captured
+    /// with yaw deliberately at zero. That measurement itself superseded
+    /// the original 2026-08-11 measurement (0.5295, from a laser dot in
+    /// `data/26_08_11_YawCalibration/recording-20260811-130522.MOV`)
+    /// because that clip had `stabilizationEnabled: false` logged, while
+    /// the walkaround clip had it `true` -- the same stabilization-crop
+    /// mismatch already root-caused for the tape-mark-vs-cone distance-
+    /// calibration discrepancy applied here too. Centroid of yellow pixels
+    /// pooled across 6 frames (t=150/250/350/450/550/650s, ~192k pixels
+    /// total) from a confirmed-stable window -- frames near the start
+    /// (t=20-60s) and end (t=750-800s) of that recording showed the
+    /// stick's screen position shifted by several percent of frame width,
+    /// almost certainly from the mount/car being disturbed while getting
+    /// in/out for the test. Result: centroid x=2482.95 of 3840, normalized
+    /// 0.6466.)
+    ///
+    /// Resolution (3840x2160 for the 2026-08-15 measurement vs. 1920x1080
+    /// for both the 2026-08-16 measurement and the live preview) doesn't
+    /// matter here -- both share the same 16:9 aspect ratio, and a
+    /// normalized X fraction is resolution-independent as long as the
+    /// field of view matches (already established: pure resolution changes
+    /// don't shift normalized geometry, only a stabilization/crop change
+    /// does -- see this file's own DistanceEstimator.calibrated history for
+    /// the precedent).
     ///
     /// `CameraPreviewView`'s `.resizeAspectFill` means this can't just be
     /// `referenceNormalizedX * screenWidth` -- the buffer is scaled to fill
@@ -951,7 +982,7 @@ struct InferenceView: View {
     /// offset has to be computed from the actual runtime view size (device
     /// screen aspect ratio isn't assumed/hardcoded here).
     private struct YawReferenceLine: View {
-        static let referenceNormalizedX: CGFloat = 0.6466
+        static let referenceNormalizedX: CGFloat = 0.6517
         private static let videoWidth: CGFloat = 1920
         private static let videoHeight: CGFloat = 1080
 
@@ -1537,10 +1568,12 @@ struct InferenceView: View {
                         .font(.system(size: 36, weight: .medium))
                         .foregroundStyle(isRecordingHealthy ? .white.opacity(0.75) : Color.red)
                         .shadow(color: .black.opacity(0.6), radius: 2)
+                        .hudBoxBackground()
                     Text(thermalLabel)
                         .font(.system(size: 36, weight: .medium))
                         .foregroundStyle(thermalLabelColor)
                         .shadow(color: .black.opacity(0.6), radius: 2)
+                        .hudBoxBackground()
                 }
             }
         }

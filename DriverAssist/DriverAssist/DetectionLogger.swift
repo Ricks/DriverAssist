@@ -71,11 +71,16 @@ struct DetectionLogEntry: Codable {
     // Which TrackingLevel was active for this entry -- mirrors `model`/
     // `twoPass` in being per-entry, since this can change mid-drive too.
     let trackingLevel: String
-    // Wall-clock cost of trackingManager.track(...) (Kalman predict/update,
-    // GMC, Hungarian assignment) -- NOT included in elapsedMs above, which is
-    // captured before tracking runs. Logged separately since this is the
-    // number that actually answers "what does tracking/GMC cost", which
-    // elapsedMs alone can't.
+    // Wall-clock cost of trackingManager.track(...) -- Kalman predict/
+    // update, applying GMC's already-computed transform, Hungarian
+    // assignment -- NOT included in elapsedMs above, which is captured
+    // before tracking runs. UPDATED 2026-08-16: GMC's own optical-flow
+    // computation no longer happens inside this span -- it now runs
+    // CONCURRENTLY with inference, before track() is even called (see
+    // InferenceEngine.process's gmcTask), and is timed separately in
+    // gmcElapsedMs below. Sessions logged before this change have GMC's
+    // full cost folded into this field instead; don't compare
+    // trackingElapsedMs across that boundary without accounting for it.
     let trackingElapsedMs: Double
     // GMC's per-frame quality signal (see GMCStats) -- nil when GMC didn't
     // run this frame (disabled, no live tracks yet, or the very first frame).
