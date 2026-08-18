@@ -318,7 +318,8 @@ final class InferenceEngine: ObservableObject {
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         stabilizationEnabled: Bool,
-        parametersLocked: Bool
+        parametersLocked: Bool,
+        yawReferenceNormalizedX: CGFloat
     ) {
         sourceSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         DebugFileLogger.log("process() called, sourceSize set to \(sourceSize)")
@@ -381,7 +382,8 @@ final class InferenceEngine: ObservableObject {
                         lowLightEnabled: lowLightEnabled,
                         autoLowLightEnabled: autoLowLightEnabled,
                         stabilizationEnabled: stabilizationEnabled,
-                        parametersLocked: parametersLocked
+                        parametersLocked: parametersLocked,
+                        yawReferenceNormalizedX: yawReferenceNormalizedX
                     )
                 }
             } catch {
@@ -417,7 +419,8 @@ final class InferenceEngine: ObservableObject {
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
         stabilizationEnabled: Bool,
-        parametersLocked: Bool
+        parametersLocked: Bool,
+        yawReferenceNormalizedX: CGFloat
     ) {
         let trackingStart = CFAbsoluteTimeGetCurrent()
         let result = trackingManager.track(
@@ -476,6 +479,7 @@ final class InferenceEngine: ObservableObject {
             rollDegrees: pitchSensor.rollDegrees,
             rollDriftDegrees: pitchSensor.rollDriftDegrees,
             referenceRollDegrees: pitchSensor.referenceRollDegrees,
+            referenceYawMarkerNormalizedX: Double(yawReferenceNormalizedX),
             userAccelerationX: pitchSensor.userAccelerationX,
             userAccelerationY: pitchSensor.userAccelerationY,
             userAccelerationZ: pitchSensor.userAccelerationZ,

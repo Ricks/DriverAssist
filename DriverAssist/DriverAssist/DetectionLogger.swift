@@ -134,6 +134,13 @@ struct DetectionLogEntry: Codable {
     // Same idea as pitchDriftDegrees/referencePitchDegrees above, for roll.
     let rollDriftDegrees: Double?
     let referenceRollDegrees: Double?
+    // Normalized [0,1] x-position of the yaw-calibration marker, captured
+    // fresh every session via CameraManager.detectYawMarker (or left as
+    // whatever manual drag-adjustment set it to) -- see the yaw-band/
+    // crosshair design discussion. Not yet consumed by anything on-device
+    // (classify_leading/path_awareness.py remain Python-only); logged so
+    // real per-session values exist once that gets ported.
+    let referenceYawMarkerNormalizedX: Double?
     // Real linear acceleration, gravity subtracted, in g (1.0 = ~9.8 m/s^2),
     // device-local x/y/z -- see PitchSensor.swift. Not consumed by anything
     // yet; intended future uses are braking detection (closing-rate warning
@@ -201,6 +208,7 @@ enum DetectionLogger {
         rollDegrees: Double?,
         rollDriftDegrees: Double?,
         referenceRollDegrees: Double?,
+        referenceYawMarkerNormalizedX: Double?,
         userAccelerationX: Double?,
         userAccelerationY: Double?,
         userAccelerationZ: Double?,
@@ -240,6 +248,7 @@ enum DetectionLogger {
             rollDegrees: rollDegrees,
             rollDriftDegrees: rollDriftDegrees,
             referenceRollDegrees: referenceRollDegrees,
+            referenceYawMarkerNormalizedX: referenceYawMarkerNormalizedX,
             userAccelerationX: userAccelerationX,
             userAccelerationY: userAccelerationY,
             userAccelerationZ: userAccelerationZ,

@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
 """
-Packages one DriverAssist recording session into a single self-contained
-directory, instead of the raw video sitting in the repo root while its
-detections/thermal data stays mixed into the shared ~/DriverAssist/logs/
-directory alongside every other drive.
+Packages one or more DriverAssist recording sessions into a single
+self-contained directory, instead of the raw video(s) sitting in the repo
+root while their detections/thermal data stays mixed into the shared
+~/DriverAssist/logs/ directory alongside every other drive.
 
-Assumed workflow:
+Assumed workflow (single session):
     mkdir 26_07_30_Day_Hosp_nano_off
     mv 26_07_30_Day_Hosp_nano_off.MOV 26_07_30_Day_Hosp_nano_off/
     python3 tools/package_session.py 26_07_30_Day_Hosp_nano_off
 
-Given a directory containing exactly one raw recording, this:
+Or multiple short sessions sharing one directory (e.g. a config-comparison
+matrix -- one recording per config, all recorded back-to-back the same day):
+    mkdir 26_08_17_Matrix_Day
+    mv recording-*.MOV 26_08_17_Matrix_Day/
+    python3 tools/package_session.py 26_08_17_Matrix_Day
+
+For EACH raw recording found in the directory, this:
   1. Resolves the recording's start time (see driverassist_sync.py) and slices
-     just this session's entries out of the shared detections.jsonl/
-     overlay-debug*.log data, writing them as local detections.jsonl/
-     overlay-debug.log inside the directory -- so the directory no longer
-     depends on ~/DriverAssist/logs/ to be useful later.
+     just that session's entries out of the shared detections.jsonl/
+     overlay-debug*.log data, writing them into the directory -- so the
+     directory no longer depends on ~/DriverAssist/logs/ to be useful later.
+     With exactly one recording in the directory, these are written as the
+     plain `detections.jsonl`/`overlay-debug.log` (unchanged from before,
+     so existing single-session directories/tooling keep working). With more
+     than one recording, each gets its own `<video>-detections.jsonl`/
+     `<video>-overlay-debug.log` instead, since a shared filename can't hold
+     more than one session's slice.
   2. Runs reconstruct_annotated.py against those local files, writing
      <video>-annotated.mp4 into the same directory.
   3. With --benchmark, also runs benchmark.py (slow -- loads the yolo26x
      reference model and runs inference per logged frame), writing
      <video>-benchmark.json/.png into the directory too.
+
+The shared logs pool is pulled from the device once per run (not once per
+video) -- all recordings in the directory are sliced out of that single
+fresh pull.
 
 Safe to re-run: each output is skipped if it already exists (delete it first
 to force regeneration).
@@ -69,17 +84,30 @@ def pull_logs(tools_dir: Path) -> None:
             print(f"  {line}")
 
 
-def find_session_video(session_dir: Path) -> Path:
+def find_session_videos(session_dir: Path) -> list:
+    """Returns every raw recording in session_dir, sorted by filename (which
+    -- given the app's recording-YYYYMMDD-HHMMSS.MOV naming -- also sorts
+    them chronologically). One recording is the common case; more than one
+    is the config-comparison-matrix case (see module docstring)."""
     candidates = [
         p for p in session_dir.iterdir()
         if p.suffix.lower() in VIDEO_EXTENSIONS and "-annotated" not in p.stem
     ]
     if not candidates:
         sys.exit(f"No raw recording found in {session_dir} -- move it in first.")
-    if len(candidates) > 1:
-        names = ", ".join(p.name for p in candidates)
-        sys.exit(f"Found more than one candidate raw recording in {session_dir}: {names} -- keep just one.")
-    return candidates[0]
+    return sorted(candidates)
+
+
+def find_session_video(session_dir: Path) -> Path:
+    """Singular counterpart to find_session_videos, for callers that need
+    exactly one video and should error on a config-comparison-matrix
+    directory rather than silently picking one -- e.g. tracker.py's own
+    single-video CLI."""
+    videos = find_session_videos(session_dir)
+    if len(videos) > 1:
+        names = ", ".join(p.name for p in videos)
+        sys.exit(f"Found more than one candidate raw recording in {session_dir}: {names} -- this tool needs exactly one.")
+    return videos[0]
 
 
 def video_duration_seconds(video: Path):
@@ -94,10 +122,10 @@ def video_duration_seconds(video: Path):
         return None
 
 
-def write_session_logs(video: Path, session_dir: Path, logs_dir: Path) -> tuple:
+def write_session_logs(video: Path, detections_path: Path, debug_log_path: Path, logs_dir: Path) -> tuple:
     """Filters the shared detections.jsonl/overlay-debug*.log data down to
-    just this video's time range and writes self-contained copies into
-    session_dir."""
+    just this video's time range and writes self-contained copies to
+    detections_path/debug_log_path."""
     start_epoch, _ = resolve_start_epoch(video, logs_dir)
     duration = video_duration_seconds(video)
     range_start = start_epoch - RANGE_BUFFER_BEFORE_SECONDS
@@ -109,14 +137,12 @@ def write_session_logs(video: Path, session_dir: Path, logs_dir: Path) -> tuple:
     else:
         range_end = start_epoch + duration + RANGE_BUFFER_AFTER_SECONDS
 
-    detections_path = session_dir / "detections.jsonl"
     all_detections = load_detections(logs_dir)
     session_detections = [e for e in all_detections if range_start <= e["t"] <= range_end]
     with open(detections_path, "w") as f:
         for entry in session_detections:
             f.write(json.dumps(entry) + "\n")
 
-    debug_log_path = session_dir / "overlay-debug.log"
     lines_written = 0
     with open(debug_log_path, "w") as out:
         for log_file in resolve_debug_log_files(logs_dir):
@@ -210,43 +236,18 @@ def existing_logs_cover_video(video: Path, detections_path: Path, debug_log_path
     return existing_start <= range_end and existing_end >= range_start
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("session_dir", type=Path, help="Directory containing exactly one raw recording")
-    parser.add_argument(
-        "--logs-dir", type=Path, default=DEFAULT_LOGS_DIR,
-        help=f"Shared logs directory to pull this session's slice from (default: {DEFAULT_LOGS_DIR})",
-    )
-    parser.add_argument(
-        "--benchmark", action="store_true",
-        help="Also run benchmark.py (slow -- runs the yolo26x reference model) into this directory",
-    )
-    parser.add_argument("--reference-model", type=Path, default=None, help="Passed through to benchmark.py if --benchmark is set")
-    parser.add_argument(
-        "--skip-annotate", action="store_true",
-        help="Only extract this session's local detections.jsonl/overlay-debug.log -- skip generating the annotated reconstruction",
-    )
-    parser.add_argument(
-        "--skip-pull", action="store_true",
-        help="Don't run pull_logs.sh first -- use whatever's already in --logs-dir as-is",
-    )
-    args = parser.parse_args()
-
-    session_dir = args.session_dir
-    if not session_dir.is_dir():
-        sys.exit(f"{session_dir} is not a directory -- create it and move the raw recording in first.")
-
-    tools_dir = Path(__file__).parent
-    if args.skip_pull:
-        print("--skip-pull passed -- not refreshing the shared logs pool from the device.")
+def process_video(video: Path, session_dir: Path, args, tools_dir: Path, shared_names: bool) -> None:
+    """Packages one recording. shared_names=True uses the plain
+    detections.jsonl/overlay-debug.log names (single-recording-per-directory
+    case, unchanged from before); False prefixes them with the video's stem
+    (multi-recording case, so each session gets its own files)."""
+    if shared_names:
+        detections_path = session_dir / "detections.jsonl"
+        debug_log_path = session_dir / "overlay-debug.log"
     else:
-        pull_logs(tools_dir)
+        detections_path = session_dir / f"{video.stem}-detections.jsonl"
+        debug_log_path = session_dir / f"{video.stem}-overlay-debug.log"
 
-    video = find_session_video(session_dir)
-    print(f"Session video: {video}")
-
-    detections_path = session_dir / "detections.jsonl"
-    debug_log_path = session_dir / "overlay-debug.log"
     if detections_path.exists() and debug_log_path.exists():
         if existing_logs_cover_video(video, detections_path, debug_log_path, args.logs_dir):
             print(f"{detections_path.name}/{debug_log_path.name} already present -- skipping extraction "
@@ -262,7 +263,7 @@ def main() -> None:
                 "and re-run to extract the correct data for this video."
             )
     else:
-        detections_path, debug_log_path = write_session_logs(video, session_dir, args.logs_dir)
+        detections_path, debug_log_path = write_session_logs(video, detections_path, debug_log_path, args.logs_dir)
 
     annotated_path = session_dir / f"{video.stem}-annotated.mp4"
     if args.skip_annotate:
@@ -293,7 +294,54 @@ def main() -> None:
                 cmd += ["--reference-model", str(args.reference_model)]
             subprocess.run(cmd, check=True)
 
-    print(f"\nSession packaged in {session_dir}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("session_dir", type=Path, help="Directory containing one or more raw recordings")
+    parser.add_argument(
+        "--logs-dir", type=Path, default=DEFAULT_LOGS_DIR,
+        help=f"Shared logs directory to pull this session's slice from (default: {DEFAULT_LOGS_DIR})",
+    )
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help="Also run benchmark.py (slow -- runs the yolo26x reference model) into this directory",
+    )
+    parser.add_argument("--reference-model", type=Path, default=None, help="Passed through to benchmark.py if --benchmark is set")
+    parser.add_argument(
+        "--skip-annotate", action="store_true",
+        help="Only extract each session's local detections.jsonl/overlay-debug.log -- skip generating the annotated reconstruction",
+    )
+    parser.add_argument(
+        "--skip-pull", action="store_true",
+        help="Don't run pull_logs.sh first -- use whatever's already in --logs-dir as-is",
+    )
+    args = parser.parse_args()
+
+    session_dir = args.session_dir
+    if not session_dir.is_dir():
+        sys.exit(f"{session_dir} is not a directory -- create it and move the raw recording(s) in first.")
+
+    tools_dir = Path(__file__).parent
+    if args.skip_pull:
+        print("--skip-pull passed -- not refreshing the shared logs pool from the device.")
+    else:
+        pull_logs(tools_dir)
+
+    videos = find_session_videos(session_dir)
+    shared_names = len(videos) == 1
+    if shared_names:
+        print(f"Session video: {videos[0]}")
+    else:
+        print(f"{len(videos)} recordings found in {session_dir} -- packaging each separately:")
+        for v in videos:
+            print(f"  {v.name}")
+
+    for video in videos:
+        if not shared_names:
+            print(f"\n=== {video.name} ===")
+        process_video(video, session_dir, args, tools_dir, shared_names)
+
+    print(f"\nSession{'s' if not shared_names else ''} packaged in {session_dir}")
 
 
 if __name__ == "__main__":

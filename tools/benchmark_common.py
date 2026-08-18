@@ -22,6 +22,28 @@ import numpy as np
 
 TARGET_CLASSES = {"person", "bicycle", "car", "motorcycle", "bus", "truck"}
 
+# yolo26x is ground truth, so its own resolution shouldn't be a limiting
+# factor -- always run it at (roughly) native content resolution, regardless
+# of which on-device config it's being compared against. This is the same
+# (h, w) shape the on-device high-res export uses; for this project's native
+# 1920x1080 capture that's essentially zero letterbox padding (not an
+# upscale) -- there's no real resolution left to gain by going higher.
+# Previously this defaulted to a plain int (1280, square), which let
+# ultralytics letterbox a 1920x1080 frame down to an effective ~1280x720 --
+# lower than on-device high-res's own ~1920x1080 content, which unfairly
+# penalized high-res on-device configs' measured precision (see
+# project_reference_model_resolution_fix memory for the full story).
+DEFAULT_REFERENCE_IMGSZ = (1088, 1920)
+
+
+def parse_imgsz(value: str):
+    """argparse type for --imgsz: 'HxW' (e.g. '1088x1920') for a rectangular
+    shape, or a bare int for a square one."""
+    if "x" in value:
+        h, w = value.split("x")
+        return (int(h), int(w))
+    return int(value)
+
 # Validated categorical palette (dataviz skill's default), assigned in a
 # FIXED order keyed to config identity — a config keeps its color whether or
 # not other configs appear in a given chart, never reassigned by rank.

@@ -1,9 +1,10 @@
 import Foundation
 import CoreML
 
-// nano/small are tap-reachable (see ContentView.toggleModel); medium is
-// voice-only (VoiceCommandManager's .selectModel command), not tap-reachable --
-// it has no high-res export (see ModelManager.highResTiers).
+// All three tiers are tap-reachable (see ContentView.toggleModel), cycling
+// nano -> small -> medium -> nano. Medium was originally voice-only
+// (VoiceCommandManager's .selectModel command), but voice proved unreliable
+// in practice. Medium has no high-res export (see ModelManager.highResTiers).
 enum DetectorModel: String, CaseIterable, Codable {
     case nano   = "yolo26n"
     case small  = "yolo26s"
@@ -24,11 +25,6 @@ final class ModelManager: ObservableObject {
     // latency/thermal cost (that's the point of exposing it as a manual,
     // deliberate swipe rather than a silent default).
     //
-    // Only nano and small have a high-res export (see highResTiers) --
-    // medium was deliberately excluded, being the most expensive tier
-    // already, stacking it with the more expensive input too compounds two
-    // untested costs at once. Toggling high-res while medium is selected is
-    // a harmless no-op.
     @Published private(set) var isHighResEnabled = false
 
     // Both models are kept resident so switching is O(1).
@@ -38,7 +34,12 @@ final class ModelManager: ObservableObject {
     private var loadTasks: [DetectorModel: Task<Void, Never>] = [:]
     private var highResLoadTasks: [DetectorModel: Task<Void, Never>] = [:]
 
-    private static let highResTiers: Set<DetectorModel> = [.nano, .small]
+    // All three tiers now have a high-res export. Medium+high-res stacks the
+    // most expensive model tier with the more expensive input -- an
+    // untested combination -- but the existing high-res confirmation dialog
+    // (see ContentView.toggleResolution) already gates that risk generically,
+    // so no medium-specific guard is needed here.
+    private static let highResTiers: Set<DetectorModel> = [.nano, .small, .medium]
 
     // Actual model input dimensions, for HUD display -- see the resolution
     // comparison this came out of (isHighResEnabled's doc comment above).

@@ -43,8 +43,59 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// Whether `.standard` video stabilization is applied to the capture connection.
     /// Published for the HUD text; toggling also updates `currentStabilizationEnabled`
-    /// below for applying the mode to the capture connection.
-    @Published private(set) var isStabilizationEnabled = false
+    /// below for applying the mode to the capture connection. Defaults on (not
+    /// persisted, see init() -- every launch starts here regardless of the
+    /// last session's choice).
+    @Published private(set) var isStabilizationEnabled = true
+
+    /// Normalized [0,1] x-position of the yaw-calibration marker (a small,
+    /// distinctly-colored object fixed to the dash, assumed rigid relative
+    /// to the car body) -- read fresh EVERY session via detectYawMarker()
+    /// (ContentView.runYawAutoDetect, unconditional, no skip path), same
+    /// "don't assume calibration" discipline as PitchSensor's
+    /// referencePitchDegrees/referenceRollDegrees. Persisted only as a
+    /// reasonable starting value before that session's own fresh detection
+    /// completes, not trusted to stay correct indefinitely on its own.
+    @Published private(set) var yawReferenceNormalizedX: CGFloat = CameraManager.defaultYawMarkerNormalizedX
+
+    /// Where a *reasonably mounted* phone's camera should roughly point --
+    /// the yaw band's fixed center (see ContentView's YawBand), and the
+    /// starting value for yawReferenceNormalizedX before any real
+    /// per-session detection has run. Was a hardcoded reference-line
+    /// position (`YawReferenceLine`, in ContentView.swift) before the
+    /// auto-detect/crosshair system replaced it with a live, per-session
+    /// measurement -- kept here as the coarse "is the mount roughly sane"
+    /// expectation, distinct from the precise (and now per-session)
+    /// crosshair value.
+    ///
+    /// This value's own history (relocated from ContentView.swift's old
+    /// YawReferenceLine, kept for the methodology, not because it's still
+    /// authoritative -- the auto-detect system now re-measures every
+    /// session instead of trusting one hardcoded number indefinitely):
+    ///
+    /// RE-MEASURED 2026-08-16 against
+    /// `data/26_08_16_TestDrive_LowRes_Nano_Day/recording-20260816-132942.MOV`
+    /// -- the same dash-mounted yellow stick, after Rick slightly realigned
+    /// the mount's yaw before this drive. Centroid of yellow pixels
+    /// (`r>180, g>130, b<100`) within a fixed ROI around the real (bottom,
+    /// sharply-focused) stick, avoiding its blurrier windshield reflection
+    /// above the wiper-arm band. Pooled across 11 frames (t=600/800/1000/
+    /// 1200/1500/2100/2400/3000/3600/3900/4000s, ~125k pixels total)
+    /// spanning nearly the full 69-minute drive; 5 other candidate frames
+    /// excluded for reading notably off from the rest of the cluster or
+    /// returning too few yellow pixels (glare/shadow). Result: pooled
+    /// centroid x=1251.35 of 1920, normalized 0.6517 -- NOT eyeballed. Only
+    /// ~10px (~0.5%) from the prior 0.6466, consistent with Rick's own
+    /// description of that mount adjustment as "slight."
+    ///
+    /// (2026-08-15 measurement, superseded above: against
+    /// `data/26_08_15_Walkaround/recording-20260815-123041.MOV`, centroid
+    /// pooled across 6 frames, result 0.6466. That itself superseded the
+    /// original 2026-08-11 measurement (0.5295, from a laser dot) because
+    /// that clip had `stabilizationEnabled: false` logged while the
+    /// walkaround clip had it `true` -- a stabilization-crop mismatch, not
+    /// a real mount change.)
+    static let defaultYawMarkerNormalizedX: CGFloat = 0.6517
 
     /// Current system thermal state. Published so the HUD can warn when the device
     /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
@@ -191,6 +242,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// reference during normal driving.
     private nonisolated(unsafe) var latestCalibrationPixelBuffer: CVPixelBuffer?
 
+    /// Unlike latestCalibrationPixelBuffer, updated on EVERY frame regardless
+    /// of recording state -- detectYawMarker() needs a frame to scan on the
+    /// level screen, before any recording (calibration or otherwise) has
+    /// started.
+    private nonisolated(unsafe) var latestPreviewPixelBuffer: CVPixelBuffer?
+
     /// The exposure bias (in EV) the boost is currently applying, so it can be
     /// restored after a probe. Written and read only on `sessionQueue` — no lock
     /// needed.
@@ -245,32 +302,36 @@ final class CameraManager: NSObject, ObservableObject {
     /// actually starts failing, instead of only finding out after the fact.
     private let lowStorageThresholdBytes: Int64 = 1_000_000_000
 
-    private static let lowLightBoostDefaultsKey = "settings.lowLightBoostEnabled"
-    private static let stabilizationDefaultsKey = "settings.stabilizationEnabled"
-
     override init() {
         super.init()
-        let defaults = UserDefaults.standard
-        // isAutoLowLightEnabled is deliberately NOT persisted — every launch
-        // starts back at the default (auto) regardless of whatever manual
-        // override was last in effect, so a prior drive/test's choice doesn't
-        // silently carry over into an unrelated later one. `exitSession`
-        // always terminates the app outright (see its own comment) rather than looping
-        // back to the level screen, so "every launch" and "every session" are the same
-        // thing here -- no separate per-session reset path is needed beyond this.
-        if defaults.object(forKey: Self.lowLightBoostDefaultsKey) != nil {
-            isLowLightBoostEnabled = defaults.bool(forKey: Self.lowLightBoostDefaultsKey)
-        }
-        if defaults.object(forKey: Self.stabilizationDefaultsKey) != nil {
-            isStabilizationEnabled = defaults.bool(forKey: Self.stabilizationDefaultsKey)
-        }
-        // Keep the nonisolated mirrors in sync with what was just loaded — `configure()`
-        // applies the boost/stabilization to the actual capture device from these once
-        // it's available.
+        // Neither isLowLightBoostEnabled/isAutoLowLightEnabled nor
+        // isStabilizationEnabled are persisted — every launch starts back at
+        // their compiled-in defaults (auto, on) regardless of whatever
+        // manual override was last in effect, so a prior drive/test's choice
+        // doesn't silently carry over into an unrelated later one.
+        // `exitSession` always terminates the app outright (see its own
+        // comment) rather than looping back to the level screen, so "every
+        // launch" and "every session" are the same thing here -- no separate
+        // per-session reset path is needed beyond just not persisting.
+        //
+        // Keep the nonisolated mirrors in sync with these defaults —
+        // `configure()` applies the boost/stabilization to the actual
+        // capture device from these once it's available.
         currentAutoLowLightEnabled = isAutoLowLightEnabled
         currentLowLightEnabled = isLowLightBoostEnabled
         currentStabilizationEnabled = isStabilizationEnabled
+
+        // Unlike the settings above, the yaw reference genuinely should
+        // persist across launches -- it's a measurement of the physical
+        // mount, not a mode that should reset defensively. A session that
+        // skips fresh calibration reuses this rather than falling back to
+        // defaultYawMarkerNormalizedX.
+        if UserDefaults.standard.object(forKey: Self.yawReferenceDefaultsKey) != nil {
+            yawReferenceNormalizedX = CGFloat(UserDefaults.standard.double(forKey: Self.yawReferenceDefaultsKey))
+        }
     }
+
+    private static let yawReferenceDefaultsKey = "settings.yawReferenceNormalizedX"
 
     /// `recording: false` starts the session (live preview + inference feed)
     /// without writing a video file -- lets the configuring screen show a
@@ -610,6 +671,89 @@ final class CameraManager: NSObject, ObservableObject {
         return bandCount
     }
 
+    /// Detects the yaw-calibration marker (a small, distinctly yellow
+    /// object fixed to the dash -- see the yaw-band/crosshair design
+    /// discussion) and returns its horizontal centroid as a normalized
+    /// [0,1] x-coordinate, or nil if nothing confidently matched.
+    ///
+    /// Searches the full frame width (unlike countRedTapeMarks's lane-only
+    /// crop) since the marker's rough screen position isn't assumed --
+    /// only that it's on the dash, restricted to the lower third of frame
+    /// to avoid matching yellow elsewhere in the scene (signage, headlights
+    /// of an oncoming car, etc.) above the dashboard line.
+    ///
+    /// Color thresholds and minSamples are placeholders pending tuning
+    /// against the real object under real lighting -- same discipline as
+    /// countRedTapeMarks's own bench-test-pending constants, don't trust
+    /// blindly.
+    private nonisolated func detectYawMarkerNormalizedX(in pixelBuffer: CVPixelBuffer) -> CGFloat? {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+
+        let rowStart = height * 2 / 3
+        let colStride = 2
+        let rowStride = 2
+
+        func yellowPixel(atByteOffset offset: Int) -> Bool {
+            // kCVPixelFormatType_32BGRA byte order: B, G, R, A.
+            let b = Double(bytes[offset])
+            let g = Double(bytes[offset + 1])
+            let r = Double(bytes[offset + 2])
+            return r > 130 && g > 130 && b < 100 && abs(r - g) < 50
+        }
+
+        var sumX = 0.0
+        var count = 0
+        var row = rowStart
+        while row < height {
+            var col = 0
+            while col < width {
+                if yellowPixel(atByteOffset: row * bytesPerRow + col * 4) {
+                    sumX += Double(col)
+                    count += 1
+                }
+                col += colStride
+            }
+            row += rowStride
+        }
+
+        // Require enough matching samples to trust this as a real object,
+        // not scattered false-positive pixels.
+        let minSamples = 30
+        guard count >= minSamples else { return nil }
+        return CGFloat(sumX / Double(count)) / CGFloat(width)
+    }
+
+    /// One-shot yaw-marker auto-detection against whatever frame is
+    /// currently showing in the live preview (see latestPreviewPixelBuffer)
+    /// -- the level screen's entry point into the yaw-calibration flow.
+    /// Updates and persists yawReferenceNormalizedX on success; leaves it
+    /// unchanged on failure (no marker confidently found) so a caller can
+    /// fall back to showing the last-known/persisted value rather than a
+    /// jarring reset. Returns the detected value so the caller can drive a
+    /// confirmation flash.
+    @discardableResult
+    func detectYawMarker() -> CGFloat? {
+        guard let pixelBuffer = latestPreviewPixelBuffer,
+              let detectedX = detectYawMarkerNormalizedX(in: pixelBuffer) else { return nil }
+        setYawReferenceNormalizedX(detectedX)
+        return detectedX
+    }
+
+    /// Commits a yaw reference value (from detectYawMarker's auto-detect,
+    /// or the crosshair's manual drag-adjust) and persists it -- see
+    /// yawReferenceNormalizedX's doc comment for why this, unlike the
+    /// settings above, IS persisted across launches.
+    func setYawReferenceNormalizedX(_ x: CGFloat) {
+        yawReferenceNormalizedX = x
+        UserDefaults.standard.set(Double(x), forKey: Self.yawReferenceDefaultsKey)
+    }
+
     /// Removes the session's inputs/outputs (not just stopping it) so the
     /// next `configure()` call takes the full setup path again -- the only
     /// way to guarantee a calibration recording's 4K preset and locked
@@ -802,7 +946,6 @@ final class CameraManager: NSObject, ObservableObject {
         isAutoLowLightEnabled = false
         currentAutoLowLightEnabled = false
         applyLowLightState(enabled)
-        UserDefaults.standard.set(enabled, forKey: Self.lowLightBoostDefaultsKey)
     }
 
     /// Hands control back to the auto-detector (voice: "low light auto"). The next
@@ -818,7 +961,6 @@ final class CameraManager: NSObject, ObservableObject {
     func setStabilizationEnabled(_ enabled: Bool) {
         isStabilizationEnabled = enabled
         currentStabilizationEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: Self.stabilizationDefaultsKey)
         sessionQueue.async { [weak self] in self?.applyStabilizationMode(enabled: enabled) }
     }
 
@@ -1670,6 +1812,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         sampleAutoLowLightIfDue(pixelBuffer)
         recalibrateFocusIfDue()
         appendRecordingFrame(pixelBuffer, presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        latestPreviewPixelBuffer = pixelBuffer
         if activeRecordingFilenamePrefix == "calibration" {
             latestCalibrationPixelBuffer = pixelBuffer
         }

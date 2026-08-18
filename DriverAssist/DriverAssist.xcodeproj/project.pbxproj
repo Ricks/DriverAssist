@@ -10,6 +10,9 @@
 		1E86CD43C56742E08A0AB38B /* yolo26m.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 9FEF06E7382E46159EC9B04E /* yolo26m.mlpackage */; };
 		A9EC1A393010098E0037CCF6 /* yolo26n.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */; };
 		A9EC1A3B3010099C0037CCF6 /* yolo26s.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */; };
+		1F7BC0132BAF44AC823A7E3F /* yolo26n-1920x1088.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 5D59CEF623B74C5882F698BA /* yolo26n-1920x1088.mlpackage */; };
+		24C615CF634544B4B3B03755 /* yolo26s-1920x1088.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 333CDC283519415180C599A4 /* yolo26s-1920x1088.mlpackage */; };
+		4C0F67EBF2B04A908CCA91DF /* yolo26m-1920x1088.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = 5C354C08988D400C8876BB71 /* yolo26m-1920x1088.mlpackage */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -36,6 +39,9 @@
 		A9EC19E2300EC6910037CCF6 /* DriverAssistUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DriverAssistUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26n.mlpackage; sourceTree = "<group>"; };
 		A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo26s.mlpackage; sourceTree = "<group>"; };
+		5D59CEF623B74C5882F698BA /* yolo26n-1920x1088.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = "yolo26n-1920x1088.mlpackage"; sourceTree = "<group>"; };
+		333CDC283519415180C599A4 /* yolo26s-1920x1088.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = "yolo26s-1920x1088.mlpackage"; sourceTree = "<group>"; };
+		5C354C08988D400C8876BB71 /* yolo26m-1920x1088.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = "yolo26m-1920x1088.mlpackage"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -104,6 +110,9 @@
 				A9EC1A383010098E0037CCF6 /* yolo26n.mlpackage */,
 				A9EC1A3A3010099C0037CCF6 /* yolo26s.mlpackage */,
 				9FEF06E7382E46159EC9B04E /* yolo26m.mlpackage */,
+				5D59CEF623B74C5882F698BA /* yolo26n-1920x1088.mlpackage */,
+				333CDC283519415180C599A4 /* yolo26s-1920x1088.mlpackage */,
+				5C354C08988D400C8876BB71 /* yolo26m-1920x1088.mlpackage */,
 			);
 			sourceTree = "<group>";
 		};
@@ -240,6 +249,9 @@
 				A9EC1A3B3010099C0037CCF6 /* yolo26s.mlpackage in Resources */,
 				A9EC1A393010098E0037CCF6 /* yolo26n.mlpackage in Resources */,
 				1E86CD43C56742E08A0AB38B /* yolo26m.mlpackage in Resources */,
+				1F7BC0132BAF44AC823A7E3F /* yolo26n-1920x1088.mlpackage in Resources */,
+				24C615CF634544B4B3B03755 /* yolo26s-1920x1088.mlpackage in Resources */,
+				4C0F67EBF2B04A908CCA91DF /* yolo26m-1920x1088.mlpackage in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

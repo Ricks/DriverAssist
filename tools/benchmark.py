@@ -33,7 +33,7 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
-from benchmark_common import TARGET_CLASSES, make_chart, print_summary, save_results
+from benchmark_common import DEFAULT_REFERENCE_IMGSZ, TARGET_CLASSES, make_chart, parse_imgsz, print_summary, save_results
 from driverassist_sync import DEFAULT_LOGS_DIR, MODEL_DISPLAY_NAMES, load_detections, resolve_start_epoch
 
 CONFIDENCE_THRESHOLD = 0.25  # matches YOLODecoder.confidenceThreshold in the app
@@ -99,7 +99,7 @@ def match_boxes(predicted: list, reference: list, iou_threshold: float) -> dict:
     return result
 
 
-def run_reference_model(model, frame, device: str, imgsz: int) -> list:
+def run_reference_model(model, frame, device: str, imgsz) -> list:
     results = model.predict(frame, verbose=False, device=device, conf=CONFIDENCE_THRESHOLD, imgsz=imgsz)[0]
     h, w = frame.shape[:2]
     names = model.names
@@ -134,7 +134,7 @@ def main() -> None:
         help=f"Reference weights (default: {DEFAULT_REFERENCE_MODEL})",
     )
     parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU to count as a match (default: 0.5)")
-    parser.add_argument("--imgsz", type=int, default=1280, help="Reference model inference resolution (default: 1280)")
+    parser.add_argument("--imgsz", type=parse_imgsz, default=DEFAULT_REFERENCE_IMGSZ, help="Reference model inference resolution, 'HxW' or a bare int (default: near-native, see benchmark_common.DEFAULT_REFERENCE_IMGSZ)")
     parser.add_argument("--device", default="mps", help="torch device for the reference model (default: mps)")
     parser.add_argument(
         "--max-entries", type=int, default=None,

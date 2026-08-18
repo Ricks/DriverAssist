@@ -64,7 +64,7 @@ import pandas as pd
 from ultralytics import YOLO
 
 from benchmark import DEFAULT_REFERENCE_MODEL, config_label, iou, run_reference_model
-from benchmark_common import TARGET_CLASSES
+from benchmark_common import DEFAULT_REFERENCE_IMGSZ, TARGET_CLASSES, parse_imgsz
 from driverassist_sync import DEFAULT_LOGS_DIR, load_detections, resolve_start_epoch
 from gmc import GMC
 from tracker import (
@@ -164,7 +164,7 @@ def main() -> None:
     parser.add_argument("--debug-log", type=Path, default=DEFAULT_LOGS_DIR)
     parser.add_argument("--reference-model", type=Path, default=DEFAULT_REFERENCE_MODEL)
     parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU to count as a match (default: 0.5)")
-    parser.add_argument("--imgsz", type=int, default=1280)
+    parser.add_argument("--imgsz", type=parse_imgsz, default=DEFAULT_REFERENCE_IMGSZ)
     parser.add_argument("--device", default="mps")
     parser.add_argument("--max-entries", type=int, default=None)
     parser.add_argument("--results", type=Path, default=None, help="JSON path; defaults to <video>-track-benchmark.json")

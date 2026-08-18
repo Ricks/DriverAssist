@@ -69,6 +69,22 @@ final class PitchSensor: ObservableObject {
     @Published private(set) var referencePitchDegrees: Double?
     @Published private(set) var referenceRollDegrees: Double?
 
+    /// Nominal/expected mount pitch (degrees, nose-down-positive) -- the
+    /// mean `pitchDegrees` across the entire first real 69-minute test
+    /// drive (2026-08-16, detections-1786929695.jsonl, n=44793 frames:
+    /// -0.2624483860168278, rounded here to -0.26). Distinct from
+    /// `referencePitchDegrees`, which is captured fresh every session by
+    /// `captureReferenceAttitude()` and is what `DistanceEstimator` actually
+    /// uses -- this is a fixed constant (same "default" role as
+    /// `CameraManager.defaultYawMarkerNormalizedX`), used only as the
+    /// level-screen mount-tilt sanity check (see ContentView.isMountPitchOK):
+    /// is the phone still sitting at roughly the same pitch it was during
+    /// the drive that validated everything else. A drive-averaged value,
+    /// not a bench-measured "flat" pitch -- the mount/dash geometry imposes
+    /// some consistent resting tilt of its own, so comparing against 0
+    /// would be wrong.
+    static let defaultMountPitchDegrees: Double = -0.26
+
     /// Raw gyro rotation rate (deg/s), in the device's own x/y/z axes --
     /// deliberately NOT resolved down to a single "yaw rate" here, because
     /// which physical axis actually corresponds to the vehicle's turning

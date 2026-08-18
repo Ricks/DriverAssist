@@ -8,6 +8,21 @@
 import SwiftUI
 import UIKit
 
+/// The three states toggleLowLight() cycles through -- named here so a
+/// pending confirmation (see ContentView.pendingLowLightTarget) can name its
+/// target without re-deriving it from CameraManager's raw booleans.
+private enum LowLightTarget {
+    case auto, on, off
+
+    var label: String {
+        switch self {
+        case .auto: return "auto"
+        case .on: return "on"
+        case .off: return "off"
+        }
+    }
+}
+
 // MARK: — Root view
 
 @MainActor
@@ -54,18 +69,15 @@ private extension View {
 /// single "hasPressedGo" flag with an explicit state machine now that there
 /// are three distinct screens instead of two.
 private enum SessionPhase {
-    /// Initial screen: "Calibrate?" Yes/No. Calibration only needs to happen
-    /// when the mount was just attached (or feels like it may have moved) --
-    /// not every session, and importantly NOT when the car itself is
-    /// currently on unlevel ground (parked on a slope, roadside camber),
-    /// since the whole point of a calibration is to capture a known-flat-
-    /// ground reference. "No" reuses whatever reference pitch/roll was
-    /// captured last time (persisted in PitchSensor via UserDefaults, not
-    /// re-derived here) and skips straight to `.configuring`.
-    case calibratePrompt
-    /// Live tilt readout + "Calibrate" button -- only reached via "Yes"
-    /// above. No recording yet -- this is the mount-leveling step, done
-    /// standing still before anything else.
+    /// Initial screen: live tilt readout + yaw band/crosshair + "OK" button
+    /// -- the mount-leveling step, done standing still before anything
+    /// else, entered directly on launch (no more separate "Calibrate?"
+    /// Yes/No prompt in front of it -- see the design discussion this came
+    /// out of). Fine calibration (yaw auto-detect, and pitch/roll capture
+    /// on "OK") now always runs fresh every session; there's no skip path
+    /// left to reuse a stale persisted reference. "NUDGE MOUNT" state (see
+    /// ContentView.isMountOK) gates "OK" behind a confirmation instead of
+    /// silently proceeding with a mount that's out of tolerance.
     case level
     /// Post-calibration screen: camera-orientation warning, plus the one-time
     /// "Lock Settings"/"Unlocked" choice that starts the drive. Settings
@@ -102,8 +114,27 @@ struct InferenceView: View {
 
     @State private var batteryLevel: Float = UIDevice.current.batteryLevel
     @State private var batteryState: UIDevice.BatteryState = UIDevice.current.batteryState
-    @State private var sessionPhase: SessionPhase = .calibratePrompt
+    @State private var sessionPhase: SessionPhase = .level
     @State private var showExitConfirmation = false
+    /// Confirms before actually enabling high-res -- added 2026-08-17 after
+    /// real-drive data showed every high-res config either loses/ties a
+    /// same-latency low-res option or costs 200+ms for marginal accuracy
+    /// gain (see project_matrix_comparison_result), so an accidental tap on
+    /// this HUD label mid-drive would otherwise silently tank frame rate
+    /// with no warning (the label's own text updates, but nothing else
+    /// flags the drop). Only gates turning it ON -- turning back OFF is the
+    /// safe direction and doesn't need a confirmation in the way.
+    @State private var showHighResConfirmation = false
+    /// Confirmation gate for stabilization and low-light, same rationale as
+    /// showHighResConfirmation above -- an accidental tap on either HUD label
+    /// mid-drive would silently change the crop/exposure behavior with no
+    /// warning beyond the label's own text. Both directions are gated here
+    /// (unlike high-res, where only enabling was risky) since these are
+    /// simple toggles/cycles with no clearly "safe" direction.
+    @State private var showStabilizationConfirmation = false
+    @State private var pendingStabilizationEnabled = false
+    @State private var showLowLightConfirmation = false
+    @State private var pendingLowLightTarget: LowLightTarget = .auto
     /// True while any `StepperButton` is mid-hold (repeat timer running) --
     /// lets `withSessionGestures`'s long-press-to-exit gesture ignore a
     /// stepper hold-to-repeat past its ~2s threshold instead of popping the
@@ -114,6 +145,16 @@ struct InferenceView: View {
     // (and thus only re-evaluates the HUD) when the state itself changes, so without
     // a timer a sustained `.critical` would never actually blink on screen.
     @State private var thermalBlinkOn = true
+
+    /// Brief highlight on YawMarker right after runYawAutoDetect() finds a
+    /// marker -- lets a glance confirm the auto-detected position before
+    /// trusting it, rather than the value silently changing with no visual
+    /// acknowledgment.
+    @State private var showYawDetectionFlash = false
+
+    /// Gates the level screen's "OK" button when isMountOK is false -- see
+    /// tapOK().
+    @State private var showNudgeMountConfirmation = false
     private let thermalBlinkTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
     // Full brightness for the whole session, by explicit request (2026-08-14)
@@ -121,7 +162,20 @@ struct InferenceView: View {
     // save power, full only for the level/calibration screens that need to
     // resolve fine detail). Restored on disappear rather than left changed
     // system-wide.
+    //
+    // Exception (2026-08-18): dimmed to dimmedBrightness while low-light
+    // boost is actually active -- "On" or "Auto (on)", i.e.
+    // isLowLightBoostEnabled, not isAutoLowLightEnabled -- since full
+    // brightness fights night visibility/glare at exactly the moment the
+    // boost is compensating for a dark scene. Kept reactive via onChange
+    // below rather than only set once, since auto-detection can flip this
+    // mid-drive.
+    private static let dimmedBrightness: CGFloat = 0.7
     @State private var previousBrightness: CGFloat = UIScreen.main.brightness
+
+    private func updateBrightnessForLowLight() {
+        UIScreen.main.brightness = cameraManager.isLowLightBoostEnabled ? Self.dimmedBrightness : 1.0
+    }
 
     // Freezes model/resolution/low-light/stabilization for the whole drive once
     // chosen on the settings screen -- a one-time decision now (via "Lock
@@ -207,39 +261,30 @@ struct InferenceView: View {
         }
     }
 
-    /// "Yes" on the calibrate-prompt screen -- go do the actual leveling
-    /// step. Starts the preview-only session here too (not just at
-    /// `enterConfiguring`, which no-ops harmlessly on the already-running
-    /// session per `CameraManager.configure`'s `!session.isRunning` guard)
-    /// so the level screen's live camera feed -- and the yaw-reference line
-    /// on it -- is up before the user gets there, instead of popping in
-    /// only once `.configuring` is reached. Side benefit: the distance-
-    /// calibration side-flow reachable from this screen (long-press, see
-    /// `beginDistanceCalibration`) now also always finds a running session,
-    /// rather than depending on `startCalibrationRecording`'s cold-start
-    /// path for round 0's first attempt.
-    private func confirmCalibrate() {
-        cameraManager.start(recording: false)
-        withAnimation { sessionPhase = .level }
-    }
-
-    /// "No" on the calibrate-prompt screen -- skip straight to configuring,
-    /// reusing whichever reference pitch/roll `PitchSensor` already loaded
-    /// from a previous session (persisted via UserDefaults -- see its
-    /// init()). Deliberately does NOT call `captureReferenceAttitude()`.
-    private func skipCalibration() {
-        let pitch = pitchSensor.referencePitchDegrees
-        let roll = pitchSensor.referenceRollDegrees
-        DebugFileLogger.log("calibrate: SKIPPED reusing persisted reference pitch=\(String(describing: pitch)) roll=\(String(describing: roll))")
-        enterConfiguring()
+    /// "OK" on the level screen, when the mount is already within
+    /// tolerance (isMountOK) -- proceeds straight to calibrateAttitude().
+    /// When it's NOT (still showing "NUDGE MOUNT"), gates behind a
+    /// confirmation instead of silently letting a known-out-of-tolerance
+    /// mount through -- see showNudgeMountConfirmation's confirmationDialog
+    /// on levelScreen.
+    private func tapOK() {
+        if isMountOK {
+            calibrateAttitude()
+        } else {
+            DebugFileLogger.log("tap: MATCHED nudgeMountConfirmationPrompt")
+            showNudgeMountConfirmation = true
+        }
     }
 
     /// Deliberate, UI-triggered pitch+roll calibration -- see
     /// PitchSensor.captureReferenceAttitude() and DistanceEstimator.swift's
     /// file-level comment for why this must be done standing still on known-
-    /// flat, level ground, not while driving. Transitions to the settings
-    /// screen on success; stays on the level screen (with a toast explaining
-    /// why) if there's no motion reading yet.
+    /// flat, level ground, not while driving. Always runs fresh now (no more
+    /// skip-and-reuse-persisted path, see SessionPhase.level's doc comment)
+    /// -- transitions to the settings screen on success; stays on the level
+    /// screen (with a toast explaining why) if there's no motion reading
+    /// yet. Yaw calibration is NOT part of this -- it runs unconditionally
+    /// on level-screen appear (see runYawAutoDetect), independent of this.
     private func calibrateAttitude() {
         guard let result = pitchSensor.captureReferenceAttitude() else {
             DebugFileLogger.log("calibrate: FAILED no motion reading yet")
@@ -250,7 +295,7 @@ struct InferenceView: View {
         enterConfiguring()
     }
 
-    /// Shared tail of both calibration paths (captured fresh, or skipped and
+    /// Tail of the level screen's "OK" flow (see tapOK/calibrateAttitude) --
     /// reusing the persisted reference) -- starts the preview-only camera
     /// session and transitions to the configuring screen. Preview-only lets
     /// the configuring screen show a live camera feed (and reflect swipe/
@@ -353,14 +398,13 @@ struct InferenceView: View {
     /// `pitchSensor`'s LIVE roll for their own on-screen display -- the
     /// actual `referencePitchDegrees`/`referenceRollDegrees`
     /// `DistanceEstimator` uses for every distance calculation only gets
-    /// (re)captured by `calibrateAttitude()` ("Calibrate" on the level
-    /// screen), or is deliberately reused from whatever was persisted last
-    /// session (`skipCalibration`). Neither tape-marks nor walkaround
-    /// recapture it, so starting either from the level screen -- before
-    /// Calibrate -- would silently record against a stale reference from
-    /// however long ago calibration last actually ran. Reaching the
-    /// configuring screen means calibration already either ran fresh or was
-    /// a deliberate, conscious skip, so this only guards `.level`.
+    /// (re)captured by `calibrateAttitude()` ("OK" on the level screen).
+    /// Neither tape-marks nor walkaround recapture it, so starting either
+    /// from the level screen -- before pressing OK -- would silently record
+    /// against whatever reference was left over from the previous launch.
+    /// Reaching the configuring screen means calibration has already run
+    /// fresh (unconditional now, no skip path), so this only guards
+    /// `.level`.
     ///
     /// The `.simultaneousGesture(DragGesture(minimumDistance: 0))` exists
     /// only to flip `isDistanceCalLabelPressActive` -- see that property's
@@ -596,10 +640,12 @@ struct InferenceView: View {
             flashToast("LOCKED")
             return
         }
-        // Cycles nano<->small only -- medium stays reachable by voice command
-        // alone (see DetectorModel's doc comment), same boundary the old
-        // swipe grid drew.
-        let target: DetectorModel = modelManager.selectedModel == .nano ? .small : .nano
+        // Cycles nano -> small -> medium -> nano -- voice command (the
+        // original way to reach medium, see DetectorModel's doc comment)
+        // proved unreliable in practice, so this is the only path to medium now.
+        let allModels = DetectorModel.allCases
+        let currentIndex = allModels.firstIndex(of: modelManager.selectedModel) ?? 0
+        let target = allModels[(currentIndex + 1) % allModels.count]
         DebugFileLogger.log("tap: MATCHED selectModel(\(target.rawValue))")
         modelManager.switchModel(to: target)
     }
@@ -610,9 +656,14 @@ struct InferenceView: View {
             flashToast("LOCKED")
             return
         }
-        let enabled = !modelManager.isHighResEnabled
-        DebugFileLogger.log("tap: MATCHED setHighRes(\(enabled))")
-        modelManager.setHighResEnabled(enabled)
+        if modelManager.isHighResEnabled {
+            // Turning off -- back to the safe default, no confirmation needed.
+            DebugFileLogger.log("tap: MATCHED setHighRes(false)")
+            modelManager.setHighResEnabled(false)
+        } else {
+            DebugFileLogger.log("tap: MATCHED highResConfirmationPrompt")
+            showHighResConfirmation = true
+        }
     }
 
     private func toggleLowLight() {
@@ -624,12 +675,25 @@ struct InferenceView: View {
         // Cycles auto -> on -> off -> auto -- all three states, since voice
         // commands (the only other way to reach "auto") are currently off.
         if cameraManager.isAutoLowLightEnabled {
+            pendingLowLightTarget = .on
+        } else if cameraManager.isLowLightBoostEnabled {
+            pendingLowLightTarget = .off
+        } else {
+            pendingLowLightTarget = .auto
+        }
+        DebugFileLogger.log("tap: MATCHED lowLightConfirmationPrompt(\(pendingLowLightTarget.label))")
+        showLowLightConfirmation = true
+    }
+
+    private func applyPendingLowLightTarget() {
+        switch pendingLowLightTarget {
+        case .on:
             DebugFileLogger.log("tap: MATCHED setLowLightBoost(true)")
             cameraManager.setLowLightBoost(true)
-        } else if cameraManager.isLowLightBoostEnabled {
+        case .off:
             DebugFileLogger.log("tap: MATCHED setLowLightBoost(false)")
             cameraManager.setLowLightBoost(false)
-        } else {
+        case .auto:
             DebugFileLogger.log("tap: MATCHED enableAutoLowLight")
             cameraManager.enableAutoLowLight()
         }
@@ -641,9 +705,9 @@ struct InferenceView: View {
             flashToast("LOCKED")
             return
         }
-        let enabled = !cameraManager.isStabilizationEnabled
-        DebugFileLogger.log("tap: MATCHED setStabilization(\(enabled))")
-        cameraManager.setStabilizationEnabled(enabled)
+        pendingStabilizationEnabled = !cameraManager.isStabilizationEnabled
+        DebugFileLogger.log("tap: MATCHED stabilizationConfirmationPrompt(\(pendingStabilizationEnabled))")
+        showStabilizationConfirmation = true
     }
 
     init(modelManager: ModelManager) {
@@ -717,8 +781,6 @@ struct InferenceView: View {
                 withSessionGestures(distanceCalibrationPitchScreen(round: round))
             } else {
                 switch sessionPhase {
-                case .calibratePrompt:
-                    withSessionGestures(calibratePromptScreen)
                 case .level:
                     withSessionGestures(levelScreen)
                 case .configuring:
@@ -726,6 +788,19 @@ struct InferenceView: View {
                 case .driving:
                     withSessionGestures(drivingScreen)
                 }
+            }
+
+            // Structural SIBLING to the big if/else chain above, not nested
+            // inside it -- see levelScreen's own doc comment for why:
+            // YawMarker's drag gesture never fired at all while it was a
+            // DESCENDANT of withSessionGestures's gesture wrapper, even
+            // with .highPriorityGesture. Mirrors that chain's own gating
+            // conditions so this only shows during the plain level screen,
+            // not on top of the other calibration sub-flows.
+            if sessionPhase == .level, !isChoosingTapeMarkCount, tapeMarkDistanceIndex == nil,
+               !isCalibrationRecording, !isWalkaroundRecording, distanceCalibrationRound == nil {
+                YawBand(isMountYawOK: isMountYawOK)
+                YawMarker(cameraManager: cameraManager, isFlashing: showYawDetectionFlash)
             }
 
             // Hoisted here (once) rather than duplicated per-screen --
@@ -769,14 +844,23 @@ struct InferenceView: View {
         .onReceive(thermalBlinkTimer) { _ in
             thermalBlinkOn.toggle()
         }
+        .onChange(of: cameraManager.isLowLightBoostEnabled) { _, _ in
+            updateBrightnessForLowLight()
+        }
         .onAppear {
             DebugFileLogger.reset()
             DetectionLogger.reset()
+            // Starts the preview-only session immediately on launch -- used
+            // to wait for "Yes" on the now-removed calibrate-prompt screen,
+            // but the app now goes straight to the level screen, so the
+            // live camera feed (and yaw auto-detect, see levelScreen's own
+            // onAppear) needs to be up from the very first frame.
+            cameraManager.start(recording: false)
             // Keeps the screen (and thus the camera/recording) awake for the whole
             // drive instead of auto-locking after the idle timeout.
             UIApplication.shared.isIdleTimerDisabled = true
             previousBrightness = UIScreen.main.brightness
-            UIScreen.main.brightness = 1.0
+            updateBrightnessForLowLight()
             UIDevice.current.isBatteryMonitoringEnabled = true
             batteryLevel = UIDevice.current.batteryLevel
             batteryState = UIDevice.current.batteryState
@@ -791,7 +875,8 @@ struct InferenceView: View {
                     lowLightEnabled: cameraManager?.isLowLightBoostEnabled ?? false,
                     autoLowLightEnabled: cameraManager?.isAutoLowLightEnabled ?? true,
                     stabilizationEnabled: cameraManager?.isStabilizationEnabled ?? false,
-                    parametersLocked: isLocked.wrappedValue
+                    parametersLocked: isLocked.wrappedValue,
+                    yawReferenceNormalizedX: cameraManager?.yawReferenceNormalizedX ?? CameraManager.defaultYawMarkerNormalizedX
                 )
             }
             // PitchSensor/EgoSpeedManager run for the app's whole lifetime, not
@@ -847,163 +932,170 @@ struct InferenceView: View {
         }
     }
 
-    // MARK: — Calibrate-prompt screen
-
-    private var calibratePromptScreen: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: 32) {
-                Text("Calibrate?")
-                    .font(.system(size: 40, weight: .bold))
-                    .foregroundStyle(.white)
-                Text("Only needed when the phone is freshly mounted --\nnot if the mount hasn't moved, and not if the car\nitself isn't on level ground right now.")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.6))
-                    .multilineTextAlignment(.center)
-                calibrationDriftText
-                HStack(spacing: 16) {
-                    Button {
-                        confirmCalibrate()
-                    } label: {
-                        Text("Yes")
-                            .font(.system(size: 28, weight: .bold))
-                            .foregroundStyle(.black)
-                            .padding(.horizontal, 40)
-                            .frame(height: 72)
-                            .background(Color.yellow, in: Capsule())
-                    }
-                    Button {
-                        skipCalibration()
-                    } label: {
-                        Text("No")
-                            .font(.system(size: 28, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 40)
-                            .frame(height: 72)
-                            .background(Color.black.opacity(0.5), in: Capsule())
-                    }
-                }
-                .padding(.top, 8)
-            }
-        }
-    }
-
-    /// 2026-08-12: shows live pitch/roll against whatever's persisted from the
-    /// last calibration, right at the Yes/No decision -- turns "No" from a
-    /// blind trust into an informed one. Deliberately NOT auto-capturing a
-    /// fresh reference on skip instead (a tempting simpler alternative):
-    /// that would silently bake in whatever grade/camber the car happens to
-    /// be sitting on right now, exactly the hill/camber misattribution the
-    /// reference-not-live design exists to avoid -- see DistanceEstimator.swift's
-    /// file-level comment. Showing the drift preserves the user's own judgment
-    /// call instead of replacing it. nil (no text shown) until there's both a
-    /// live reading and a previously-persisted reference to compare against --
-    /// e.g. the very first launch, before any calibration has ever happened.
-    @ViewBuilder
-    private var calibrationDriftText: some View {
-        if let pitchDrift = pitchSensor.pitchDriftDegrees {
-            let rollDrift = pitchSensor.rollDriftDegrees ?? 0
-            let notable = abs(pitchDrift) > 0.3 || abs(rollDrift) > 0.3
-            Text(String(format: "drift since last calibration: pitch %+.1f°, roll %+.1f°", pitchDrift, rollDrift))
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(notable ? .yellow : .white.opacity(0.5))
-        }
-    }
-
     // MARK: — Level screen
 
-    /// A fixed vertical line marking where a real-world dash point sits on
-    /// screen when yaw is correctly zeroed -- lets yaw be rechecked/redone
-    /// any time just by looking at the live preview and nudging the mount
-    /// until that same real-world point sits back on this line, instead of
-    /// needing the laser-in-the-V-groove routine every time (see
-    /// [[project-following-distance-measurement]]'s yaw-alignment entries).
-    ///
-    /// `referenceNormalizedX` was RE-MEASURED 2026-08-16 against
-    /// `data/26_08_16_TestDrive_LowRes_Nano_Day/recording-20260816-132942.MOV`
-    /// -- the same dash-mounted yellow stick, after Rick slightly realigned
-    /// the mount's yaw before this drive (confirmed: the realignment was
-    /// done before recording started, not mid-drive, so the whole clip
-    /// reflects the one, current alignment). Superseded the 2026-08-15
-    /// measurement below because the mount was physically touched since
-    /// then -- same reasoning as that entry superseding 2026-08-11's: a
-    /// screen-space reference line is only as good as the last time the
-    /// real mount was measured, not assumed stable indefinitely.
-    ///
-    /// Measurement method: same as 2026-08-15 below -- centroid of yellow
-    /// pixels (`r>180, g>130, b<100`) within a fixed ROI around the real
-    /// (bottom, sharply-focused) stick, avoiding its blurrier windshield
-    /// reflection above the wiper-arm band. Pooled across 11 frames (t=600/
-    /// 800/1000/1200/1500/2100/2400/3000/3600/3900/4000s, ~125k pixels
-    /// total) spanning nearly the full 69-minute drive. 5 other candidate
-    /// frames were excluded: one (t=200s, near the start) read notably off
-    /// from the rest of the cluster (cx 1194.8 vs. a ~1245-1257 cluster,
-    /// consistent with the same "unstable near the start" pattern the
-    /// 2026-08-15 measurement found); four others (t=400/1800/2700/3300s)
-    /// returned under 5k yellow pixels each (one as low as 324) against a
-    /// healthy ~11k on good frames -- almost certainly glare or a passing
-    /// shadow partially washing out the stick, not a real position change,
-    /// but their centroids were also visibly biased (lower cy) so excluded
-    /// rather than trusted. Result: pooled centroid x=1251.35 of 1920,
-    /// normalized 0.6517 -- NOT eyeballed. Only ~10px (~0.5%) from the
-    /// prior 0.6466, consistent with Rick's own description of the
-    /// adjustment as "slight."
-    ///
-    /// (2026-08-15 measurement, superseded above -- kept for history:
-    /// against `data/26_08_15_Walkaround/recording-20260815-123041.MOV`, a
-    /// yellow stick added to the dash for exactly this purpose, captured
-    /// with yaw deliberately at zero. That measurement itself superseded
-    /// the original 2026-08-11 measurement (0.5295, from a laser dot in
-    /// `data/26_08_11_YawCalibration/recording-20260811-130522.MOV`)
-    /// because that clip had `stabilizationEnabled: false` logged, while
-    /// the walkaround clip had it `true` -- the same stabilization-crop
-    /// mismatch already root-caused for the tape-mark-vs-cone distance-
-    /// calibration discrepancy applied here too. Centroid of yellow pixels
-    /// pooled across 6 frames (t=150/250/350/450/550/650s, ~192k pixels
-    /// total) from a confirmed-stable window -- frames near the start
-    /// (t=20-60s) and end (t=750-800s) of that recording showed the
-    /// stick's screen position shifted by several percent of frame width,
-    /// almost certainly from the mount/car being disturbed while getting
-    /// in/out for the test. Result: centroid x=2482.95 of 3840, normalized
-    /// 0.6466.)
-    ///
-    /// Resolution (3840x2160 for the 2026-08-15 measurement vs. 1920x1080
-    /// for both the 2026-08-16 measurement and the live preview) doesn't
-    /// matter here -- both share the same 16:9 aspect ratio, and a
-    /// normalized X fraction is resolution-independent as long as the
-    /// field of view matches (already established: pure resolution changes
-    /// don't shift normalized geometry, only a stabilization/crop change
-    /// does -- see this file's own DistanceEstimator.calibrated history for
-    /// the precedent).
-    ///
-    /// `CameraPreviewView`'s `.resizeAspectFill` means this can't just be
-    /// `referenceNormalizedX * screenWidth` -- the buffer is scaled to fill
-    /// the view and center-cropped on whichever axis overflows, so the crop
-    /// offset has to be computed from the actual runtime view size (device
-    /// screen aspect ratio isn't assumed/hardcoded here).
-    private struct YawReferenceLine: View {
-        static let referenceNormalizedX: CGFloat = 0.6517
-        private static let videoWidth: CGFloat = 1920
-        private static let videoHeight: CGFloat = 1080
+    /// Shared video-to-screen x math for the yaw calibration overlays
+    /// (YawBand, YawMarker) -- the camera preview scales to fill the view
+    /// and center-crops on whichever axis overflows, so converting a
+    /// normalized video-space x into a screen-space x needs the actual
+    /// runtime view size, not a hardcoded device aspect ratio. Was inline
+    /// in the old single-line YawReferenceLine; factored out since two
+    /// separate overlays need the same math now.
+    private enum YawOverlayGeometry {
+        static let videoWidth: CGFloat = 1920
+        static let videoHeight: CGFloat = 1080
+
+        static func displayedWidth(in geo: GeometryProxy) -> CGFloat {
+            let scale = max(geo.size.width / videoWidth, geo.size.height / videoHeight)
+            return videoWidth * scale
+        }
+
+        static func screenX(forNormalizedX normalizedX: CGFloat, in geo: GeometryProxy) -> CGFloat {
+            let displayed = displayedWidth(in: geo)
+            let originX = (geo.size.width - displayed) / 2
+            return originX + normalizedX * displayed
+        }
+
+        static func screenWidth(forNormalizedWidth normalizedWidth: CGFloat, in geo: GeometryProxy) -> CGFloat {
+            normalizedWidth * displayedWidth(in: geo)
+        }
+    }
+
+    /// Coarse, FIXED-position "is the mount roughly sane" sanity check --
+    /// replaces the old single-pixel-precise YawReferenceLine, which is now
+    /// two separate things: this band (a stable expectation about the
+    /// mount hardware, never re-measured) and YawMarker below (the
+    /// precise, per-session measurement). Deliberately not yellow, so the
+    /// actual yellow marker doesn't visually blend into it when correctly
+    /// aligned -- that's exactly the case where standing out matters most.
+    /// Border color mirrors the roll readout's own green/white convention,
+    /// extended to a third (orange) "needs attention" state -- see
+    /// ContentView.isMountYawOK.
+    private struct YawBand: View {
+        // Placeholder pending real data on how much residual yaw offset the
+        // fine per-session correction can actually absorb -- same "don't
+        // pretend to precision we don't have yet" discipline as
+        // path_awareness.py's own placeholder constants. Revisit once
+        // there's a real basis to tune this against.
+        static let halfWidthNormalized: CGFloat = 0.04
+
+        var isMountYawOK: Bool
 
         var body: some View {
             GeometryReader { geo in
-                let scale = max(geo.size.width / Self.videoWidth, geo.size.height / Self.videoHeight)
-                let displayedWidth = Self.videoWidth * scale
-                let originX = (geo.size.width - displayedWidth) / 2
-                let x = originX + Self.referenceNormalizedX * displayedWidth
+                let centerX = YawOverlayGeometry.screenX(forNormalizedX: CameraManager.defaultYawMarkerNormalizedX, in: geo)
+                let width = YawOverlayGeometry.screenWidth(forNormalizedWidth: 2 * Self.halfWidthNormalized, in: geo)
                 Rectangle()
-                    .fill(Color.yellow.opacity(0.85))
-                    .frame(width: 4, height: geo.size.height)
-                    .position(x: x, y: geo.size.height / 2)
+                    .fill(Color.white.opacity(0.15))
+                    .overlay(
+                        Rectangle()
+                            .stroke(isMountYawOK ? Color.green.opacity(0.7) : Color.orange.opacity(0.8), lineWidth: 2)
+                    )
+                    .frame(width: width, height: geo.size.height)
+                    .position(x: centerX, y: geo.size.height / 2)
             }
-            // Without this, GeometryReader is only proposed the safe-area-
-            // inset size, not the true full-screen bounds CameraPreviewView
-            // itself fills (see its own `.ignoresSafeArea()`) -- the line
-            // stopped short of the real screen edges, matching the reported
-            // "doesn't go all the way to the bottom" symptom exactly.
             .ignoresSafeArea()
             .allowsHitTesting(false)
+        }
+    }
+
+    /// Precise, per-session yaw-calibration marker -- positioned at
+    /// cameraManager.yawReferenceNormalizedX (auto-detected on level-screen
+    /// appear, see runYawAutoDetect), draggable for manual fine adjustment
+    /// when auto-detection needs correcting.
+    ///
+    /// Drag movement is scaled down from actual finger movement (dragScale
+    /// below) rather than 1:1, so a full swipe across the screen only moves
+    /// the marker a small, precise amount -- addresses the "fat finger"
+    /// imprecision problem a direct drag would have against a target this
+    /// narrow (see the design discussion this came out of). The tappable
+    /// hit area is much wider than the visible line for the same reason,
+    /// applied to STARTING the drag rather than moving it.
+    private struct YawMarker: View {
+        // How much of actual finger movement translates to marker
+        // movement -- 0.25 means dragging 100pt across the screen moves
+        // the marker by the normalized-x equivalent of 25pt of on-screen
+        // travel. Placeholder, not yet validated against how much
+        // precision this actually needs in practice.
+        static let dragScale: CGFloat = 0.25
+        private static let hitAreaWidth: CGFloat = 100
+
+        @ObservedObject var cameraManager: CameraManager
+        var isFlashing: Bool
+
+        @State private var dragStartNormalizedX: CGFloat?
+        @State private var liveNormalizedX: CGFloat?
+
+        private var displayedNormalizedX: CGFloat {
+            liveNormalizedX ?? cameraManager.yawReferenceNormalizedX
+        }
+
+        var body: some View {
+            GeometryReader { geo in
+                let x = YawOverlayGeometry.screenX(forNormalizedX: displayedNormalizedX, in: geo)
+                ZStack {
+                    // Generous drag catcher -- the right HALF of the screen
+                    // (away from the OK button and "Distance cal" label,
+                    // both on the left), not a narrow region around the
+                    // line. THREE narrower attempts before this (a nested
+                    // Color.clear+contentShape rectangle; layered .frame+
+                    // .contentShape on the line itself; highPriorityGesture;
+                    // a structural-sibling restructure out of
+                    // withSessionGestures) all registered ZERO drag events
+                    // on-device, confirmed via debug log each time -- this
+                    // sidesteps hit-testing precision entirely rather than
+                    // refining it further. Color.white.opacity(0.001), not
+                    // Color.clear -- a known SwiftUI workaround for cases
+                    // where a truly transparent color's hit-testing doesn't
+                    // reliably register despite .contentShape.
+                    //
+                    // Includes a diagnostic .simultaneousGesture(TapGesture)
+                    // logging separately from the drag: if a plain tap ALSO
+                    // never registers, that points to something more
+                    // fundamental about this screen region intercepting
+                    // ALL touches, not a drag-specific issue.
+                    Color.white.opacity(0.001)
+                        .frame(width: geo.size.width / 2, height: geo.size.height)
+                        .position(x: geo.size.width * 0.75, y: geo.size.height / 2)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    let base = dragStartNormalizedX ?? cameraManager.yawReferenceNormalizedX
+                                    if dragStartNormalizedX == nil {
+                                        dragStartNormalizedX = base
+                                        DebugFileLogger.log("yaw-marker: drag STARTED base=\(base)")
+                                    }
+                                    let displayedWidth = YawOverlayGeometry.displayedWidth(in: geo)
+                                    let delta = (value.translation.width * Self.dragScale) / displayedWidth
+                                    liveNormalizedX = base + delta
+                                }
+                                .onEnded { _ in
+                                    DebugFileLogger.log("yaw-marker: drag ENDED")
+                                    if let final = liveNormalizedX {
+                                        cameraManager.setYawReferenceNormalizedX(final)
+                                    }
+                                    dragStartNormalizedX = nil
+                                    liveNormalizedX = nil
+                                }
+                        )
+                        .simultaneousGesture(
+                            TapGesture().onEnded {
+                                DebugFileLogger.log("yaw-marker: TAP registered (diagnostic)")
+                            }
+                        )
+                    Rectangle()
+                        .fill(Color.yellow.opacity(isFlashing ? 1.0 : 0.85))
+                        .frame(width: isFlashing ? 8 : 4, height: geo.size.height)
+                        .position(x: x, y: geo.size.height / 2)
+                        .animation(.easeOut(duration: 0.3), value: isFlashing)
+                        .allowsHitTesting(false)
+                }
+            }
+            // Same GeometryReader full-bounds fix as the old YawReferenceLine
+            // needed -- see git history if this regresses ("doesn't go all
+            // the way to the bottom").
+            .ignoresSafeArea()
         }
     }
 
@@ -1011,15 +1103,142 @@ struct InferenceView: View {
         Int((pitchSensor.rollDegrees ?? 0).rounded())
     }
 
+    /// Live pitch minus `PitchSensor.defaultMountPitchDegrees`, rounded --
+    /// so the level screen can show "0" at the mount's known-good tilt
+    /// instead of the raw absolute pitch (which is never near 0, see
+    /// `defaultMountPitchDegrees`'s doc comment). Falls back to 0 (reads as
+    /// "on target") when no reading exists yet, same convention as
+    /// `rollDegreesRounded`.
+    private var pitchOffsetDegreesRounded: Int {
+        guard let pitch = pitchSensor.pitchDegrees else { return 0 }
+        return Int((pitch - PitchSensor.defaultMountPitchDegrees).rounded())
+    }
+
+    /// The three mount-status checks, split out so YawBand's border color,
+    /// the on-screen verdict text, and (eventually) any hard gate on
+    /// starting a drive all read the same computed truth rather than
+    /// three separately-eyeballed signals -- see the design discussion
+    /// this came out of: "takes the guesswork out of whether to
+    /// calibrate." Fine per-session calibration (pitch/roll reference
+    /// capture, yaw auto-detect) always runs regardless of these --
+    /// they're only about whether the PHYSICAL mount needs a manual nudge
+    /// on top of that.
+    private var isMountRollOK: Bool {
+        abs(rollDegreesRounded) <= 1
+    }
+
+    private var isMountPitchOK: Bool {
+        abs(pitchOffsetDegreesRounded) <= 1
+    }
+
+    private var isMountYawOK: Bool {
+        abs(cameraManager.yawReferenceNormalizedX - CameraManager.defaultYawMarkerNormalizedX) <= YawBand.halfWidthNormalized
+    }
+
+    private var isMountOK: Bool {
+        isMountRollOK && isMountPitchOK && isMountYawOK
+    }
+
+    /// Runs yaw auto-detection unconditionally on level-screen appear --
+    /// unlike pitch/roll (which has a skip-and-reuse-persisted path, see
+    /// `skipCalibration`), fine yaw calibration has no stationary/level
+    /// precondition to worry about, so there's no reason to ever skip it.
+    /// A short delay gives the camera session (just started by
+    /// `confirmCalibrate`) time to actually produce a frame -- detection
+    /// against no frame yet just leaves the previous value in place (see
+    /// `CameraManager.detectYawMarker`), not a crash, but retrying blind
+    /// immediately would likely just fail the first time every launch.
+    private func runYawAutoDetect() {
+        Task {
+            try? await Task.sleep(for: .seconds(0.4))
+            guard cameraManager.detectYawMarker() != nil else {
+                DebugFileLogger.log("yaw-detect: FAILED no confident marker found")
+                return
+            }
+            DebugFileLogger.log("yaw-detect: MATCHED x=\(cameraManager.yawReferenceNormalizedX)")
+            withAnimation { showYawDetectionFlash = true }
+            try? await Task.sleep(for: .seconds(0.4))
+            withAnimation { showYawDetectionFlash = false }
+        }
+    }
+
+    /// Circular arc + arrowhead (SF Symbol, not hand-drawn) pointing the
+    /// direction to rotate the mount to null out roll -- shown only while
+    /// isMountRollOK is false. `needsClockwise = rollDegrees > 0` is a
+    /// CHOSEN, not bench-confirmed, convention -- rollDegrees's own sign
+    /// (atan2(gy, -gx)) is itself flagged not-yet-bench-confirmed in
+    /// PitchSensor.swift, so treat this arrow's direction the same way:
+    /// confirm which way an actual mount nudge moves the reading toward
+    /// zero before trusting it blindly.
+    private struct RollNudgeIndicator: View {
+        var rollDegrees: Double
+        private var needsClockwise: Bool { rollDegrees > 0 }
+
+        var body: some View {
+            VStack(spacing: 4) {
+                Image(systemName: needsClockwise ? "arrow.clockwise" : "arrow.counterclockwise")
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundStyle(.orange)
+                Text("Roll")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.orange.opacity(0.8))
+            }
+            .shadow(color: .black.opacity(0.7), radius: 4)
+        }
+    }
+
+    /// A thin plane rendered with a genuine 3D tilt (rotation3DEffect, not
+    /// a flat skew) plus an up/down chevron -- shown only while
+    /// isMountPitchOK is false, indicating which way to tilt the phone's
+    /// nose. CONFIRMED 2026-08-18 on-device: the original `< reference`
+    /// condition pointed the wrong direction -- flipped to `>`. Caller
+    /// passes `needsNoseDown` computed from the live reading vs.
+    /// `PitchSensor.defaultMountPitchDegrees`.
+    private struct PitchNudgeIndicator: View {
+        var needsNoseDown: Bool
+
+        var body: some View {
+            VStack(spacing: 4) {
+                Image(systemName: needsNoseDown ? "chevron.down" : "chevron.up")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(.orange)
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.orange.opacity(0.85))
+                    .frame(width: 56, height: 8)
+                    .rotation3DEffect(
+                        .degrees(needsNoseDown ? -25 : 25),
+                        axis: (x: 1, y: 0, z: 0),
+                        perspective: 0.6
+                    )
+                Text("Pitch")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.orange.opacity(0.8))
+            }
+            .shadow(color: .black.opacity(0.7), radius: 4)
+        }
+    }
+
     /// Live camera preview shows through from `body` (see the
     /// `sessionPhase == .level` case added to its visibility condition) --
     /// deliberately no opaque background here anymore, matching
-    /// `distanceCalibrationPitchScreen`'s pattern, so `YawReferenceLine` and
-    /// the dash behind it are actually visible. Text shadows replace the
+    /// `distanceCalibrationPitchScreen`'s pattern, so the yaw overlays and
+    /// the dash behind them are actually visible. Text shadows replace the
     /// old solid-black backdrop for legibility over live video.
+    ///
+    /// YawBand/YawMarker are NOT here anymore -- moved to a sibling in the
+    /// outer ZStack (see body), OUTSIDE withSessionGestures's wrapping.
+    /// CONFIRMED 2026-08-18 via on-device debug log: YawMarker's drag
+    /// gesture never fired at all (not even once) while nested inside
+    /// withSessionGestures's content, even with .highPriorityGesture --
+    /// that modifier resolves parent/child priority within one view's own
+    /// ancestor chain, not sibling z-order conflicts within a ZStack, and
+    /// something about being a DESCENDANT of withSessionGestures's
+    /// .contentShape(Rectangle()) + .simultaneousGesture(LongPressGesture)
+    /// wrapper was swallowing the touch before YawMarker ever saw it.
+    /// Making it a structural SIBLING instead of a descendant sidesteps
+    /// the whole question of gesture priority rather than resolving it.
     private var levelScreen: some View {
         ZStack {
-            YawReferenceLine()
             // Top-left corner label, same low-key styling and tap trigger
             // as configuringScreen's -- not wrapped in the full settingsHUD
             // (its resolution/model/stabilization labels don't apply here,
@@ -1038,14 +1257,47 @@ struct InferenceView: View {
             }
             .padding()
             VStack(spacing: 32) {
-                Text("\(rollDegreesRounded)°")
-                    .font(.system(size: 96, weight: .bold, design: .rounded))
-                    .foregroundStyle(abs(rollDegreesRounded) <= 1 ? .green : .white)
+                // The explicit go/no-go verdict -- see isMountOK's doc
+                // comment for why this exists as its own line instead of
+                // leaving Rick to mentally combine the roll color and the
+                // yaw band by eye.
+                Text(isMountOK ? "MOUNT OK" : "NUDGE MOUNT")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(isMountOK ? .green : .orange)
                     .shadow(color: .black.opacity(0.7), radius: 4)
-                Text("from level")
-                    .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.8))
+                if !isMountOK {
+                    VStack(spacing: 4) {
+                        if !isMountPitchOK {
+                            Text("Pitch must be within 1° of reference")
+                        }
+                        if !isMountRollOK {
+                            Text("Roll must be between -1° and 1°")
+                        }
+                        if !isMountYawOK {
+                            Text("Yellow dash stick must be in band")
+                        }
+                    }
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .shadow(color: .black.opacity(0.7), radius: 3)
+                }
+                Text("Pitch: \(pitchOffsetDegreesRounded)°   Roll: \(rollDegreesRounded)°")
+                    .font(.system(size: 52, weight: .bold, design: .rounded))
+                    .foregroundStyle(isMountPitchOK && isMountRollOK ? .green : .white)
                     .shadow(color: .black.opacity(0.7), radius: 4)
+                if !isMountPitchOK || !isMountRollOK {
+                    HStack(spacing: 32) {
+                        if !isMountPitchOK {
+                            PitchNudgeIndicator(
+                                needsNoseDown: (pitchSensor.pitchDegrees ?? PitchSensor.defaultMountPitchDegrees)
+                                    > PitchSensor.defaultMountPitchDegrees
+                            )
+                        }
+                        if !isMountRollOK {
+                            RollNudgeIndicator(rollDegrees: pitchSensor.rollDegrees ?? 0)
+                        }
+                    }
+                }
                 // Added 2026-08-11 to make the pitch-sign hand-tilt check
                 // (DistanceEstimator.swift's file-level warning: "tilt the
                 // mounted phone's nose down by hand and confirm pitchDegrees
@@ -1054,31 +1306,56 @@ struct InferenceView: View {
                 // distance-entry flow. One decimal place, not rounded to a
                 // whole degree, so a small hand tilt visibly moves the
                 // number instead of needing a large exaggerated motion to
-                // see any change at all.
-                Text(pitchSensor.pitchDegrees.map { String(format: "pitch %.1f°", $0) } ?? "pitch --")
+                // see any change at all. Kept alongside the new reference-
+                // relative "Pitch: X°" readout above, not replaced by it --
+                // this is the raw sensor value that formula actually needs.
+                Text(pitchSensor.pitchDegrees.map { String(format: "absolute pitch: %.1f°", $0) } ?? "absolute pitch: --")
                     .font(.system(size: 20, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.6))
                     .shadow(color: .black.opacity(0.7), radius: 4)
             }
 
-            // 2026-08-12: moved out to the far left, vertically centered --
-            // was previously stacked centered with the roll/pitch readout
-            // above, which covered YawReferenceLine's dot right when the
-            // user needs an unobstructed view of it (this screen's whole
-            // point is checking yaw alignment against that dot).
-            HStack {
-                Button {
-                    calibrateAttitude()
-                } label: {
-                    Text("Calibrate")
-                        .font(.system(size: 32, weight: .bold))
-                        .foregroundStyle(.black)
-                        .frame(width: 220, height: 80)
-                        .background(Color.yellow, in: Capsule())
-                }
-                .padding(.leading, 12)
+            // 2026-08-12: moved out to the far left -- was previously
+            // stacked centered with the roll/pitch readout above, which
+            // covered the yaw marker right when the user needs an
+            // unobstructed view of it (this screen's whole point is
+            // checking yaw alignment against the band). CONFIRMED 2026-08-18
+            // on-device: vertically centered (as it was) put it directly
+            // behind the center readout's left edge once that readout grew
+            // wider (pitch+roll combined, plus reasons/indicators) --
+            // pinned to the bottom-left corner instead so it can't collide
+            // with the center content regardless of that content's width.
+            VStack {
                 Spacer()
+                HStack {
+                    Button {
+                        tapOK()
+                    } label: {
+                        Text("OK")
+                            .font(.system(size: 32, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 220, height: 80)
+                            .background(Color.yellow, in: Capsule())
+                    }
+                    .padding(.leading, 12)
+                    .padding(.bottom, 12)
+                    .confirmationDialog(
+                        "Mount out of tolerance -- continue anyway?",
+                        isPresented: $showNudgeMountConfirmation,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Continue Anyway") {
+                            DebugFileLogger.log("tap: MATCHED nudgeMountConfirmed")
+                            calibrateAttitude()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    }
+                    Spacer()
+                }
             }
+        }
+        .onAppear {
+            runYawAutoDetect()
         }
     }
 
@@ -1318,7 +1595,12 @@ struct InferenceView: View {
     /// by any of this screen's own UI.
     private func distanceCalibrationPitchScreen(round: Int) -> some View {
         ZStack {
-            YawReferenceLine()
+            // Fixed reference only here (not the draggable YawMarker too --
+            // this screen has its own tape-mark-based interaction model,
+            // dragging a yaw crosshair on top of it would just be
+            // confusing) -- same purpose as before: a stable visual anchor
+            // to check the camera hasn't rotated between rounds.
+            YawBand(isMountYawOK: isMountYawOK)
             distanceCalibrationPitchScreenContent(round: round)
         }
     }
@@ -1597,6 +1879,17 @@ struct InferenceView: View {
                 Text(stabilizationLabel)
                     .hudLabelStyle()
                     .onTapGesture { toggleStabilization() }
+                    .confirmationDialog(
+                        "Turn stabilization \(pendingStabilizationEnabled ? "on" : "off")?",
+                        isPresented: $showStabilizationConfirmation,
+                        titleVisibility: .visible
+                    ) {
+                        Button(pendingStabilizationEnabled ? "Turn On" : "Turn Off") {
+                            DebugFileLogger.log("tap: MATCHED setStabilization(\(pendingStabilizationEnabled))")
+                            cameraManager.setStabilizationEnabled(pendingStabilizationEnabled)
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    }
             }
             Spacer()
             HStack {
@@ -1604,6 +1897,17 @@ struct InferenceView: View {
                     Text(resolutionLabel)
                         .hudLabelStyle()
                         .onTapGesture { toggleResolution() }
+                        .confirmationDialog(
+                            "Enable high-res? This significantly increases per-frame latency.",
+                            isPresented: $showHighResConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Enable") {
+                                DebugFileLogger.log("tap: MATCHED setHighRes(true)")
+                                modelManager.setHighResEnabled(true)
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        }
                     Text(modelLabel)
                         .hudLabelStyle()
                         .onTapGesture { toggleModel() }
@@ -1612,6 +1916,16 @@ struct InferenceView: View {
                 Text(lowLightLabel)
                     .hudLabelStyle()
                     .onTapGesture { toggleLowLight() }
+                    .confirmationDialog(
+                        "Set low-light to \(pendingLowLightTarget.label)?",
+                        isPresented: $showLowLightConfirmation,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Set to \(pendingLowLightTarget.label.capitalized)") {
+                            applyPendingLowLightTarget()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    }
             }
         }
         .padding(.horizontal, 12)
