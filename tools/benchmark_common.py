@@ -47,13 +47,25 @@ def parse_imgsz(value: str):
 # Validated categorical palette (dataviz skill's default), assigned in a
 # FIXED order keyed to config identity — a config keeps its color whether or
 # not other configs appear in a given chart, never reassigned by rank.
-CONFIG_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+# CONFIRMED gap 2026-08-20: this used to be model x two-pass only, from
+# before the high-res ML-inference toggle (added 2026-08-17) existed --
+# config_label (benchmark.py) now includes resolution too, so a chart for a
+# model x resolution matrix session needs those combos in here as well or
+# `c in stats` below would never match, silently dropping every bar. Two
+# resolution values exist in practice (ModelManager.baseResolutionLabel/
+# highResResolutionLabel) -- medium has no high-res export, so
+# "medium, res 1920x1088, ..." is a harmless never-populated slot, not a bug.
+CONFIG_COLORS = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
+    "#8b5fbf", "#c94f4f", "#4fb0af", "#b0a13f", "#5f8bbf", "#bf5f96",
+]
 CONFIG_ORDER = [
-    f"{name}, two-pass {state}"
+    f"{name}, res {resolution}, two-pass {state}"
     for name in ("nano", "small", "medium")
+    for resolution in ("1152x640", "1920x1088")
     for state in ("off", "on")
 ]
-CONFIG_COLOR_BY_LABEL = dict(zip(CONFIG_ORDER, CONFIG_COLORS))
+CONFIG_COLOR_BY_LABEL = dict(zip(CONFIG_ORDER, CONFIG_COLORS * (len(CONFIG_ORDER) // len(CONFIG_COLORS) + 1)))
 
 
 def precision_recall_f1(tp: int, fp: int, fn: int) -> tuple:

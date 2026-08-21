@@ -48,54 +48,153 @@ final class CameraManager: NSObject, ObservableObject {
     /// last session's choice).
     @Published private(set) var isStabilizationEnabled = true
 
-    /// Normalized [0,1] x-position of the yaw-calibration marker (a small,
-    /// distinctly-colored object fixed to the dash, assumed rigid relative
-    /// to the car body) -- read fresh EVERY session via detectYawMarker()
-    /// (ContentView.runYawAutoDetect, unconditional, no skip path), same
-    /// "don't assume calibration" discipline as PitchSensor's
+    /// The near-focus lens position actually used for the whole yaw
+    /// calibration flow -- see `settleAndLockNearFieldFocus`. Added by
+    /// request 2026-08-20: the empirically-swept `defaultNearFocusLensPosition`
+    /// (0.35) started producing visibly soft frames on a real device even
+    /// though the lock itself was confirmed landing exactly there (not a
+    /// focus-race bug -- ruled out via log/frame comparison against the
+    /// original sharp reference capture). Rather than re-run the sweep test
+    /// blind, this lets the user dial it in directly via the Manual Focus
+    /// screen (ContentView) while watching the live zoomed preview, and
+    /// PERSISTS it -- unlike most calibration state (which re-verifies every
+    /// session on purpose, see isYawVerifiedThisSession's doc comment), this
+    /// is a property of the PHYSICAL LENS/MOUNT geometry, not something that
+    /// needs re-confirming every drive, same reasoning as yawReferenceNormalizedX
+    /// being persisted where most settings aren't.
+    @Published private(set) var manualNearFocusLensPosition: Float = CameraManager.defaultNearFocusLensPosition
+
+    /// Whether normal (non-calibration) recording uses 4K instead of the
+    /// default 1080p. REACTIVATED 2026-08-18 -- originally added 2026-08-11
+    /// for the cone calibration test, then removed 2026-08-15 after a real
+    /// walkaround session came back unusable (accidentally recorded at 4K,
+    /// see git history) because the old UI toggle had NO confirmation step
+    /// -- a stray tap silently switched a real recording to 4K. Reactivated
+    /// with a required confirmation dialog (ContentView.toggleFourK/
+    /// showFourKConfirmation, same pattern as the high-res ML-inference
+    /// toggle) specifically to close that gap, prompted by wanting higher-
+    /// fidelity source footage for offline YOLO26x ground-truth labeling.
+    /// Defaults off/1080p and is deliberately NOT persisted (see init's
+    /// comment) -- always starts back at 1080p on a fresh launch, so a
+    /// deliberate choice for one recording can't silently carry over into a
+    /// later one. Thermal risk is real and confirmed (see `configure`'s own
+    /// comment: 10-15x throttling on a 23-minute 4K/30fps drive) -- that
+    /// test predates the Cooler 8 Pro being mount-compatible, so the actual
+    /// sustained-4K-with-cooler thermal behavior is still unmeasured.
+    @Published private(set) var isFourKEnabled = false
+
+    /// Whether normal (non-calibration) recording captures at 30fps instead
+    /// of the default 15fps -- added by request 2026-08-20 specifically to
+    /// improve yolo26x reference-pass quality (more temporal samples to
+    /// match on-device detections against), NOT to change what the
+    /// on-device pipeline itself sees. Safe to do independently:
+    /// `InferenceEngine.process`'s existing `isBusy` guard already drops
+    /// any frame that arrives while the previous one is still being
+    /// processed (see `restrictFrameRate`'s own doc comment, which already
+    /// noted this for the 30fps-default/15fps-restricted case) -- so
+    /// doubling how fast frames ARRIVE doesn't change how fast inference
+    /// actually RUNS, it just means more of the arriving frames get
+    /// dropped by that same guard. Recording itself (`appendRecordingFrame`
+    /// in `captureOutput`) is unconditional per frame regardless, so it's
+    /// the one thing that actually captures at the higher rate. Real cost
+    /// is elsewhere: video encoding does genuinely more work at 30fps
+    /// (separate from inference), and the file is roughly 2x the size for
+    /// the same duration -- same "off by default, confirm before
+    /// enabling" treatment as `isFourKEnabled` for that reason, and NOT
+    /// persisted for the same "a deliberate choice for one recording
+    /// shouldn't silently carry into the next" reasoning.
+    @Published private(set) var isThirtyFpsEnabled = false
+
+    /// Normalized [0,1] x-position of the yaw-calibration marker (the
+    /// wiper-cowl marker, rigidly part of the car -- see
+    /// `defaultYawMarkerNormalizedX`'s doc comment) -- read fresh EVERY
+    /// session via `refineYawReference()` (ContentView.enterYawScreen,
+    /// unconditional, no skip path), same "don't assume calibration"
+    /// discipline as PitchSensor's
     /// referencePitchDegrees/referenceRollDegrees. Persisted only as a
     /// reasonable starting value before that session's own fresh detection
     /// completes, not trusted to stay correct indefinitely on its own.
     @Published private(set) var yawReferenceNormalizedX: CGFloat = CameraManager.defaultYawMarkerNormalizedX
 
+    /// Vertical companion to yawReferenceNormalizedX -- only needed once
+    /// the reference switched from the yellow stick (a vertical line,
+    /// x-only) to the wiper-cowl marker (a small 2D blob, needs both axes
+    /// to place the confirmation crosshair and re-detect it). Same
+    /// verify-every-session/persist-as-starting-value discipline as X.
+    @Published private(set) var yawReferenceNormalizedY: CGFloat = CameraManager.defaultWiperMarkerNormalizedY
+
+    /// Whether yawReferenceNormalizedX has actually been confirmed THIS
+    /// session (auto-detect succeeded, or the user manually dragged/
+    /// confirmed the crosshair) -- as opposed to still holding whatever
+    /// value was last persisted from a PRIOR session. CONFIRMED 2026-08-18:
+    /// auto-detect failing (see detectYawMarkerNormalizedX's threshold
+    /// history) left the level screen silently reusing a stale persisted
+    /// value with no visible distinction from a freshly-verified one --
+    /// the mount-yaw check was technically correct about that stale
+    /// number, but looked wrong next to the user's own visual read of the
+    /// real stick, since nothing on screen said the number hadn't actually
+    /// been checked against reality yet this session. Deliberately NOT
+    /// persisted -- resets false every launch, same "every session"
+    /// discipline as the fine yaw calibration itself (see
+    /// ContentView.beginYawCalibrationFlow's doc comment).
+    @Published private(set) var isYawVerifiedThisSession = false
+
     /// Where a *reasonably mounted* phone's camera should roughly point --
     /// the yaw band's fixed center (see ContentView's YawBand), and the
     /// starting value for yawReferenceNormalizedX before any real
-    /// per-session detection has run. Was a hardcoded reference-line
-    /// position (`YawReferenceLine`, in ContentView.swift) before the
-    /// auto-detect/crosshair system replaced it with a live, per-session
-    /// measurement -- kept here as the coarse "is the mount roughly sane"
-    /// expectation, distinct from the precise (and now per-session)
-    /// crosshair value.
+    /// per-session detection has run.
     ///
-    /// This value's own history (relocated from ContentView.swift's old
-    /// YawReferenceLine, kept for the methodology, not because it's still
-    /// authoritative -- the auto-detect system now re-measures every
-    /// session instead of trusting one hardcoded number indefinitely):
+    /// RETIRED 2026-08-19: this used to reference a loose yellow stick
+    /// clipped to the dash, re-measured several times as the mount was
+    /// adjusted (see git history for that full lineage -- 2026-08-11
+    /// laser dot, 2026-08-15/16 walkaround/drive re-measures, 2026-08-19
+    /// post-laser-readjustment manual value). Retired by request: Rick
+    /// flagged the stick as not mounted firmly enough to trust as a yaw
+    /// reference (see `detectWiperMarkerNormalized`'s doc comment for the
+    /// replacement's own rationale) -- a loose object can shift
+    /// independently of the mount, defeating the entire point of using it
+    /// to measure the mount's own drift. Now points at the wiper-cowl
+    /// marker instead, which is rigidly part of the car and can't do that.
+    /// See `defaultWiperMarkerNormalizedY` for the y-axis measurement this
+    /// pairs with.
     ///
-    /// RE-MEASURED 2026-08-16 against
-    /// `data/26_08_16_TestDrive_LowRes_Nano_Day/recording-20260816-132942.MOV`
-    /// -- the same dash-mounted yellow stick, after Rick slightly realigned
-    /// the mount's yaw before this drive. Centroid of yellow pixels
-    /// (`r>180, g>130, b<100`) within a fixed ROI around the real (bottom,
-    /// sharply-focused) stick, avoiding its blurrier windshield reflection
-    /// above the wiper-arm band. Pooled across 11 frames (t=600/800/1000/
-    /// 1200/1500/2100/2400/3000/3600/3900/4000s, ~125k pixels total)
-    /// spanning nearly the full 69-minute drive; 5 other candidate frames
-    /// excluded for reading notably off from the rest of the cluster or
-    /// returning too few yellow pixels (glare/shadow). Result: pooled
-    /// centroid x=1251.35 of 1920, normalized 0.6517 -- NOT eyeballed. Only
-    /// ~10px (~0.5%) from the prior 0.6466, consistent with Rick's own
-    /// description of that mount adjustment as "slight."
+    /// RE-MEASURED 2026-08-19 (later same day): the value above was from
+    /// `nearfocus-20260819-132838.mov`, a sweep-test capture that (per the
+    /// same day's later mount work) no longer matched the mount's actual
+    /// position -- confirmed once the focus-race bug (see
+    /// `lockKnownGoodFarFocus`) was fixed and a genuinely clean,
+    /// correctly-focused live capture (`wipercal-20260819-183622.mov`)
+    /// became available to check against: the real marker sat at pixel
+    /// (1647.7, 785.0) of 1920x1080, not the old (1710.4, 835.3). Found via
+    /// connected-component analysis offline (a naive whole-ROI centroid was
+    /// getting pulled toward a second, larger dark blob -- the wiper cap's
+    /// shadowed edge, immediately left of the marker -- see
+    /// `detectWiperMarkerNormalized`'s doc comment for how the ROI was
+    /// retightened to exclude it).
     ///
-    /// (2026-08-15 measurement, superseded above: against
-    /// `data/26_08_15_Walkaround/recording-20260815-123041.MOV`, centroid
-    /// pooled across 6 frames, result 0.6466. That itself superseded the
-    /// original 2026-08-11 measurement (0.5295, from a laser dot) because
-    /// that clip had `stabilizationEnabled: false` logged while the
-    /// walkaround clip had it `true` -- a stabilization-crop mismatch, not
-    /// a real mount change.)
-    static let defaultYawMarkerNormalizedX: CGFloat = 0.6517
+    /// RE-MEASURED AGAIN 2026-08-20: two fresh, correctly near-focused
+    /// sessions (`wipercal-20260820-104855.mov`, `wipercal-20260820-110040.mov`
+    /// -- confirmed genuinely near-focused this time, lensPosition=0.353
+    /// landed in 0.2-0.26s per the log, not the focus-race-contaminated
+    /// captures earlier fixes were working around) both auto-detected the
+    /// marker meaningfully lower (higher normY) than the 2026-08-19 value
+    /// above -- 0.7351 and 0.7478 vs the stored 0.7269 -- consistent with
+    /// real session-to-session mount drift (this clamp mount isn't
+    /// perfectly repeatable), not detector noise in one direction only.
+    /// Updated to the FIRST session's value: auto-detect was accepted with
+    /// no manual drag correction that time (see the log: "MATCHED" ->
+    /// "MATCHED confirmed" with no intervening drag), the closest thing to
+    /// a confirmed-accurate reading available, vs. the second session
+    /// where the user visibly dragged to correct it. X moved only
+    /// slightly and non-monotonically between the two sessions (0.8593,
+    /// 0.7269 sample straddles it) -- read as ordinary detector noise, not
+    /// drift, so updated to match this same session's own X reading rather
+    /// than left inconsistent with the new Y.
+    static let defaultYawMarkerNormalizedX: CGFloat = 0.8455
+
+    /// Y-axis companion to `defaultYawMarkerNormalizedX` above -- see that
+    /// constant's doc comment for the 2026-08-20 re-measurement.
+    static let defaultWiperMarkerNormalizedY: CGFloat = 0.7351
 
     /// Current system thermal state. Published so the HUD can warn when the device
     /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
@@ -151,10 +250,34 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentStabilizationEnabled = newValue; overlayLock.unlock() }
     }
 
+    /// Nonisolated mirror of `isFourKEnabled`, readable from `sessionQueue`
+    /// when choosing the preset in `configure()`/`start(recording:)`.
+    private nonisolated var currentFourKEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentFourKEnabled }
+        set { overlayLock.lock(); _currentFourKEnabled = newValue; overlayLock.unlock() }
+    }
+
+    /// Nonisolated mirror of `manualNearFocusLensPosition`, readable from
+    /// `sessionQueue` in `settleAndLockNearFieldFocus`.
+    private nonisolated var currentNearFocusLensPosition: Float {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentNearFocusLensPosition }
+        set { overlayLock.lock(); _currentNearFocusLensPosition = newValue; overlayLock.unlock() }
+    }
+
+    /// Nonisolated mirror of `isThirtyFpsEnabled`, readable from
+    /// `sessionQueue` in `configure()`/`restrictFrameRate`.
+    private nonisolated var currentThirtyFpsEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentThirtyFpsEnabled }
+        set { overlayLock.lock(); _currentThirtyFpsEnabled = newValue; overlayLock.unlock() }
+    }
+
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
+    private nonisolated(unsafe) var _currentFourKEnabled: Bool = false
+    private nonisolated(unsafe) var _currentNearFocusLensPosition: Float = CameraManager.defaultNearFocusLensPosition
+    private nonisolated(unsafe) var _currentThirtyFpsEnabled: Bool = false
 
     // nonisolated(unsafe): AVCaptureSession and outputs are internally thread-safe
     // and are always accessed on sessionQueue or before the session starts.
@@ -165,71 +288,31 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private nonisolated(unsafe) var rotationObservation: NSKeyValueObservation?
     private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
-    private nonisolated(unsafe) var focusSettleObservation: NSKeyValueObservation?
-    /// Identifies which `settleAndLockFarFieldFocus` call is the CURRENT
-    /// one -- see that function's doc comment for why `focusSettleObservation
-    /// != nil` alone isn't a sufficient guard against a stale/delayed
-    /// notification from a PREVIOUS call re-firing after a newer one has
-    /// already started.
-    private nonisolated(unsafe) var currentFocusSettleToken: UUID?
 
     // Periodic focus recalibration (see `recalibrateFocusIfDue`): a one-shot
-    // settle-then-lock can catch a bad moment -- a dark scene, a close
-    // object, still sitting in a driveway -- and then stay wrong for an
-    // entire drive with no way to recover, which is what happened on a real
-    // night drive. Bounding how long a bad lock can last by periodically
-    // re-running the same cycle, the same principle as the low-light
-    // auto-detector re-sampling instead of deciding once and never
-    // revisiting it. RESTORED 2026-08-09 alongside the settle-then-lock this
-    // depends on -- see `settleAndLockFarFieldFocus`'s doc comment for why
-    // both are safe to bring back now.
+    // lock can drift wrong over a long drive with no way to recover
+    // otherwise. Bounding how long a bad lock can last by periodically
+    // re-asserting the known-good value, the same principle as the
+    // low-light auto-detector re-sampling instead of deciding once and
+    // never revisiting it.
     private nonisolated(unsafe) var lastFocusLockTime: CFAbsoluteTime = 0
     private nonisolated static let focusRecalibrationInterval: CFAbsoluteTime = 60
-    private nonisolated static let maxFocusSettleWait: CFAbsoluteTime = 5
 
-    /// Set for the duration of a `startWalkaroundRecording` session --
-    /// suppresses `recalibrateFocusIfDue`'s periodic re-settle entirely
-    /// (rather than just relying on `.far` range restriction), because this
-    /// test deliberately keeps a tape-measure marker in near-field view for
-    /// its whole duration (how the tester holds the correct tethered
-    /// distance) -- a permanent close-range distractor normal driving never
-    /// has to contend with. CONFIRMED 2026-08-15 via a real walkaround
-    /// session (data/26_08_15_Walkaround): focus was visibly inconsistent
-    /// across the recording despite the same settle-then-lock-far machinery
-    /// that works fine for normal drives, most plausibly because each
-    /// periodic re-settle switches back to `.continuousAutoFocus` (still
-    /// `.far`-restricted) for a moment, and re-exposes that brief window to
-    /// the marker. The one settle-then-lock `startWalkaroundRecording` does
-    /// at the very start is left in place -- only the periodic re-runs are
-    /// skipped.
+    /// Set for the duration of a `startWalkaroundRecording` session (and
+    /// the whole yaw calibration flow -- see `beginYawCalibrationSession`)
+    /// -- suppresses `recalibrateFocusIfDue`'s periodic re-lock entirely,
+    /// since either session deliberately keeps the lens at a DIFFERENT
+    /// fixed position (near-field) than normal driving's far lock, and a
+    /// periodic re-assertion of the far value mid-session would fight that.
     private nonisolated(unsafe) var suppressPeriodicFocusRecalibration = false
 
-    /// CONFIRMED 2026-08-11 (real outdoor distance-calibration session,
-    /// `data/26_08_11_DistanceCalibration/`): `continuousAutoFocus` under
-    /// `.far` range restriction can report `isAdjustingFocus == false`
-    /// ("settled") at `lensPosition` near 0 -- the near extreme, clearly
-    /// wrong for an 8-20m subject -- with no signal distinguishing that
-    /// from a genuine far-field settle. That bad value then got cached as
-    /// `lastGoodLensPosition` and reused by every later timed-out
-    /// recalibration in the same session, silently propagating a bad focus
-    /// lock across multiple rounds. `minPlausibleFarLensPosition` rejects
-    /// any settled/current reading below this floor rather than trusting
-    /// it. `knownGoodFarLensPosition` is the fallback for when there's
-    /// nothing plausible to use at all -- the empirical middle of every
-    /// genuinely sharp far-field lock's `lensPosition` logged across today's
-    /// session (observed range 0.745-0.788, tightly clustered, never
-    /// remotely close to 0 on any confirmed-sharp round).
-    private nonisolated static let minPlausibleFarLensPosition: Float = 0.5
+    /// Empirically confirmed via real far-focus locks across many sessions
+    /// -- see `lockKnownGoodFarFocus`, the only place this is used (direct
+    /// lock, no AF search -- see that function's doc comment for why
+    /// AF-based settling was retired entirely 2026-08-20 after it was
+    /// confirmed to poison focus for two full drives).
     private nonisolated static let knownGoodFarLensPosition: Float = 0.76
 
-    /// The last lens position a lock actually settled on with confidence. A
-    /// timed-out (unsettled) recalibration re-locks to this instead of
-    /// committing to whatever uncertain position the lens happened to be
-    /// hunting through -- otherwise a dark/close-range recalibration with
-    /// nothing confident to focus on progressively drifts the lock worse
-    /// with every retry. Never set below `minPlausibleFarLensPosition` --
-    /// see that constant's doc comment.
-    private nonisolated(unsafe) var lastGoodLensPosition: Float?
     /// Filename prefix `startNewRecording` uses -- "recording" for a normal
     /// drive, "calibration" while `startCalibrationRecording` is active, so
     /// a tape-mark reference clip can never be mistaken for real drive
@@ -243,9 +326,9 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var latestCalibrationPixelBuffer: CVPixelBuffer?
 
     /// Unlike latestCalibrationPixelBuffer, updated on EVERY frame regardless
-    /// of recording state -- detectYawMarker() needs a frame to scan on the
-    /// level screen, before any recording (calibration or otherwise) has
-    /// started.
+    /// of recording state -- checkYawNudgeNeeded()/refineYawReference()
+    /// need a frame to scan on the level/yaw screens, before any recording
+    /// (calibration or otherwise) has started.
     private nonisolated(unsafe) var latestPreviewPixelBuffer: CVPixelBuffer?
 
     /// The exposure bias (in EV) the boost is currently applying, so it can be
@@ -273,8 +356,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// 0-255 brightness thresholds (see `sampleAutoLowLightIfDue`). The gap between
     /// them is hysteresis to avoid flicker at the boundary. Starting points — may
     /// need real-world tuning.
-    private static let autoLowLightOnLuminance: Double = 50
-    private static let autoLowLightOffLuminance: Double = 90
+    // nonisolated: plain immutable constants, safe to read from the
+    // background sessionQueue closures that check luminance thresholds
+    // (e.g. beginYawCalibrationSession's torch-on check) without hopping
+    // to the main actor first.
+    private nonisolated static let autoLowLightOnLuminance: Double = 50
+    private nonisolated static let autoLowLightOffLuminance: Double = 90
 
     /// Consecutive at/below-threshold readings required before the boost actually
     /// turns on -- added after a real false-positive on session
@@ -320,6 +407,8 @@ final class CameraManager: NSObject, ObservableObject {
         currentAutoLowLightEnabled = isAutoLowLightEnabled
         currentLowLightEnabled = isLowLightBoostEnabled
         currentStabilizationEnabled = isStabilizationEnabled
+        currentFourKEnabled = isFourKEnabled
+        currentThirtyFpsEnabled = isThirtyFpsEnabled
 
         // Unlike the settings above, the yaw reference genuinely should
         // persist across launches -- it's a measurement of the physical
@@ -329,9 +418,21 @@ final class CameraManager: NSObject, ObservableObject {
         if UserDefaults.standard.object(forKey: Self.yawReferenceDefaultsKey) != nil {
             yawReferenceNormalizedX = CGFloat(UserDefaults.standard.double(forKey: Self.yawReferenceDefaultsKey))
         }
+        if UserDefaults.standard.object(forKey: Self.yawReferenceYDefaultsKey) != nil {
+            yawReferenceNormalizedY = CGFloat(UserDefaults.standard.double(forKey: Self.yawReferenceYDefaultsKey))
+        }
+
+        // Same "measures the physical setup, not a mode" persistence
+        // reasoning as the yaw reference above.
+        if UserDefaults.standard.object(forKey: Self.manualNearFocusLensPositionDefaultsKey) != nil {
+            manualNearFocusLensPosition = UserDefaults.standard.float(forKey: Self.manualNearFocusLensPositionDefaultsKey)
+        }
+        currentNearFocusLensPosition = manualNearFocusLensPosition
     }
 
     private static let yawReferenceDefaultsKey = "settings.yawReferenceNormalizedX"
+    private static let yawReferenceYDefaultsKey = "settings.yawReferenceNormalizedY"
+    private static let manualNearFocusLensPositionDefaultsKey = "settings.manualNearFocusLensPosition"
 
     /// `recording: false` starts the session (live preview + inference feed)
     /// without writing a video file -- lets the configuring screen show a
@@ -351,14 +452,14 @@ final class CameraManager: NSObject, ObservableObject {
             case .authorized:
                 sessionQueue.async { [weak self] in
                     guard let self else { return }
-                    self.configure(startRecording: recording)
+                    self.configure(startRecording: recording, preset: self.currentFourKEnabled ? .hd4K3840x2160 : .hd1920x1080)
                 }
             case .notDetermined:
                 let granted = await AVCaptureDevice.requestAccess(for: .video)
                 if granted {
                     self.sessionQueue.async { [weak self] in
                         guard let self else { return }
-                        self.configure(startRecording: recording)
+                        self.configure(startRecording: recording, preset: self.currentFourKEnabled ? .hd4K3840x2160 : .hd1920x1080)
                     }
                 }
             default:
@@ -466,11 +567,25 @@ final class CameraManager: NSObject, ObservableObject {
                 DispatchQueue.main.async { completion(false) }
                 return
             }
-            self.settleAndLockFarFieldFocus(device: device) { [weak self] in
-                guard let self else { return }
-                self.startNewRecording()
-                DispatchQueue.main.async { completion(true) }
-            }
+            // CONFIRMED 2026-08-20: settleAndLockFarFieldFocus's AF-based
+            // approach can be fooled into a false-instant "settled" report
+            // (isAdjustingFocus flips false almost immediately, ~0.19s, not
+            // a genuine search) landing on whatever value the lens already
+            // happened to be at -- if that value clears minPlausibleFarLensPosition
+            // (0.5) by even a little, it's wrongly accepted and cached as
+            // lastGoodLensPosition, then every later timed-out recalibration
+            // falls back to that SAME wrong value for the rest of the
+            // session. Real drive evidence: two full sessions where every
+            // single periodic recalibration attempt (every 60s, for 70+
+            // minutes) timed out and reused a lensPosition=0.588 poisoned by
+            // exactly this failure mode at calibration end -- the AF search
+            // never once actually completed, so it was providing zero real
+            // value while carrying this risk. `lockKnownGoodFarFocus`
+            // (already used successfully at launch) sidesteps the whole
+            // failure class by never running an AF search at all.
+            self.lockKnownGoodFarFocus(device: device)
+            self.startNewRecording()
+            DispatchQueue.main.async { completion(true) }
         }
     }
 
@@ -510,6 +625,191 @@ final class CameraManager: NSObject, ObservableObject {
             // sequence one atomic chain -- nothing else can interleave.
             self.configure(startRecording: false, settleFocus: true)
             DispatchQueue.main.async { completion(detectedCount) }
+        }
+    }
+
+    // MARK: - Near-focus test capture (wiper-cowl marker measurement)
+    //
+    // A DIAGNOSTIC tool, not a finished production calibration path -- added
+    // 2026-08-19 to get one real near-focused sample of the wiper-cowl
+    // circle (see the yaw-calibration design discussion: this rigid,
+    // always-in-frame car feature is meant to replace the loose yellow
+    // stick, which the user flagged as at risk of shifting independently
+    // of the mount). Every prior color-threshold guess in this file (the
+    // yaw marker's own detectYawMarkerNormalizedX, most recently) turned
+    // out wrong until measured against real footage -- this exists so the
+    // eventual near-focus detector gets built from real pixels too, not
+    // another guess. Reuses settleAndLockFarFieldFocus's real settle-
+    // detection mechanism (see settleAndLockNearFieldFocus) rather than a
+    // blind fixed delay -- CONFIRMED 2026-08-19 that a blind delay doesn't
+    // work: the first attempt never actually racked focus near at all.
+    // Also turns the torch on for the capture (added same day, for night
+    // visibility of the marker) and off again when stopped.
+    //
+    // Saves to nearfocus-<timestamp>.mov (not recording-/calibration-) so
+    // it's unambiguous in Photos and never picked up by
+    // recoverOrphanedRecordings's "recording-" filter. Same full
+    // teardown-then-fresh-configure / full-teardown-afterward pattern as
+    // startCalibrationRecording for the same reason: guarantees this
+    // mode's focus override can never leak into a later normal drive.
+
+    /// `completion` reports whether the capture actually started -- same
+    /// failure semantics as `startCalibrationRecording`.
+    func startNearFocusTestCapture(completion: @escaping @Sendable (Bool) -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            // CONFIRMED 2026-08-19: a real drive recording already in
+            // progress (Lock Settings/Unlocked tapped) used to make this
+            // silently fail -- "can't switch mid-recording" is the right
+            // call for the tape-marks/calibration flows (an intentional,
+            // rare action worth protecting from an accidental interrupt),
+            // but this is a quick diagnostic tool reachable from the same
+            // menu during a normal drive -- by request, finish and save
+            // whatever's currently recording instead of refusing.
+            if self.assetWriter != nil {
+                DebugFileLogger.log("nearfocus-capture: a recording was already in progress -- finishing it first")
+                self.finishRecording()
+            }
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+            self.teardownSession()
+            self.activeRecordingFilenamePrefix = "nearfocus"
+            self.configure(startRecording: false, preset: .hd1920x1080, settleFocus: false)
+            guard let device = self.captureDevice else {
+                self.activeRecordingFilenamePrefix = "recording"
+                DebugFileLogger.log("nearfocus-capture: FAILED to start, captureDevice nil after configure()")
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            guard device.isFocusModeSupported(.locked) else {
+                DebugFileLogger.log("nearfocus-capture: locked focus unsupported on this device, recording at whatever focus is current")
+                self.startNewRecording()
+                DispatchQueue.main.async { completion(true) }
+                return
+            }
+            // CONFIRMED bug 2026-08-19: an early attempt here just set
+            // .near + .continuousAutoFocus and waited a blind fixed delay,
+            // which never actually racked focus near at all -- a real
+            // captured clip stayed far-focused start to finish. Now uses
+            // `settleAndLockNearFieldFocus`'s direct lock (no AF at all,
+            // see that function's doc comment) instead.
+            self.suppressPeriodicFocusRecalibration = true
+            if device.hasTorch, device.isTorchModeSupported(.on) {
+                do {
+                    try device.lockForConfiguration()
+                    device.torchMode = .on
+                    device.unlockForConfiguration()
+                } catch {
+                    DebugFileLogger.log("nearfocus-capture: torch lockForConfiguration failed (\(error))")
+                }
+            }
+            self.settleAndLockNearFieldFocus(device: device) { [weak self] in
+                guard let self else { return }
+                self.startNewRecording()
+                DispatchQueue.main.async { completion(true) }
+            }
+        }
+    }
+
+    /// Empirically measured 2026-08-19: a 6-step sweep (0.05 through 0.55)
+    /// captured in one recording, reviewed frame-by-frame against the real
+    /// wiper-cowl marker at its actual ~15in distance from the camera.
+    /// 0.05/0.15 were still visibly soft (too close), 0.55 had drifted back
+    /// toward far-blurry, and 0.35 was unambiguously the sharpest --
+    /// individual hex-mesh grille holes and the marker's circular edge both
+    /// crisply resolved, with embossed text on the wiper blade itself also
+    /// legible in that same frame. Same empirical-measurement discipline as
+    /// `knownGoodFarLensPosition` (0.76, confirmed via real far settles),
+    /// just for the near end instead.
+    ///
+    /// RENAMED from `knownGoodNearLensPosition` 2026-08-20: this value alone
+    /// started producing visibly soft frames on a real device (confirmed via
+    /// direct comparison against the original sharp reference frame -- not
+    /// a focus-lock bug, the lens genuinely landed here, it's just no longer
+    /// sharp) -- now only the STARTING value for `manualNearFocusLensPosition`
+    /// (used the very first time, before any manual adjustment is ever
+    /// persisted), not blindly trusted as permanently correct.
+    private nonisolated static let defaultNearFocusLensPosition: Float = 0.35
+
+    /// Directly drives the lens to the measured near-focus position, rather
+    /// than asking any flavor of autofocus to find it. CONFIRMED
+    /// 2026-08-19: TWO different autofocus approaches both failed here,
+    /// identically -- `.continuousAutoFocus` + `.near` restriction, and
+    /// single-shot `.autoFocus` + `.near` restriction, both reported
+    /// settling in ~0.19s at essentially the SAME lensPosition the device
+    /// was already far-locked at (real far settles in this same log take
+    /// 2.3-2.4s, so 0.19s is not a genuine scan completing) -- range
+    /// restriction only constrains where AF is ALLOWED to land if it
+    /// decides to search, and on a static, unchanging scene neither AF mode
+    /// judged a fresh search necessary, restriction or not. Bypassing AF
+    /// entirely and driving the lens directly via `setFocusModeLocked`'s
+    /// own completion handler (which only fires once the lens has
+    /// genuinely arrived -- a real hardware-driven signal, not an AF
+    /// heuristic) is what actually works, combined with the real measured
+    /// `knownGoodNearLensPosition` above (0.0, the naive "nearest extreme"
+    /// guess, itself overshot the real ~15in distance).
+    private nonisolated func settleAndLockNearFieldFocus(
+        device: AVCaptureDevice,
+        completion: @escaping @Sendable () -> Void
+    ) {
+        guard device.isFocusModeSupported(.locked) else {
+            completion()
+            return
+        }
+        // A prior version of this function had to defensively guard against
+        // racing an in-flight AF-based far settle here (settleAndLockFarFieldFocus,
+        // removed 2026-08-20) -- moot now that far focus is also a direct,
+        // synchronous lock with nothing async left to race.
+        DebugFileLogger.log("nearfocus-capture: driving lens to measured near position")
+        let settleStart = CFAbsoluteTimeGetCurrent()
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.setFocusModeLocked(lensPosition: self.currentNearFocusLensPosition) { [weak self] _ in
+                DebugFileLogger.log(String(
+                    format: "nearfocus-capture: lens arrived after %.2fs at lensPosition=%.3f",
+                    CFAbsoluteTimeGetCurrent() - settleStart, device.lensPosition
+                ))
+                self?.sessionQueue.async { completion() }
+            }
+        } catch {
+            DebugFileLogger.log("nearfocus-capture: lockForConfiguration failed (\(error))")
+            completion()
+        }
+    }
+
+    /// Ends the near-focus test capture, saves to Photos (same as a normal
+    /// recording), and fully tears the session down so the next normal
+    /// `start()` re-runs the full setup path (1080p, far/continuous AF)
+    /// instead of inheriting the near-focus override. `completion` fires on
+    /// the main queue once teardown is complete.
+    func stopNearFocusTestCapture(completion: (@Sendable () -> Void)? = nil) {
+        let sessionBox = UncheckedSendableBox(value: session)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if let device = self.captureDevice, device.hasTorch, device.torchMode == .on {
+                do {
+                    try device.lockForConfiguration()
+                    device.torchMode = .off
+                    device.unlockForConfiguration()
+                } catch {
+                    // Torch will still turn off when the session/device is
+                    // torn down just below regardless.
+                }
+            }
+            self.finishRecording()
+            sessionBox.value.stopRunning()
+            self.teardownSession()
+            self.activeRecordingFilenamePrefix = "recording"
+            self.suppressPeriodicFocusRecalibration = false
+            self.configure(startRecording: false, settleFocus: true)
+            if let completion {
+                DispatchQueue.main.async { completion() }
+            }
         }
     }
 
@@ -556,11 +856,11 @@ final class CameraManager: NSObject, ObservableObject {
                 DispatchQueue.main.async { completion(false) }
                 return
             }
-            self.settleAndLockFarFieldFocus(device: device) { [weak self] in
-                guard let self else { return }
-                self.startNewRecording()
-                DispatchQueue.main.async { completion(true) }
-            }
+            // See startCalibrationRecording's matching comment -- same
+            // AF-based false-instant-settle risk, same fix.
+            self.lockKnownGoodFarFocus(device: device)
+            self.startNewRecording()
+            DispatchQueue.main.async { completion(true) }
         }
     }
 
@@ -671,22 +971,47 @@ final class CameraManager: NSObject, ObservableObject {
         return bandCount
     }
 
-    /// Detects the yaw-calibration marker (a small, distinctly yellow
-    /// object fixed to the dash -- see the yaw-band/crosshair design
-    /// discussion) and returns its horizontal centroid as a normalized
-    /// [0,1] x-coordinate, or nil if nothing confidently matched.
+    /// Detects the wiper-cowl marker -- a small, DARKER-than-its-
+    /// surroundings circular feature on the wiper arm cover, rigidly part
+    /// of the car -- and returns its centroid as normalized [0,1] (x,y),
+    /// or nil if nothing confidently matched. Replaces the retired yellow-
+    /// stick detector (see `defaultYawMarkerNormalizedX`'s doc comment for
+    /// why): a loose clipped-on object can shift independently of the
+    /// mount, defeating the whole point of using it to measure the
+    /// mount's own drift; this can't.
     ///
-    /// Searches the full frame width (unlike countRedTapeMarks's lane-only
-    /// crop) since the marker's rough screen position isn't assumed --
-    /// only that it's on the dash, restricted to the lower third of frame
-    /// to avoid matching yellow elsewhere in the scene (signage, headlights
-    /// of an oncoming car, etc.) above the dashboard line.
+    /// Only meaningful against a NEAR-focused frame -- see
+    /// `settleAndLockNearFieldFocus`/`knownGoodNearLensPosition`, and
+    /// `calibrateWiperMarker` (this function's only caller) for why the
+    /// whole point of that near-focus detour exists. Under the normal
+    /// far-focused driving view this region is soft.
     ///
-    /// Color thresholds and minSamples are placeholders pending tuning
-    /// against the real object under real lighting -- same discipline as
-    /// countRedTapeMarks's own bench-test-pending constants, don't trust
-    /// blindly.
-    private nonisolated func detectYawMarkerNormalizedX(in pixelBuffer: CVPixelBuffer) -> CGFloat? {
+    /// ROI and threshold RE-MEASURED 2026-08-19 (later same day) against
+    /// `wipercal-20260819-183622.mov`, the first capture where the marker
+    /// was both correctly near-focused AND from the mount's actual current
+    /// position -- every earlier attempt had one or the other wrong (see
+    /// `defaultYawMarkerNormalizedX`'s doc comment for the stale-frame
+    /// history, and `lockKnownGoodFarFocus` for the focus-race bug). Offline
+    /// connected-component analysis of that frame found the true marker as
+    /// a compact ~21x24px blob centered at pixel (1647.7, 785.0) of
+    /// 1920x1080 -- and, critically, a SECOND, larger dark blob immediately
+    /// to its left (the wiper cap's own shadowed edge, bbox roughly
+    /// 1555-1581 x 765-830, over 3x the marker's pixel count) that the old
+    /// ROI (0.85-0.94 x, 0.68-0.80 y) was wide enough to catch, biasing a
+    /// naive whole-ROI centroid rightward toward it -- which is exactly the
+    /// rightward bias real on-device sessions kept showing, and why a prior
+    /// same-day tightening pass (reasoned from log evidence rather than a
+    /// fresh pixel measurement) didn't fix it: it narrowed the ROI but
+    /// didn't move it, so the shadow blob was still inside. This pass
+    /// re-centers the ROI tightly enough around the real marker to exclude
+    /// that shadow blob by x-range alone, and re-derives the threshold
+    /// multiplier (0.6 -> 0.75) against the new, correctly-centered ROI's
+    /// own mean brightness -- 0.6 was tuned for the old, wider ROI and
+    /// produces zero matches in this tighter one. Threshold stays relative
+    /// to the ROI's own mean, not a fixed absolute value -- same "ratio
+    /// holds across lighting, absolute doesn't" lesson the retired yellow-
+    /// stick detector's color thresholds already had to learn twice.
+    private nonisolated func detectWiperMarkerNormalized(in pixelBuffer: CVPixelBuffer) -> (x: CGFloat, y: CGFloat)? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
@@ -695,63 +1020,491 @@ final class CameraManager: NSObject, ObservableObject {
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let bytes = base.assumingMemoryBound(to: UInt8.self)
 
-        let rowStart = height * 2 / 3
-        let colStride = 2
-        let rowStride = 2
+        // Tight around the re-measured (0.8582, 0.7269) center -- see this
+        // function's doc comment for why the previous, wider ROI reached
+        // far enough left to catch the wiper cap's own shadow blob. Still
+        // has margin for real session-to-session mount drift (~15-30px
+        // each side), just not enough to reach that shadow region again.
+        let roiXRange = Int(0.83 * Double(width))..<Int(0.89 * Double(width))
+        let roiYRange = Int(0.70 * Double(height))..<Int(0.76 * Double(height))
+        let stride = 2
 
-        func yellowPixel(atByteOffset offset: Int) -> Bool {
+        func brightness(atByteOffset offset: Int) -> Double {
             // kCVPixelFormatType_32BGRA byte order: B, G, R, A.
             let b = Double(bytes[offset])
             let g = Double(bytes[offset + 1])
             let r = Double(bytes[offset + 2])
-            return r > 130 && g > 130 && b < 100 && abs(r - g) < 50
+            return (r + g + b) / 3
         }
+
+        var total = 0.0
+        var sampleCount = 0
+        var row = roiYRange.lowerBound
+        while row < roiYRange.upperBound {
+            var col = roiXRange.lowerBound
+            while col < roiXRange.upperBound {
+                total += brightness(atByteOffset: row * bytesPerRow + col * 4)
+                sampleCount += 1
+                col += stride
+            }
+            row += stride
+        }
+        guard sampleCount > 0 else { return nil }
+        let threshold = (total / Double(sampleCount)) * 0.75
 
         var sumX = 0.0
-        var count = 0
-        var row = rowStart
-        while row < height {
-            var col = 0
-            while col < width {
-                if yellowPixel(atByteOffset: row * bytesPerRow + col * 4) {
+        var sumY = 0.0
+        var darkCount = 0
+        row = roiYRange.lowerBound
+        while row < roiYRange.upperBound {
+            var col = roiXRange.lowerBound
+            while col < roiXRange.upperBound {
+                if brightness(atByteOffset: row * bytesPerRow + col * 4) < threshold {
                     sumX += Double(col)
-                    count += 1
+                    sumY += Double(row)
+                    darkCount += 1
                 }
-                col += colStride
+                col += stride
             }
-            row += rowStride
+            row += stride
         }
 
-        // Require enough matching samples to trust this as a real object,
-        // not scattered false-positive pixels.
+        // Require enough matching samples to trust this as the real
+        // marker, not scattered dark noise (shadow, dirt, a gap in the
+        // grille texture).
         let minSamples = 30
-        guard count >= minSamples else { return nil }
-        return CGFloat(sumX / Double(count)) / CGFloat(width)
+        guard darkCount >= minSamples else { return nil }
+        return (
+            CGFloat(sumX / Double(darkCount)) / CGFloat(width),
+            CGFloat(sumY / Double(darkCount)) / CGFloat(height)
+        )
     }
 
-    /// One-shot yaw-marker auto-detection against whatever frame is
-    /// currently showing in the live preview (see latestPreviewPixelBuffer)
-    /// -- the level screen's entry point into the yaw-calibration flow.
-    /// Updates and persists yawReferenceNormalizedX on success; leaves it
-    /// unchanged on failure (no marker confidently found) so a caller can
-    /// fall back to showing the last-known/persisted value rather than a
-    /// jarring reset. Returns the detected value so the caller can drive a
-    /// confirmation flash.
-    @discardableResult
-    func detectYawMarker() -> CGFloat? {
-        guard let pixelBuffer = latestPreviewPixelBuffer,
-              let detectedX = detectYawMarkerNormalizedX(in: pixelBuffer) else { return nil }
-        setYawReferenceNormalizedX(detectedX)
-        return detectedX
+    /// Remembers what to restore once `endYawCalibrationSession` runs --
+    /// only meaningful between a `beginYawCalibrationSession` call and its
+    /// matching `end`. Spans BOTH the main (pitch/roll) calibration screen
+    /// and the zoomed yaw screen -- see `beginYawCalibrationSession`'s doc
+    /// comment for why this moved up from just the zoomed screen.
+    private nonisolated(unsafe) var wiperMarkerCalibrationRestoreStabilization = false
+    private nonisolated(unsafe) var wiperMarkerCalibrationTorchEngaged = false
+
+    /// Begins a yaw calibration session -- called once, when the MAIN
+    /// (pitch/roll) calibration screen first appears, not just when the
+    /// user reaches the zoomed yaw screen. Moved up from a prior
+    /// yaw-screen-only `beginWiperMarkerCalibration` by request 2026-08-19:
+    /// the main screen now shows a live rectangle previewing the yaw
+    /// screen's crop area and warns if the marker isn't in it (see
+    /// `checkYawNudgeNeeded`), which needs a genuinely near-focused,
+    /// correctly-exposed view to check against reliably -- the same
+    /// detour the yaw screen itself needs, just started earlier so it's
+    /// already settled by the time either screen needs to read a frame
+    /// off it. Both screens together are one continuous near-focus
+    /// session now:
+    ///  1. Stabilization off (a stabilization crop shifts the whole frame,
+    ///     which already once invalidated a real measurement for the old
+    ///     yellow-stick system -- see git history, "a stabilization-crop
+    ///     mismatch, not a real mount change" -- avoided here by never
+    ///     letting it happen instead of re-diagnosing it later).
+    ///  2. Torch on, but only if the scene actually reads dark -- reuses
+    ///     `averageLuminance`/`autoLowLightOnLuminance`, the SAME signal
+    ///     and threshold the existing auto-low-light system already
+    ///     trusts, rather than a second guessed threshold.
+    ///  3. Lock focus near (`settleAndLockNearFieldFocus`).
+    ///
+    /// Deliberately does NOT restore stabilization/torch/focus here --
+    /// that's `endYawCalibrationSession`'s job, called once the user
+    /// confirms the zoomed yaw screen. Also does NOT run detection or
+    /// suppress the periodic far-focus recalibration by itself -- callers
+    /// that need either should also see `checkYawNudgeNeeded`/
+    /// `refineYawReference` and the `suppressPeriodicFocusRecalibration`
+    /// toggle below, since this session can now legitimately sit open for
+    /// a while (the user reading pitch/roll, maybe physically nudging the
+    /// mount) rather than the few seconds the old yaw-screen-only version
+    /// typically lasted -- CONFIRMED this matters:
+    /// `recalibrateFocusIfDue` fires every 60s and would otherwise yank
+    /// focus back to far mid-session.
+    func beginYawCalibrationSession(completion: @escaping @Sendable () -> Void) {
+        beginYawCalibrationSession(retriesRemaining: 25, completion: completion)
     }
 
-    /// Commits a yaw reference value (from detectYawMarker's auto-detect,
-    /// or the crosshair's manual drag-adjust) and persists it -- see
-    /// yawReferenceNormalizedX's doc comment for why this, unlike the
-    /// settings above, IS persisted across launches.
-    func setYawReferenceNormalizedX(_ x: CGFloat) {
+    /// CONFIRMED 2026-08-20 on-device: the level screen's `.onAppear` (see
+    /// ContentView.beginYawCalibrationFlow) can fire before `configure()`
+    /// has actually set `captureDevice` -- `configure()`'s own device setup
+    /// runs on `sessionQueue` and isn't guaranteed to have completed by the
+    /// time SwiftUI's first layout pass fires `.onAppear`. The OLD version
+    /// of this function silently gave up in that case (guard-else straight
+    /// to `completion()`, no retry) -- a real session showed ZERO
+    /// "nearfocus-capture" log lines despite going through the wiper-marker
+    /// flow multiple times, meaning near-focus/torch/stabilization-off/the
+    /// "wipercal-" recording never engaged AT ALL that session (confirmed:
+    /// no wipercal-*.mov file exists from it either) -- `refineYawReference`
+    /// still ran later and still found "a" match, just against a blurry,
+    /// still-far-focused frame, which is what actually caused the reported
+    /// "near-field focus seemed blurry" symptom. Retrying (rather than
+    /// failing open) closes that gap -- 25 attempts * 0.2s = 5s ceiling,
+    /// generous relative to how fast `configure()` normally finishes, with
+    /// a clear log line if it's ever genuinely exhausted rather than an
+    /// indistinguishable silent no-op.
+    private nonisolated func beginYawCalibrationSession(retriesRemaining: Int, completion: @escaping @Sendable () -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion() }
+                return
+            }
+            guard let device = self.captureDevice else {
+                guard retriesRemaining > 0 else {
+                    DebugFileLogger.log("wiper-marker-calibrate: FAILED captureDevice never became available, giving up")
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    self?.beginYawCalibrationSession(retriesRemaining: retriesRemaining - 1, completion: completion)
+                }
+                return
+            }
+            self.suppressPeriodicFocusRecalibration = true
+            // Records this whole calibration session to Photos
+            // ("wipercal-" prefixed), from the very start (before
+            // stabilization/torch/focus even change) -- added by request
+            // 2026-08-19: comparing live detection against a SEPARATE,
+            // earlier near-focus-test-capture kept coming up stale (real
+            // finding: the mount moved between that capture and later live
+            // sessions, making the reference itself wrong, not the
+            // detector). Recording the ACTUAL calibration session instead
+            // means the reference always matches whatever the user was
+            // really looking at, no separate capture step needed -- and
+            // starting immediately (not waiting for near-focus lock) means
+            // the clip also shows the far-to-near transition itself, useful
+            // for debugging the focus mechanism, not just the end state.
+            self.activeRecordingFilenamePrefix = "wipercal"
+            self.startNewRecording()
+            self.wiperMarkerCalibrationRestoreStabilization = self.currentStabilizationEnabled
+            if self.wiperMarkerCalibrationRestoreStabilization {
+                self.applyStabilizationMode(enabled: false)
+            }
+            self.wiperMarkerCalibrationTorchEngaged = false
+            // No longer racing the app's own launch-time far settle here --
+            // `configure()` now direct-locks far focus at launch instead of
+            // running a multi-second AF sweep (see `lockKnownGoodFarFocus`),
+            // so there's nothing slow left in flight for this near-lock to
+            // collide with.
+            self.settleAndLockNearFieldFocus(device: device) { [weak self] in
+                guard let self else {
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+                // CONFIRMED 2026-08-20, real night sessions: this used to
+                // run BEFORE settleAndLockNearFieldFocus, checking
+                // latestPreviewPixelBuffer at the very moment captureDevice
+                // first became available -- often before the session had
+                // delivered its first frame at all, so the `if let
+                // pixelBuffer = ...` chain silently failed (no frame yet)
+                // and torch never engaged, with no log line to explain why.
+                // Two full night sessions both went dark-scene-confirmed
+                // (first logged luminance 13.8, well under the 50
+                // threshold) with zero "torch on" lines. Moved to run here,
+                // after the near-focus lock has genuinely completed, by
+                // which point real frames are guaranteed to have been
+                // flowing for a while.
+                if let pixelBuffer = self.latestPreviewPixelBuffer,
+                   let luminance = self.averageLuminance(of: pixelBuffer) {
+                    if luminance <= Self.autoLowLightOnLuminance, device.hasTorch, device.isTorchModeSupported(.on) {
+                        do {
+                            try device.lockForConfiguration()
+                            device.torchMode = .on
+                            device.unlockForConfiguration()
+                            self.wiperMarkerCalibrationTorchEngaged = true
+                            DebugFileLogger.log("wiper-marker-calibrate: torch on (luminance=\(luminance))")
+                        } catch {
+                            DebugFileLogger.log("wiper-marker-calibrate: torch lockForConfiguration failed (\(error))")
+                        }
+                    } else {
+                        DebugFileLogger.log("wiper-marker-calibrate: torch not engaged (luminance=\(luminance), hasTorch=\(device.hasTorch))")
+                    }
+                } else {
+                    DebugFileLogger.log("wiper-marker-calibrate: torch check SKIPPED, still no preview frame available")
+                }
+                DispatchQueue.main.async { completion() }
+            }
+        }
+    }
+
+    /// Re-runs the precise, tightly-centered detector
+    /// (`detectWiperMarkerNormalized`) and, on a confident match, commits
+    /// it as the new yaw reference -- used once, when the user actually
+    /// opens the zoomed yaw screen (to seed its crosshair), NOT by the
+    /// main screen's live nudge polling (see `checkYawNudgeNeeded` for
+    /// that -- deliberately a separate, wider-search function, since this
+    /// one's whole point is precision within a small ROI, not tolerance
+    /// for a still-misaligned mount). `completion` reports the detected
+    /// (x,y), or nil if nothing confidently matched -- yawReferenceNormalizedX/Y
+    /// are left unchanged on failure (same "fall back to the last-known/
+    /// persisted value" contract `detectYawMarker` used to have) so the
+    /// yaw screen still has a starting position to show and let the user
+    /// manually adjust.
+    func refineYawReference(completion: @escaping @Sendable ((x: CGFloat, y: CGFloat)?) -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let detected = self.latestPreviewPixelBuffer.flatMap { self.detectWiperMarkerNormalized(in: $0) }
+            if let detected {
+                DebugFileLogger.log("wiper-marker-calibrate: MATCHED x=\(detected.x) y=\(detected.y)")
+            } else {
+                DebugFileLogger.log("wiper-marker-calibrate: FAILED no confident marker found")
+            }
+            // setYawReferenceNormalized mutates @Published state and must
+            // run on the main actor -- moved into this same main.async
+            // hop (rather than calling it directly from this background
+            // closure) instead of adding a separate Task, so the commit
+            // and the completion callback stay in a fixed, deterministic
+            // order on the same thread.
+            DispatchQueue.main.async {
+                if let detected {
+                    self.setYawReferenceNormalized(x: detected.x, y: detected.y)
+                }
+                completion(detected)
+            }
+        }
+    }
+
+    /// Wide-search variant of `detectWiperMarkerNormalized`, used for the
+    /// main calibration screen's live "yaw nudge" check -- that screen
+    /// shows a rectangle previewing where the yaw screen will zoom to, and
+    /// needs to know, well before the user ever opens that zoomed screen,
+    /// whether the marker is inside it, outside it, or not visible at
+    /// all, so it can warn the user to nudge the mount (see ContentView's
+    /// yaw-nudge polling).
+    ///
+    /// A plain widened version of `detectWiperMarkerNormalized`'s ROI/
+    /// threshold approach doesn't work here -- CONFIRMED 2026-08-19, same
+    /// session: a wide net over a naive whole-ROI centroid gets dragged
+    /// toward whichever dark region is BIGGEST, not necessarily the
+    /// marker itself (the wiper cap's own shadowed edge is ~3x the
+    /// marker's pixel count -- see `detectWiperMarkerNormalized`'s doc
+    /// comment for the full story of how that fooled the original
+    /// detector). This searches a wide window but finds CONNECTED dark
+    /// blobs and filters by the marker's real measured size, rather than
+    /// trusting a single whole-region centroid -- the shadow blob and any
+    /// other incidental dark region get rejected as too big (or too
+    /// small, for noise), not blended in.
+    ///
+    /// Returns the largest accepted blob's centroid (there's normally at
+    /// most one real candidate in range; size is just the simplest
+    /// tiebreak if something else nearby happens to also qualify).
+    private nonisolated func detectWiperMarkerCoarse(in pixelBuffer: CVPixelBuffer) -> (x: CGFloat, y: CGFloat)? {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+
+        // Comfortably contains the yaw-screen rectangle (roughly 0.715-
+        // 0.882 x, 0.606-0.772 y at the current default center/zoom) with
+        // margin on every side for a realistic nudge-range mount
+        // misalignment, without spanning far enough to reach unrelated
+        // dark regions of the dash/hood.
+        let roiXRange = Int(0.70 * Double(width))..<Int(0.95 * Double(width))
+        let roiYRange = Int(0.60 * Double(height))..<Int(0.85 * Double(height))
+        let stride = 2
+
+        func brightness(atByteOffset offset: Int) -> Double {
+            let b = Double(bytes[offset])
+            let g = Double(bytes[offset + 1])
+            let r = Double(bytes[offset + 2])
+            return (r + g + b) / 3
+        }
+
+        var total = 0.0
+        var sampleCount = 0
+        var row = roiYRange.lowerBound
+        while row < roiYRange.upperBound {
+            var col = roiXRange.lowerBound
+            while col < roiXRange.upperBound {
+                total += brightness(atByteOffset: row * bytesPerRow + col * 4)
+                sampleCount += 1
+                col += stride
+            }
+            row += stride
+        }
+        guard sampleCount > 0 else { return nil }
+        let threshold = (total / Double(sampleCount)) * 0.7
+
+        let gridCols = (roiXRange.upperBound - roiXRange.lowerBound) / stride
+        let gridRows = (roiYRange.upperBound - roiYRange.lowerBound) / stride
+        guard gridCols > 0, gridRows > 0 else { return nil }
+        var dark = [Bool](repeating: false, count: gridCols * gridRows)
+        for gy in 0..<gridRows {
+            let row = roiYRange.lowerBound + gy * stride
+            for gx in 0..<gridCols {
+                let col = roiXRange.lowerBound + gx * stride
+                if brightness(atByteOffset: row * bytesPerRow + col * 4) < threshold {
+                    dark[gy * gridCols + gx] = true
+                }
+            }
+        }
+
+        // Connected-component flood fill (4-connectivity) over the grid,
+        // sized in stride-2 SAMPLE count -- calibrated against
+        // `detectWiperMarkerNormalized`'s own real measurements of the
+        // genuine marker (89-129 samples at stride 2 within a tightly-
+        // centered ROI) vs. the shadow blob it was confused with (~325
+        // equivalent) -- see that function's doc comment.
+        var visited = [Bool](repeating: false, count: gridCols * gridRows)
+        var best: (size: Int, sumGX: Int, sumGY: Int)?
+        let minBlobSize = 25
+        let maxBlobSize = 260
+        for start in 0..<(gridCols * gridRows) where dark[start] && !visited[start] {
+            var stack = [start]
+            visited[start] = true
+            var size = 0
+            var sumGX = 0
+            var sumGY = 0
+            while let idx = stack.popLast() {
+                size += 1
+                let gx = idx % gridCols
+                let gy = idx / gridCols
+                sumGX += gx
+                sumGY += gy
+                for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let nx = gx + dx, ny = gy + dy
+                    guard nx >= 0, nx < gridCols, ny >= 0, ny < gridRows else { continue }
+                    let neighborIdx = ny * gridCols + nx
+                    if dark[neighborIdx], !visited[neighborIdx] {
+                        visited[neighborIdx] = true
+                        stack.append(neighborIdx)
+                    }
+                }
+            }
+            guard (minBlobSize...maxBlobSize).contains(size) else { continue }
+            if best == nil || size > best!.size {
+                best = (size, sumGX, sumGY)
+            }
+        }
+        guard let match = best else { return nil }
+        let centerGX = Double(match.sumGX) / Double(match.size)
+        let centerGY = Double(match.sumGY) / Double(match.size)
+        let pixelX = Double(roiXRange.lowerBound) + centerGX * Double(stride)
+        let pixelY = Double(roiYRange.lowerBound) + centerGY * Double(stride)
+        return (CGFloat(pixelX / Double(width)), CGFloat(pixelY / Double(height)))
+    }
+
+    /// Public wrapper around `detectWiperMarkerCoarse` for the main
+    /// screen's live yaw-nudge polling -- a pure check, does NOT commit
+    /// anything to `yawReferenceNormalizedX/Y` (that only happens via
+    /// `refineYawReference`, on the yaw screen itself). Returns the
+    /// detected (x,y), or nil if nothing in the expected size range was
+    /// found anywhere in the wide search window -- ContentView classifies
+    /// that result against the yaw-screen rectangle's bounds to decide
+    /// in-band / needs-nudge / not-detected.
+    func checkYawNudgeNeeded(completion: @escaping @Sendable ((x: CGFloat, y: CGFloat)?) -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let result = self.latestPreviewPixelBuffer.flatMap { self.detectWiperMarkerCoarse(in: $0) }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    /// Unwinds everything `beginYawCalibrationSession` changed, back to
+    /// normal driving state -- recording finished and saved to Photos as
+    /// its own separate "wipercal-" clip (a pre-roll, distinct from the
+    /// "recording-" drive file that starts later when the user actually
+    /// locks in and drives -- NOT the same segment), torch off,
+    /// stabilization restored to whatever it actually was (the user's real
+    /// setting, not assumed on/off), focus back to far. Called once the
+    /// user confirms the zoomed yaw screen -- NOT on that screen's Cancel
+    /// (which returns to the main screen with the session still active, so
+    /// polling can resume) -- see ContentView's yaw-calibration flow.
+    /// `completion` fires once far focus is settled again.
+    func endYawCalibrationSession(completion: @escaping @Sendable () -> Void) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else {
+                DispatchQueue.main.async { completion() }
+                return
+            }
+            self.suppressPeriodicFocusRecalibration = false
+            self.finishRecording()
+            self.activeRecordingFilenamePrefix = "recording"
+            if self.wiperMarkerCalibrationTorchEngaged {
+                do {
+                    try device.lockForConfiguration()
+                    device.torchMode = .off
+                    device.unlockForConfiguration()
+                } catch {
+                    DebugFileLogger.log("wiper-marker-calibrate: torch-off lockForConfiguration failed (\(error))")
+                }
+                self.wiperMarkerCalibrationTorchEngaged = false
+            }
+            if self.wiperMarkerCalibrationRestoreStabilization {
+                self.applyStabilizationMode(enabled: true)
+                self.wiperMarkerCalibrationRestoreStabilization = false
+            }
+            // CONFIRMED 2026-08-20, real drive evidence: this is exactly
+            // where the "focus stayed near-field for the whole drive" bug
+            // originated -- see startCalibrationRecording's matching
+            // comment for the full failure mechanism. The Manual Focus
+            // screen (added same day) can leave the lens at ANY position
+            // when the user backs out, not just the fixed near-focus
+            // constant, which made settleAndLockFarFieldFocus's AF search
+            // much more likely to falsely report an instant "settled" at
+            // whatever near-ish position it started from. Direct lock
+            // sidesteps the whole failure class.
+            self.lockKnownGoodFarFocus(device: device)
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    /// Commits a yaw reference position (from `calibrateWiperMarker`'s
+    /// auto-detect, or the confirmation screen's manual drag-adjust) and
+    /// persists both axes -- see `yawReferenceNormalizedX`'s doc comment
+    /// for why this, unlike the settings above, IS persisted across
+    /// launches.
+    func setYawReferenceNormalized(x: CGFloat, y: CGFloat) {
         yawReferenceNormalizedX = x
+        yawReferenceNormalizedY = y
+        isYawVerifiedThisSession = true
         UserDefaults.standard.set(Double(x), forKey: Self.yawReferenceDefaultsKey)
+        UserDefaults.standard.set(Double(y), forKey: Self.yawReferenceYDefaultsKey)
+    }
+
+    /// Live focus preview for the Manual Focus screen (ContentView) -- drives
+    /// the lens directly as the user drags the slider, WITHOUT persisting
+    /// anything, so they can see the actual sharpness change in real time
+    /// before committing. Fire-and-forget (nil completion) since the slider
+    /// can call this many times a second while dragging -- unlike
+    /// `settleAndLockNearFieldFocus`, there's no completion to chain off of
+    /// and no need for one.
+    func previewFocusLensPosition(_ lensPosition: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice, device.isFocusModeSupported(.locked) else { return }
+            do {
+                try device.lockForConfiguration()
+                device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+                device.unlockForConfiguration()
+            } catch {
+                DebugFileLogger.log("manual-focus: lockForConfiguration failed (\(error))")
+            }
+        }
+    }
+
+    /// Commits the Manual Focus screen's selected lens position -- called
+    /// once, on "Done", not on every slider move (see `previewFocusLensPosition`
+    /// for that). Persists across launches, same reasoning as
+    /// `setYawReferenceNormalized`: this measures the physical lens/mount,
+    /// not a mode. Also re-applies it to the device rather than trusting
+    /// the last preview call already left it there -- cheap, and correct
+    /// even if this is ever called without a preceding preview.
+    func commitManualNearFocusLensPosition(_ lensPosition: Float) {
+        manualNearFocusLensPosition = lensPosition
+        currentNearFocusLensPosition = lensPosition
+        UserDefaults.standard.set(lensPosition, forKey: Self.manualNearFocusLensPositionDefaultsKey)
+        previewFocusLensPosition(lensPosition)
     }
 
     /// Removes the session's inputs/outputs (not just stopping it) so the
@@ -770,173 +1523,56 @@ final class CameraManager: NSObject, ObservableObject {
         rotationObservation = nil
     }
 
-    /// Restricts autofocus to the far range, then waits for it to settle on
-    /// a genuinely sharp position before locking there. Shared by two
-    /// callers: the driving session's start-of-drive focus (re-run
-    /// periodically, see `recalibrateFocusIfDue`) and
-    /// `startCalibrationRecording`'s one-off lock.
-    ///
-    /// HISTORY: used to run unconditionally at drive start, then got
-    /// removed 2026-08-08 after appearing to cause a multi-second freeze on
-    /// Lock Settings -- the on-device debug log showed `captureOutput`
-    /// itself stopped firing for the whole settle window, which looked
-    /// damning. CONFIRMED 2026-08-09 that diagnosis was wrong: even after
-    /// fully removing this machinery, the freeze persisted unchanged. The
-    /// real cause was `configuringScreen`/`drivingScreen` each creating
-    /// their own `CameraPreviewView`, tearing down and re-attaching a
-    /// second `AVCaptureVideoPreviewLayer` to the same running session on
-    /// the phase transition -- fixed separately by hoisting
-    /// `CameraPreviewView` to the top-level view, shared across that
-    /// transition. Restoring this is therefore safe: the thing it was
-    /// blamed for has a different, already-fixed cause. Its own real
-    /// downside is unrelated and separately documented: confirmed on a
-    /// real night drive to sometimes lock onto a bad moment (dark scene,
-    /// still in the driveway) and stay wrong for the rest of the drive --
-    /// see `recalibrateFocusIfDue` for how that's bounded. Also confirmed
-    /// 2026-08-09 (tape-mark calibration clip): the plain `.far`-restriction
-    /// -only approach this replaced doesn't reliably keep continuous AF off
-    /// a large, close, high-contrast object (e.g. the dash) -- locking
-    /// removes that risk instead of just leaving it transient.
-    ///
-    /// `completion` fires exactly once per call, whether focus settled,
-    /// timed out, or the device doesn't support the required modes at all.
-    ///
-    /// *** Guards against stale re-firing with a unique token, not just
-    /// "is focusSettleObservation non-nil" -- CONFIRMED bug 2026-08-09:
-    /// during the 3-round distance calibration, round 0's completion
-    /// re-fired minutes after round 1 had already started its own settle,
-    /// re-running round 0's whole chain a second time (a second, stale
-    /// `stopCalibrationRecording` call for a round the UI had already moved
-    /// past). Root cause: `setFocusModeLocked` inside `finish` can itself
-    /// briefly perturb `isAdjustingFocus`, and/or AVFoundation's KVO
-    /// delivery isn't guaranteed to happen on `sessionQueue` -- either way,
-    /// a notification tied to THIS call could still arrive after
-    /// `focusSettleObservation` had already been reassigned to a NEWER
-    /// call's observation, so the old `!= nil` check passed incorrectly
-    /// (it was checking "is *some* settle active", not "is *this* one still
-    /// current"). A per-call UUID token closes that gap: a stale
-    /// notification's captured token can never match a newer call's token.
-    private nonisolated func settleAndLockFarFieldFocus(
-        device: AVCaptureDevice,
-        completion: @escaping @Sendable () -> Void
-    ) {
-        guard
-            device.isFocusModeSupported(.continuousAutoFocus),
-            device.isAutoFocusRangeRestrictionSupported,
-            device.isFocusModeSupported(.locked)
-        else {
-            completion()
-            return
-        }
+    /// Direct-locks to `knownGoodFarLensPosition` with no AF search --
+    /// the ONLY way far focus is ever set now (see `knownGoodFarLensPosition`'s
+    /// doc comment for why the AF-based settle-then-lock approach this
+    /// replaced -- `settleAndLockFarFieldFocus`, removed 2026-08-20 -- was
+    /// retired entirely rather than kept as a fallback). Used at launch,
+    /// at the end of a yaw calibration session, at the end of a
+    /// calibration/walkaround recording's start, and periodically during
+    /// driving (see `recalibrateFocusIfDue`) -- one mechanism for every
+    /// far-focus call site now, matching `settleAndLockNearFieldFocus`'s
+    /// own already-direct approach for the near side.
+    private nonisolated func lockKnownGoodFarFocus(device: AVCaptureDevice) {
+        guard device.isFocusModeSupported(.locked) else { return }
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
-            device.autoFocusRangeRestriction = .far
-            device.focusMode = .continuousAutoFocus
+            device.setFocusModeLocked(lensPosition: Self.knownGoodFarLensPosition, completionHandler: nil)
+            lastFocusLockTime = CFAbsoluteTimeGetCurrent()
+            DebugFileLogger.log("focus: direct-locked at known-good far lensPosition=\(Self.knownGoodFarLensPosition), no AF settle")
         } catch {
-            completion()
-            return
-        }
-
-        let token = UUID()
-        currentFocusSettleToken = token
-        DebugFileLogger.log("focus: settling")
-        let settleStart = CFAbsoluteTimeGetCurrent()
-        let finish: @Sendable (Bool) -> Void = { [weak self] settled in
-            guard let self else {
-                completion()
-                return
-            }
-            guard self.currentFocusSettleToken == token else {
-                // Stale -- a newer settle call has already superseded this
-                // one. Not this call's completion to fire.
-                return
-            }
-            self.focusSettleObservation = nil
-            self.currentFocusSettleToken = nil
-            self.lastFocusLockTime = CFAbsoluteTimeGetCurrent()
-
-            let lockPosition: Float
-            if settled, device.lensPosition >= Self.minPlausibleFarLensPosition {
-                lockPosition = device.lensPosition
-                self.lastGoodLensPosition = lockPosition
-                DebugFileLogger.log(String(
-                    format: "focus: settled after %.2fs at lensPosition=%.3f",
-                    CFAbsoluteTimeGetCurrent() - settleStart, lockPosition
-                ))
-            } else if settled {
-                // CONFIRMED 2026-08-11: continuousAutoFocus under .far can
-                // report "not adjusting" at an implausibly near lensPosition
-                // (observed: 0.000, repeatedly, for a whole outdoor session)
-                // -- treated the same as an unsettled timeout below rather
-                // than trusted, so it can never get cached as
-                // lastGoodLensPosition and silently poison later rounds.
-                lockPosition = self.lastGoodLensPosition ?? Self.knownGoodFarLensPosition
-                DebugFileLogger.log(String(
-                    format: "focus: settled at implausible lensPosition=%.3f (< %.2f floor), rejected -- using %.3f instead",
-                    device.lensPosition, Self.minPlausibleFarLensPosition, lockPosition
-                ))
-            } else if let goodPosition = self.lastGoodLensPosition {
-                lockPosition = goodPosition
-                DebugFileLogger.log(String(
-                    format: "focus: settle timed out after %.0fs, keeping previous good lensPosition=%.3f instead of unconfirmed=%.3f",
-                    Self.maxFocusSettleWait, goodPosition, device.lensPosition
-                ))
-            } else if device.lensPosition >= Self.minPlausibleFarLensPosition {
-                lockPosition = device.lensPosition
-                DebugFileLogger.log(String(
-                    format: "focus: settle timed out after %.0fs, no prior good lock, locking at lensPosition=%.3f anyway",
-                    Self.maxFocusSettleWait, lockPosition
-                ))
-            } else {
-                // No prior good lock AND the current (unconfirmed) reading
-                // is also implausible -- same 0.000-poisoning risk as the
-                // rejected-settle case above, just reached via timeout
-                // instead. Fall back to the known-good empirical default
-                // rather than locking at whatever the lens happens to be
-                // sitting at.
-                lockPosition = Self.knownGoodFarLensPosition
-                DebugFileLogger.log(String(
-                    format: "focus: settle timed out after %.0fs, no prior good lock and current lensPosition=%.3f implausible -- using known-good default %.3f",
-                    Self.maxFocusSettleWait, device.lensPosition, lockPosition
-                ))
-            }
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-                device.setFocusModeLocked(lensPosition: lockPosition, completionHandler: nil)
-            } catch {
-                // Device may be mid-reconfiguration; focus stays continuous
-                // (still far-restricted), not ideal but not broken either.
-            }
-            completion()
-        }
-
-        focusSettleObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] _, change in
-            guard change.newValue == false, self?.currentFocusSettleToken == token else { return }
-            finish(true)
-        }
-        sessionQueue.asyncAfter(deadline: .now() + Self.maxFocusSettleWait) { [weak self] in
-            guard self?.currentFocusSettleToken == token else { return }
-            finish(false)
+            DebugFileLogger.log("focus: direct far-lock failed (\(error))")
         }
     }
 
-    /// Re-runs the settle-then-lock focus roughly every
+    /// Re-asserts the known-good far lock roughly every
     /// `focusRecalibrationInterval` -- called from every captured frame,
     /// matching how `sampleAutoLowLightIfDue` self-throttles instead of
-    /// needing its own timer. Bounds how long a bad one-shot lock can stay
-    /// wrong for -- see `settleAndLockFarFieldFocus`'s doc comment. Skipped
-    /// entirely during a walkaround recording -- see
-    /// `suppressPeriodicFocusRecalibration`'s doc comment for why.
+    /// needing its own timer.
+    ///
+    /// SWITCHED 2026-08-20 from the AF-based `settleAndLockFarFieldFocus`
+    /// to the direct `lockKnownGoodFarFocus` -- real drive evidence showed
+    /// the AF search never once actually completed across two full
+    /// sessions (every single attempt, every 60s, for 70+ minutes each,
+    /// hit the 5s timeout), so the "correct for real drift" premise this
+    /// was originally built for was providing zero real value while
+    /// carrying a genuine, confirmed risk: a false-instant "settled"
+    /// report landing on a not-quite-implausible-enough value poisons
+    /// `lastGoodLensPosition` for every later timed-out attempt to fall
+    /// back to, for the rest of the drive (see `endYawCalibrationSession`'s
+    /// matching comment for the exact mechanism that caused two spoiled
+    /// recordings). If real focus drift over a long drive turns out to
+    /// matter, that's a reason to fix the AF-based approach's reliability
+    /// (or measure drift some other way), not a reason to keep running a
+    /// mechanism that's demonstrably not working as designed.
     private nonisolated func recalibrateFocusIfDue() {
         guard
             !suppressPeriodicFocusRecalibration,
             let device = captureDevice,
-            focusSettleObservation == nil,
             CFAbsoluteTimeGetCurrent() - lastFocusLockTime >= Self.focusRecalibrationInterval
         else { return }
-        settleAndLockFarFieldFocus(device: device) {}
+        lockKnownGoodFarFocus(device: device)
     }
 
     /// Sets the low-light exposure boost to an explicit state (voice commands "low
@@ -962,6 +1598,48 @@ final class CameraManager: NSObject, ObservableObject {
         isStabilizationEnabled = enabled
         currentStabilizationEnabled = enabled
         sessionQueue.async { [weak self] in self?.applyStabilizationMode(enabled: enabled) }
+    }
+
+    /// Toggles the normal-drive recording preset between 1080p (default) and
+    /// 4K -- see `isFourKEnabled`'s doc comment for the reactivation
+    /// history/reasoning. If the session is already running but NOT
+    /// actively writing a real recording (level/configuring screens, or
+    /// driving before Lock Settings), this takes effect immediately via the
+    /// same full teardown-then-fresh-configure sequence
+    /// `stopCalibrationRecording` already uses -- safe specifically because
+    /// nothing real is being written yet, so there's no in-progress file to
+    /// race against. If a real recording IS already in progress, the new
+    /// value is only saved -- it takes effect on the next session start
+    /// rather than interrupting footage already being written. NOT
+    /// persisted to UserDefaults -- see init's comment; this always starts
+    /// back at 1080p on a fresh launch.
+    func setFourKEnabled(_ enabled: Bool) {
+        isFourKEnabled = enabled
+        currentFourKEnabled = enabled
+        sessionQueue.async { [weak self] in
+            guard let self, self.session.isRunning, self.assetWriter == nil else { return }
+            self.session.stopRunning()
+            self.teardownSession()
+            self.configure(startRecording: false, preset: enabled ? .hd4K3840x2160 : .hd1920x1080, settleFocus: true)
+        }
+    }
+
+    /// Toggles normal-drive recording between 15fps (default) and 30fps --
+    /// see `isThirtyFpsEnabled`'s doc comment for why. Unlike
+    /// `setFourKEnabled`, this doesn't need a session teardown/preset
+    /// change to apply -- `restrictFrameRate` just sets
+    /// activeVideoMin/MaxFrameDuration directly on the already-configured
+    /// device, which AVFoundation allows on a running session -- so this
+    /// takes effect immediately regardless of whether a recording is
+    /// already in progress, rather than waiting for the next session
+    /// start.
+    func setThirtyFpsEnabled(_ enabled: Bool) {
+        isThirtyFpsEnabled = enabled
+        currentThirtyFpsEnabled = enabled
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            self.restrictFrameRate(for: device, to: enabled ? 30 : 15)
+        }
     }
 
     private nonisolated func applyStabilizationMode(enabled: Bool) {
@@ -1020,11 +1698,16 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Locks capture to a fixed, lower frame rate — half the ISP/encode work of the
-    /// default 30fps, on top of the 4x cut from dropping to 1080p (see `configure`).
-    /// The `isBusy` gate already discards most frames at 30fps anyway once inference
-    /// can't keep up, so this mostly stops paying full capture/encode cost for frames
-    /// that would've been dropped regardless.
+    /// Locks capture to a fixed frame rate -- 15fps by default (half the
+    /// ISP/encode work of the device's own default 30fps, on top of the 4x
+    /// cut from dropping to 1080p, see `configure`), or 30fps when
+    /// `isThirtyFpsEnabled` is on. Either way, `InferenceEngine.process`'s
+    /// own `isBusy` gate already discards any frame that arrives while the
+    /// previous one is still being processed -- inference's effective rate
+    /// is governed by how long inference itself takes, not by how fast
+    /// frames arrive, so requesting 30fps here doesn't add real-time
+    /// inference load, only more ISP/encode work (see
+    /// `isThirtyFpsEnabled`'s doc comment).
     private nonisolated func restrictFrameRate(for device: AVCaptureDevice, to fps: Double) {
         let desiredDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
         guard device.activeFormat.videoSupportedFrameRateRanges.contains(where: {
@@ -1206,11 +1889,29 @@ final class CameraManager: NSObject, ObservableObject {
         // the rest of the drive. Skipped when the caller (e.g.
         // startCalibrationRecording) is going to do its own explicit
         // settle-then-lock right after -- see this function's doc comment.
+        // Direct lock to the empirically-known far position instead of
+        // running the continuousAutoFocus-based settle here -- CONFIRMED
+        // 2026-08-19: that settle takes 2-5s and, being fire-and-forget at
+        // launch, was still in flight when the wiper-marker calibration
+        // screen's own near-focus lock ran moments later (level screen
+        // .onAppear -> runYawAutoDetect after a 0.4s delay), so both calls
+        // raced the same physical lens actuator and whichever's completion
+        // fired last won -- real captures came back locked far (0.812/0.831)
+        // instead of the requested near position despite the near-lock's
+        // own completion having already fired. We already know the correct
+        // far value (`knownGoodFarLensPosition`, same empirical-measurement
+        // discipline as `knownGoodNearLensPosition`), so there's nothing an
+        // AF sweep would discover here -- skipping it removes the race at
+        // its root instead of trying to out-race it after the fact.
+        // `recalibrateFocusIfDue()` still uses the AF-based settle
+        // periodically during an actual drive, to correct for real drift
+        // (temperature, mechanical settling) -- that's a different, later
+        // concern this doesn't touch.
         if settleFocus {
-            settleAndLockFarFieldFocus(device: device) {}
+            lockKnownGoodFarFocus(device: device)
         }
         restrictMaxExposureDuration(for: device)
-        restrictFrameRate(for: device, to: 15)
+        restrictFrameRate(for: device, to: currentThirtyFpsEnabled ? 30 : 15)
 
         // Apply a persisted (non-auto) low-light boost to the newly configured
         // device — loaded into the published/mirrored state in init(), before a

@@ -76,7 +76,7 @@ private enum SessionPhase {
     /// out of). Fine calibration (yaw auto-detect, and pitch/roll capture
     /// on "OK") now always runs fresh every session; there's no skip path
     /// left to reuse a stale persisted reference. "NUDGE MOUNT" state (see
-    /// ContentView.isMountOK) gates "OK" behind a confirmation instead of
+    /// ContentView.isAttitudeOK) gates "OK" behind a confirmation instead of
     /// silently proceeding with a mount that's out of tolerance.
     case level
     /// Post-calibration screen: camera-orientation warning, plus the one-time
@@ -125,6 +125,17 @@ struct InferenceView: View {
     /// flags the drop). Only gates turning it ON -- turning back OFF is the
     /// safe direction and doesn't need a confirmation in the way.
     @State private var showHighResConfirmation = false
+    /// Same rationale as showHighResConfirmation, for the recording (not
+    /// ML-inference) resolution -- REACTIVATED 2026-08-18. Only gates
+    /// turning 4K ON; turning back OFF (1080p) is the safe direction. See
+    /// `CameraManager.isFourKEnabled`'s doc comment for why this needs a
+    /// confirmation now when the original toggle (removed 2026-08-15)
+    /// didn't: a stray tap without one silently 4K'd a real recording.
+    @State private var showFourKConfirmation = false
+    /// Same rationale as showFourKConfirmation, for the 15fps/30fps
+    /// recording-rate toggle (see CameraManager.isThirtyFpsEnabled) --
+    /// only gates turning 30fps ON; back to 15fps is the safe direction.
+    @State private var showThirtyFpsConfirmation = false
     /// Confirmation gate for stabilization and low-light, same rationale as
     /// showHighResConfirmation above -- an accidental tap on either HUD label
     /// mid-drive would silently change the crop/exposure behavior with no
@@ -146,14 +157,99 @@ struct InferenceView: View {
     // a timer a sustained `.critical` would never actually blink on screen.
     @State private var thermalBlinkOn = true
 
-    /// Brief highlight on YawMarker right after runYawAutoDetect() finds a
-    /// marker -- lets a glance confirm the auto-detected position before
-    /// trusting it, rather than the value silently changing with no visual
-    /// acknowledgment.
-    @State private var showYawDetectionFlash = false
+    /// True while the zoomed yaw screen (WiperMarkerConfirmationScreen) is
+    /// up -- see `enterYawScreen`. Drives both the zoomed camera-preview
+    /// transform (applied to the single shared CameraPreviewView, not a
+    /// second instance -- see body's own comment on why two live preview
+    /// layers on the same session is a confirmed bug) and which overlay is
+    /// shown.
+    @State private var isCalibratingWiperMarker = false
 
-    /// Gates the level screen's "OK" button when isMountOK is false -- see
-    /// tapOK().
+    /// True from the moment isCalibratingWiperMarker goes true until
+    /// CameraManager.refineYawReference's completion actually fires --
+    /// covers reading a fresh frame and running the precise detector, not
+    /// a focus wait (focus is already settled by the time the yaw screen
+    /// opens -- see `beginYawCalibrationFlow`). Drives
+    /// WiperMarkerConfirmationScreen's progress indicator and disables its
+    /// drag/OK/Cancel interaction until a real starting position exists --
+    /// added by request so the screen can't be confirmed (or dragged
+    /// against a stale image) before that first detection actually lands.
+    ///
+    /// ALSO set true again, briefly, once the user taps OK -- see
+    /// `confirmWiperMarkerCalibration`'s doc comment: without disabling OK
+    /// during `endYawCalibrationSession`'s multi-second far-focus settle, a
+    /// real session showed 8 redundant confirm taps stacking up before the
+    /// screen actually dismissed. The name is a little narrow for this
+    /// second use (nothing is "focusing" at that point) but the meaning is
+    /// really "busy, don't let the user interact with this screen" both
+    /// times, so it's reused rather than adding a second, nearly-identical
+    /// flag.
+    @State private var isWiperMarkerFocusing = false
+
+    /// True from the moment the level screen appears (see
+    /// `beginYawCalibrationFlow`) until the yaw screen's own OK is
+    /// confirmed (see `confirmWiperMarkerCalibration`) -- spans the whole
+    /// two-screen yaw calibration flow, not just the zoomed screen. Gates
+    /// `pollYawNudgeStatus`'s live loop: no point polling before the
+    /// near-focus session is even up, or after the user has already left
+    /// it behind.
+    @State private var isYawCalibrationSessionActive = false
+
+    /// The live camera preview's actual on-screen size -- captured once
+    /// from the outer GeometryReader (see body) since `pollYawNudgeStatus`
+    /// runs outside any view body and has no GeometryProxy of its own, but
+    /// still needs the real size to compute the yaw rectangle's TRUE
+    /// bounds (see `YawOverlayGeometry.visibleXRange/YRange`'s doc
+    /// comment for why [0,1] isn't a safe assumption). Orientation is
+    /// locked to landscape (see DriverAssistApp's AppDelegate), so this is
+    /// effectively constant for the life of the app -- captured on appear,
+    /// not re-derived per frame.
+    @State private var previewSize: CGSize = .zero
+
+    /// True while the Manual Focus screen is up -- reachable from EITHER
+    /// calibration screen (see `openManualFocus`), by request 2026-08-20:
+    /// the empirically-swept near-focus lens position stopped producing
+    /// sharp frames on a real device, and rather than re-guess a new fixed
+    /// constant blind, this lets the user dial it in directly while
+    /// watching the live zoomed preview. Reuses the SAME zoom transform
+    /// isCalibratingWiperMarker already drives (see body's own comment),
+    /// so the marker is magnified here too -- the whole point is judging
+    /// sharpness on the actual small marker, not the wide dash view.
+    @State private var isShowingManualFocus = false
+
+    /// Live UI-bound slider value while `isShowingManualFocus` -- seeded
+    /// from `cameraManager.manualNearFocusLensPosition` when the screen
+    /// opens (see `openManualFocus`), pushed to the lens on every change
+    /// via `CameraManager.previewFocusLensPosition` (live preview, not
+    /// persisted), and only actually committed on "Done" (see
+    /// `closeManualFocus`) -- so backing out without tapping Done would
+    /// leave the CAMERA at whatever the user last dragged to for the rest
+    /// of this screen visit, but not persist it. Accepted tradeoff for a
+    /// manual calibration tool -- a Cancel-that-restores-the-old-value
+    /// wasn't requested and adds a second focus write to revert visually.
+    @State private var manualFocusSliderValue: Float = 0.35
+
+    /// True whenever the live yaw-nudge check (`pollYawNudgeStatus`)
+    /// thinks the mount needs a physical nudge before the marker will be
+    /// findable in the yaw screen's crop area -- either nothing was
+    /// detected at all, or it was detected outside the rectangle. Defaults
+    /// to true (fail-safe: assume a nudge may be needed) until the first
+    /// poll actually clears it, rather than a separate "unknown" state --
+    /// the first poll normally lands within about a second of the level
+    /// screen appearing, so the window is brief. Drives the rectangle's
+    /// border color, the nudge message, and (combined with
+    /// `isAttitudeOK`) whether the level screen's OK needs confirmation.
+    @State private var isYawNudgeWarningActive = true
+
+    /// The live check's last detected position, ONLY when it found
+    /// something outside the rectangle -- nil either when nothing was
+    /// detected at all, or once the warning has cleared. Used purely to
+    /// give `yawNudgeMessage` a left/right/up/down hint instead of a bare
+    /// "can't find it."
+    @State private var yawNudgeDetectedPosition: (x: CGFloat, y: CGFloat)?
+
+    /// Gates the level screen's "OK" button when isAttitudeOK or
+    /// yaw-nudge-active is true -- see tapOK().
     @State private var showNudgeMountConfirmation = false
     private let thermalBlinkTimer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
@@ -170,11 +266,24 @@ struct InferenceView: View {
     // boost is compensating for a dark scene. Kept reactive via onChange
     // below rather than only set once, since auto-detection can flip this
     // mid-drive.
+    //
+    // CONFIRMED 2026-08-20: this exception was applying during calibration
+    // too (sessionPhase == .level, covers both the main pitch/roll screen
+    // and the zoomed yaw screen -- isCalibratingWiperMarker never changes
+    // sessionPhase itself), since neither this function nor its call sites
+    // checked sessionPhase at all -- a dark-scene auto-detected low-light
+    // boost would dim the screen to 70% while the user is still trying to
+    // read fine pitch/roll numbers or the tiny wiper marker, exactly the
+    // "resolve fine detail" case full brightness exists for in the first
+    // place. Calibration now always wins regardless of low-light state --
+    // the dim-for-night-visibility tradeoff only makes sense once actually
+    // driving.
     private static let dimmedBrightness: CGFloat = 0.7
     @State private var previousBrightness: CGFloat = UIScreen.main.brightness
 
     private func updateBrightnessForLowLight() {
-        UIScreen.main.brightness = cameraManager.isLowLightBoostEnabled ? Self.dimmedBrightness : 1.0
+        let isCalibrating = sessionPhase == .level
+        UIScreen.main.brightness = (!isCalibrating && cameraManager.isLowLightBoostEnabled) ? Self.dimmedBrightness : 1.0
     }
 
     // Freezes model/resolution/low-light/stabilization for the whole drive once
@@ -253,6 +362,11 @@ struct InferenceView: View {
     /// screens at all.
     @State private var isWalkaroundRecording = false
 
+    /// Diagnostic near-focus test capture -- see
+    /// `CameraManager.startNearFocusTestCapture`'s doc comment. Mirrors
+    /// `isWalkaroundRecording`'s role exactly, just for this flow.
+    @State private var isNearFocusTestCapturing = false
+
     private func flashToast(_ text: String) {
         withAnimation { toastText = text }
         Task {
@@ -261,14 +375,20 @@ struct InferenceView: View {
         }
     }
 
-    /// "OK" on the level screen, when the mount is already within
-    /// tolerance (isMountOK) -- proceeds straight to calibrateAttitude().
-    /// When it's NOT (still showing "NUDGE MOUNT"), gates behind a
+    /// "OK" on the level (pitch/roll) screen -- when both attitude
+    /// (isAttitudeOK) and the live yaw-nudge check are clean, proceeds
+    /// straight to calibrateAttitude(). When either isn't (still showing
+    /// "NUDGE MOUNT" and/or the yaw-nudge warning), gates behind a
     /// confirmation instead of silently letting a known-out-of-tolerance
     /// mount through -- see showNudgeMountConfirmation's confirmationDialog
-    /// on levelScreen.
+    /// on levelScreen. This is the FIRST of two OK presses the full
+    /// calibration flow now needs -- see `enterYawScreen`/
+    /// `confirmWiperMarkerCalibration` for the second, on the yaw screen,
+    /// which never needs confirmation (by request: overriding a grossly
+    /// misaligned mount here still lets the user manually place the yaw
+    /// marker there, so there's nothing further to protect against).
     private func tapOK() {
-        if isMountOK {
+        if isAttitudeOK && !isYawNudgeWarningActive {
             calibrateAttitude()
         } else {
             DebugFileLogger.log("tap: MATCHED nudgeMountConfirmationPrompt")
@@ -281,10 +401,9 @@ struct InferenceView: View {
     /// file-level comment for why this must be done standing still on known-
     /// flat, level ground, not while driving. Always runs fresh now (no more
     /// skip-and-reuse-persisted path, see SessionPhase.level's doc comment)
-    /// -- transitions to the settings screen on success; stays on the level
-    /// screen (with a toast explaining why) if there's no motion reading
-    /// yet. Yaw calibration is NOT part of this -- it runs unconditionally
-    /// on level-screen appear (see runYawAutoDetect), independent of this.
+    /// -- transitions to the yaw screen on success (see `enterYawScreen`,
+    /// the flow's second and final step); stays on the level screen (with
+    /// a toast explaining why) if there's no motion reading yet.
     private func calibrateAttitude() {
         guard let result = pitchSensor.captureReferenceAttitude() else {
             DebugFileLogger.log("calibrate: FAILED no motion reading yet")
@@ -292,7 +411,7 @@ struct InferenceView: View {
             return
         }
         DebugFileLogger.log("calibrate: MATCHED pitch=\(result.pitch) roll=\(result.roll)")
-        enterConfiguring()
+        enterYawScreen()
     }
 
     /// Tail of the level screen's "OK" flow (see tapOK/calibrateAttitude) --
@@ -333,7 +452,7 @@ struct InferenceView: View {
     /// later, offline -- this only captures the video + the reference
     /// pitch/roll for each round.
     private func beginDistanceCalibration() {
-        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording else { return }
+        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording, !isNearFocusTestCapturing else { return }
         initialCalibrationRoll = pitchSensor.rollDegrees
         isChoosingTapeMarkCount = true
     }
@@ -355,7 +474,7 @@ struct InferenceView: View {
     /// -> `distanceCalibrationRecordingBanner`) until `endWalkaroundRecording`
     /// is tapped.
     private func beginWalkaroundRecording() {
-        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording else { return }
+        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording, !isNearFocusTestCapturing else { return }
         DebugFileLogger.log("distance-cal: MATCHED beginWalkaroundRecording")
         cameraManager.startWalkaroundRecording { success in
             Task { @MainActor in
@@ -379,6 +498,38 @@ struct InferenceView: View {
         cameraManager.stopWalkaroundRecording {
             Task { @MainActor in
                 isWalkaroundRecording = false
+            }
+        }
+    }
+
+    /// "Near-focus test" choice from the Distance-cal long-press menu --
+    /// see `CameraManager.startNearFocusTestCapture`'s doc comment. A
+    /// diagnostic capture, not a normal drive mode: gets one real near-
+    /// focused sample of the wiper-cowl marker to measure, the same way
+    /// the yaw-marker color thresholds got fixed from real night/day
+    /// footage instead of another guess.
+    private func beginNearFocusTestCapture() {
+        guard !isCalibrationRecording, distanceCalibrationRound == nil, !isWalkaroundRecording, !isNearFocusTestCapturing else { return }
+        DebugFileLogger.log("distance-cal: MATCHED beginNearFocusTestCapture")
+        cameraManager.startNearFocusTestCapture { success in
+            Task { @MainActor in
+                if success {
+                    isNearFocusTestCapturing = true
+                } else {
+                    DebugFileLogger.log("distance-cal: beginNearFocusTestCapture FAILED to start")
+                    flashToast("FAILED TO START RECORDING")
+                }
+            }
+        }
+    }
+
+    /// "Stop" on `nearFocusTestCaptureBanner`. Same race-avoidance
+    /// reasoning as `endWalkaroundRecording`.
+    private func endNearFocusTestCapture() {
+        DebugFileLogger.log("distance-cal: MATCHED endNearFocusTestCapture")
+        cameraManager.stopNearFocusTestCapture {
+            Task { @MainActor in
+                isNearFocusTestCapturing = false
             }
         }
     }
@@ -666,6 +817,44 @@ struct InferenceView: View {
         }
     }
 
+    /// Deliberately NOT gated by `parametersLocked` the way the other
+    /// settings are -- those stay live-adjustable through Unlocked
+    /// recording because they don't need a session reconfigure, but this
+    /// one does (see `CameraManager.setFourKEnabled`), so it's only
+    /// meaningful before Lock Settings/Unlocked is tapped anyway
+    /// (level/configuring screens) -- matches the pre-removal behavior.
+    private func toggleFourK() {
+        if cameraManager.isFourKEnabled {
+            // Turning off -- back to the safe default, no confirmation needed.
+            DebugFileLogger.log("tap: MATCHED setFourK(false)")
+            cameraManager.setFourKEnabled(false)
+        } else {
+            DebugFileLogger.log("tap: MATCHED fourKConfirmationPrompt")
+            showFourKConfirmation = true
+        }
+    }
+
+    /// Gated by `parametersLocked` like stabilization/low-light (NOT like
+    /// `toggleFourK`) -- unlike 4K, `CameraManager.setThirtyFpsEnabled`
+    /// applies directly to the already-configured device with no session
+    /// teardown, so it's genuinely live-adjustable through Unlocked
+    /// recording the same way those are.
+    private func toggleThirtyFps() {
+        guard !parametersLocked else {
+            DebugFileLogger.log("tap: IGNORED (locked) toggleThirtyFps")
+            flashToast("LOCKED")
+            return
+        }
+        if cameraManager.isThirtyFpsEnabled {
+            // Turning off -- back to the safe default, no confirmation needed.
+            DebugFileLogger.log("tap: MATCHED setThirtyFps(false)")
+            cameraManager.setThirtyFpsEnabled(false)
+        } else {
+            DebugFileLogger.log("tap: MATCHED thirtyFpsConfirmationPrompt")
+            showThirtyFpsConfirmation = true
+        }
+    }
+
     private func toggleLowLight() {
         guard !parametersLocked else {
             DebugFileLogger.log("tap: IGNORED (locked) toggleLowLight")
@@ -744,9 +933,23 @@ struct InferenceView: View {
             // focus while adjusting pitch and recording -- see
             // beginDistanceCalibration.
             if sessionPhase == .level || sessionPhase == .configuring || sessionPhase == .driving
-                || isCalibrationRecording || distanceCalibrationRound != nil || isWalkaroundRecording {
-                CameraPreviewView(session: cameraManager.session)
-                    .ignoresSafeArea()
+                || isCalibrationRecording || distanceCalibrationRound != nil || isWalkaroundRecording || isNearFocusTestCapturing {
+                // Zoomed in place (not a second CameraPreviewView instance
+                // -- see this comment block's own history on why two live
+                // preview layers on the same session is a confirmed bug)
+                // while wiper-marker calibration is showing its
+                // confirmation screen -- see isCalibratingWiperMarker.
+                GeometryReader { geo in
+                    CameraPreviewView(session: cameraManager.session)
+                        .scaleEffect(
+                            (isCalibratingWiperMarker || isShowingManualFocus) ? Self.wiperMarkerZoomScale : 1.0,
+                            anchor: Self.wiperMarkerZoomAnchor(in: geo)
+                        )
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .onAppear { previewSize = geo.size }
+                        .onChange(of: geo.size) { _, newSize in previewSize = newSize }
+                }
+                .ignoresSafeArea()
             }
             // Mutually exclusive with sessionPhase's own screen, not
             // layered on top of it -- CONFIRMED bug 2026-08-09: layering
@@ -777,6 +980,36 @@ struct InferenceView: View {
                 // instead. Unlike that banner, this one has no fixed
                 // duration -- it's up to the user to tap Stop.
                 walkaroundRecordingBanner
+            } else if isNearFocusTestCapturing {
+                // Same race-avoidance reasoning as isWalkaroundRecording
+                // above, for endNearFocusTestCapture's stop/teardown chain.
+                nearFocusTestCaptureBanner
+            } else if isShowingManualFocus {
+                // Takes priority over isCalibratingWiperMarker below --
+                // reachable from either calibration screen, and whichever
+                // one was underneath just shows through again once this
+                // goes false (see closeManualFocus's doc comment). Not
+                // wrapped in withSessionGestures, matching
+                // WiperMarkerConfirmationScreen -- this screen has its own
+                // full-screen drag gesture (the slider), same "an
+                // ancestor's simultaneousGesture doesn't reliably coexist
+                // with a descendant's drag in this file" reasoning.
+                ManualFocusScreen(cameraManager: cameraManager, sliderValue: $manualFocusSliderValue, onDone: closeManualFocus)
+            } else if isCalibratingWiperMarker {
+                // CONFIRMED bug 2026-08-19 (real on-device screenshot):
+                // this used to be a SIBLING to this whole if/else chain,
+                // not a branch within it -- levelScreen kept rendering
+                // underneath (it has no isCalibratingWiperMarker check of
+                // its own), so its NUDGE MOUNT/pitch/roll text and OK
+                // button showed through/behind the confirmation screen at
+                // the same time, exactly the "layering, not swapping"
+                // class of bug this chain's own comment already warns
+                // about. Not wrapped in withSessionGestures -- this screen
+                // already has its own full-screen drag gesture, and an
+                // ancestor's simultaneousGesture has already been confirmed
+                // (see WiperMarkerConfirmationScreen's own history) to not
+                // reliably coexist with a descendant's drag in this file.
+                WiperMarkerConfirmationScreen(cameraManager: cameraManager, isFocusing: isWiperMarkerFocusing, onConfirm: confirmWiperMarkerCalibration, onCancel: cancelWiperMarkerCalibration, onManualFocus: openManualFocus)
             } else if let round = distanceCalibrationRound {
                 withSessionGestures(distanceCalibrationPitchScreen(round: round))
             } else {
@@ -791,16 +1024,24 @@ struct InferenceView: View {
             }
 
             // Structural SIBLING to the big if/else chain above, not nested
-            // inside it -- see levelScreen's own doc comment for why:
-            // YawMarker's drag gesture never fired at all while it was a
+            // inside it -- see levelScreen's own doc comment for why: a
+            // gesture here never fired at all while nested as a
             // DESCENDANT of withSessionGestures's gesture wrapper, even
             // with .highPriorityGesture. Mirrors that chain's own gating
             // conditions so this only shows during the plain level screen,
-            // not on top of the other calibration sub-flows.
+            // not on top of the other calibration sub-flows -- including
+            // isCalibratingWiperMarker now (see that branch above): the
+            // confirmation screen fully REPLACES levelScreen there, so
+            // this rectangle/OK button must stay hidden too, not just swap
+            // to showing something else here.
             if sessionPhase == .level, !isChoosingTapeMarkCount, tapeMarkDistanceIndex == nil,
-               !isCalibrationRecording, !isWalkaroundRecording, distanceCalibrationRound == nil {
-                YawBand(isMountYawOK: isMountYawOK)
-                YawMarker(cameraManager: cameraManager, isFlashing: showYawDetectionFlash)
+               !isCalibrationRecording, !isWalkaroundRecording, !isNearFocusTestCapturing, !isCalibratingWiperMarker,
+               !isShowingManualFocus, distanceCalibrationRound == nil {
+                YawRectangle(isWarningActive: isYawNudgeWarningActive)
+                if isYawNudgeWarningActive {
+                    yawNudgeMessageOverlay
+                }
+                levelScreenOKButton
             }
 
             // Hoisted here (once) rather than duplicated per-screen --
@@ -845,6 +1086,14 @@ struct InferenceView: View {
             thermalBlinkOn.toggle()
         }
         .onChange(of: cameraManager.isLowLightBoostEnabled) { _, _ in
+            updateBrightnessForLowLight()
+        }
+        // Catches the calibration -> configuring transition -- without
+        // this, a low-light boost that turned on WHILE still calibrating
+        // (isLowLightBoostEnabled already true, no further change event to
+        // react to) would leave the screen at full brightness even after
+        // driving actually starts, since nothing else would re-evaluate it.
+        .onChange(of: sessionPhase) { _, _ in
             updateBrightnessForLowLight()
         }
         .onAppear {
@@ -959,6 +1208,53 @@ struct InferenceView: View {
         static func screenWidth(forNormalizedWidth normalizedWidth: CGFloat, in geo: GeometryProxy) -> CGFloat {
             normalizedWidth * displayedWidth(in: geo)
         }
+
+        /// Y-axis companions to the X functions above -- added 2026-08-19
+        /// for the wiper-marker calibration screen (needs both axes; the
+        /// retired yellow-stick line only ever needed X). Same
+        /// resizeAspectFill scale-and-center-crop math, just the other axis.
+        static func displayedHeight(in geo: GeometryProxy) -> CGFloat {
+            let scale = max(geo.size.width / videoWidth, geo.size.height / videoHeight)
+            return videoHeight * scale
+        }
+
+        static func screenY(forNormalizedY normalizedY: CGFloat, in geo: GeometryProxy) -> CGFloat {
+            let displayed = displayedHeight(in: geo)
+            let originY = (geo.size.height - displayed) / 2
+            return originY + normalizedY * displayed
+        }
+
+        /// The pre-zoom visible video-normalized fraction range for one
+        /// axis under aspectFill -- 0...1 ONLY when that axis is the one
+        /// exactly filling the screen; narrower when the OTHER axis is
+        /// what constrains the fill and this one overflows/gets center-
+        /// cropped. CONFIRMED 2026-08-20: `yawRectangleNormalizedXRange/
+        /// YRange` (ContentView) originally assumed 0...1 for BOTH axes,
+        /// which happens to be exactly right for X on every real iPhone in
+        /// landscape (screen aspect ~19.5:9+ is always wider than this
+        /// 1920x1080 video's 16:9, so X is always the axis that fills
+        /// exactly) but wrong for Y, which is always the cropped axis on
+        /// this app's video/device combination -- about an 18% too-
+        /// generous rectangle height at the current zoom (6x) before this
+        /// fix. Takes a plain CGSize (not GeometryProxy) so it's usable
+        /// both from a view's own live `geo.size` and from a CGSize
+        /// captured once into @State for use outside any view body (the
+        /// yaw-nudge background poll has no GeometryProxy of its own).
+        static func visibleXRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+            guard geoSize.width > 0, geoSize.height > 0 else { return 0...1 }
+            let scale = max(geoSize.width / videoWidth, geoSize.height / videoHeight)
+            let displayed = videoWidth * scale
+            let origin = (geoSize.width - displayed) / 2
+            return (-origin / displayed)...((geoSize.width - origin) / displayed)
+        }
+
+        static func visibleYRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+            guard geoSize.width > 0, geoSize.height > 0 else { return 0...1 }
+            let scale = max(geoSize.width / videoWidth, geoSize.height / videoHeight)
+            let displayed = videoHeight * scale
+            let origin = (geoSize.height - displayed) / 2
+            return (-origin / displayed)...((geoSize.height - origin) / displayed)
+        }
     }
 
     /// Coarse, FIXED-position "is the mount roughly sane" sanity check --
@@ -969,8 +1265,19 @@ struct InferenceView: View {
     /// actual yellow marker doesn't visually blend into it when correctly
     /// aligned -- that's exactly the case where standing out matters most.
     /// Border color mirrors the roll readout's own green/white convention,
-    /// extended to a third (orange) "needs attention" state -- see
-    /// ContentView.isMountYawOK.
+    /// extended to a THIRD state -- gray for "not verified this session"
+    /// (see CameraManager.isYawVerifiedThisSession's doc comment), on top
+    /// of the existing green/orange "verified, in-or-out-of-band" pair.
+    /// Gray deliberately doesn't reuse orange: orange means "verified and
+    /// confirmed wrong," gray means "no verdict yet, go look," a
+    /// different instruction to the user.
+    /// Now used ONLY by `distanceCalibrationPitchScreen`, as a stable
+    /// visual anchor to check the camera hasn't rotated between rounds --
+    /// the main level screen's own yaw indicator was replaced 2026-08-19
+    /// by `YawRectangle` below (a real preview of the yaw screen's crop
+    /// area, live-checked against the marker, rather than a fixed
+    /// gray/green/orange band compared to a value that isn't measured
+    /// until after this screen's own OK is pressed).
     private struct YawBand: View {
         // Placeholder pending real data on how much residual yaw offset the
         // fine per-session correction can actually absorb -- same "don't
@@ -979,7 +1286,13 @@ struct InferenceView: View {
         // there's a real basis to tune this against.
         static let halfWidthNormalized: CGFloat = 0.04
 
-        var isMountYawOK: Bool
+        var isYawVerified: Bool
+        var isYawWithinBand: Bool
+
+        private var borderColor: Color {
+            guard isYawVerified else { return Color.gray.opacity(0.8) }
+            return isYawWithinBand ? Color.green.opacity(0.7) : Color.orange.opacity(0.8)
+        }
 
         var body: some View {
             GeometryReader { geo in
@@ -989,7 +1302,7 @@ struct InferenceView: View {
                     .fill(Color.white.opacity(0.15))
                     .overlay(
                         Rectangle()
-                            .stroke(isMountYawOK ? Color.green.opacity(0.7) : Color.orange.opacity(0.8), lineWidth: 2)
+                            .stroke(borderColor, lineWidth: 2)
                     )
                     .frame(width: width, height: geo.size.height)
                     .position(x: centerX, y: geo.size.height / 2)
@@ -999,102 +1312,335 @@ struct InferenceView: View {
         }
     }
 
-    /// Precise, per-session yaw-calibration marker -- positioned at
-    /// cameraManager.yawReferenceNormalizedX (auto-detected on level-screen
-    /// appear, see runYawAutoDetect), draggable for manual fine adjustment
-    /// when auto-detection needs correcting.
-    ///
-    /// Drag movement is scaled down from actual finger movement (dragScale
-    /// below) rather than 1:1, so a full swipe across the screen only moves
-    /// the marker a small, precise amount -- addresses the "fat finger"
-    /// imprecision problem a direct drag would have against a target this
-    /// narrow (see the design discussion this came out of). The tappable
-    /// hit area is much wider than the visible line for the same reason,
-    /// applied to STARTING the drag rather than moving it.
-    private struct YawMarker: View {
-        // How much of actual finger movement translates to marker
-        // movement -- 0.25 means dragging 100pt across the screen moves
-        // the marker by the normalized-x equivalent of 25pt of on-screen
-        // travel. Placeholder, not yet validated against how much
-        // precision this actually needs in practice.
-        static let dragScale: CGFloat = 0.25
-        private static let hitAreaWidth: CGFloat = 100
+    /// Live preview of the yaw screen's crop area on the main (pitch/roll)
+    /// level screen -- replaces the old fixed-width YawBand there. Bounds
+    /// come from `InferenceView.yawRectangleNormalizedXRange/YRange`
+    /// (derived from the SAME zoom-about-anchor math the yaw screen itself
+    /// uses), so this rectangle genuinely IS "what you'll see, zoomed in,
+    /// if you press OK now" -- not a separately-tuned approximation. Color
+    /// mirrors `isYawNudgeWarningActive`, driven by `pollYawNudgeStatus`'s
+    /// live coarse-detect loop, not a one-time check.
+    private struct YawRectangle: View {
+        var isWarningActive: Bool
 
-        @ObservedObject var cameraManager: CameraManager
-        var isFlashing: Bool
-
-        @State private var dragStartNormalizedX: CGFloat?
-        @State private var liveNormalizedX: CGFloat?
-
-        private var displayedNormalizedX: CGFloat {
-            liveNormalizedX ?? cameraManager.yawReferenceNormalizedX
+        private var borderColor: Color {
+            isWarningActive ? Color.orange.opacity(0.85) : Color.green.opacity(0.7)
         }
 
         var body: some View {
             GeometryReader { geo in
-                let x = YawOverlayGeometry.screenX(forNormalizedX: displayedNormalizedX, in: geo)
+                let xRange = InferenceView.yawRectangleNormalizedXRange(in: geo.size)
+                let yRange = InferenceView.yawRectangleNormalizedYRange(in: geo.size)
+                let left = YawOverlayGeometry.screenX(forNormalizedX: xRange.lowerBound, in: geo)
+                let right = YawOverlayGeometry.screenX(forNormalizedX: xRange.upperBound, in: geo)
+                let top = YawOverlayGeometry.screenY(forNormalizedY: yRange.lowerBound, in: geo)
+                let bottom = YawOverlayGeometry.screenY(forNormalizedY: yRange.upperBound, in: geo)
+                // Brightens the live preview inside the rectangle -- added
+                // by request 2026-08-20, the marker is small and dark
+                // enough to be hard to spot on the main (unzoomed) screen.
+                // A `.screen`-blended white fill lightens whatever's
+                // actually showing through underneath rather than covering
+                // it with a flat tint, and deliberately stays a plain
+                // overlay (not a second CameraPreviewView/cropped copy) --
+                // see body's own comment on why two live preview layers on
+                // one session is a confirmed bug.
+                Rectangle()
+                    .fill(Color.white)
+                    .opacity(0.35)
+                    .blendMode(.screen)
+                    .overlay(
+                        Rectangle()
+                            .stroke(borderColor, lineWidth: 3)
+                    )
+                    .frame(width: right - left, height: bottom - top)
+                    .position(x: (left + right) / 2, y: (top + bottom) / 2)
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+        }
+    }
+
+    /// Small floating label near the rectangle's own edge, shown only
+    /// while isYawNudgeWarningActive -- see `yawNudgeMessage`.
+    private var yawNudgeMessageOverlay: some View {
+        GeometryReader { geo in
+            let xRange = Self.yawRectangleNormalizedXRange(in: geo.size)
+            let yRange = Self.yawRectangleNormalizedYRange(in: geo.size)
+            let centerX = YawOverlayGeometry.screenX(forNormalizedX: (xRange.lowerBound + xRange.upperBound) / 2, in: geo)
+            let top = YawOverlayGeometry.screenY(forNormalizedY: yRange.lowerBound, in: geo)
+            Text(yawNudgeMessage)
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.orange)
+                .shadow(color: .black.opacity(0.8), radius: 3)
+                .position(x: centerX, y: max(top - 24, 24))
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    /// Zoom factor applied to the shared CameraPreviewView while
+    /// calibrating -- see `isCalibratingWiperMarker`. Anchored (via
+    /// `.scaleEffect(_:anchor:)`) at the FIXED expected ROI center
+    /// (CameraManager.defaultYawMarkerNormalizedX/defaultWiperMarkerNormalizedY),
+    /// not the live/dragged position -- keeps the zoomed patch of dash
+    /// visually still while the crosshair moves within it, rather than the
+    /// whole view re-centering under the user's finger as they drag.
+    private static let wiperMarkerZoomScale: CGFloat = 6.0
+
+    /// The anchor `.scaleEffect` needs for the zoom above, as a fraction of
+    /// the preview's own frame -- computed through the SAME
+    /// resizeAspectFill-aware geometry the crosshair itself uses, not a
+    /// raw normalized-video-space fraction, since the video's aspect ratio
+    /// doesn't match a landscape iPhone screen's (the video gets cropped
+    /// top/bottom under aspect-fill, so a raw fraction would anchor the
+    /// zoom at the wrong screen point).
+    private static func wiperMarkerZoomAnchor(in geo: GeometryProxy) -> UnitPoint {
+        UnitPoint(
+            x: YawOverlayGeometry.screenX(forNormalizedX: CameraManager.defaultYawMarkerNormalizedX, in: geo) / geo.size.width,
+            y: YawOverlayGeometry.screenY(forNormalizedY: CameraManager.defaultWiperMarkerNormalizedY, in: geo) / geo.size.height
+        )
+    }
+
+    /// Full-screen confirmation step for the wiper-marker calibration --
+    /// see `enterYawScreen`/`CameraManager.refineYawReference`.
+    /// Shown while the shared CameraPreviewView (see body) is zoomed in on
+    /// the ROI and the session is near-focus-locked -- a crosshair marks
+    /// where auto-detect thinks the marker's center is
+    /// (cameraManager.yawReferenceNormalizedX/Y), draggable for manual
+    /// correction, same "auto-detect, then let the user confirm/adjust"
+    /// shape the retired yellow-stick system used, just with a real zoomed
+    /// view instead of a brief flash on the unzoomed live feed -- this
+    /// marker is small enough (and the stakes of getting it wrong high
+    /// enough, feeding every yaw-dependent heuristic) that a flash alone
+    /// wouldn't give enough to actually judge it against.
+    ///
+    /// Drag math divides out BOTH the preview's zoom scale and
+    /// displayedWidth/Height -- a screen-space drag of dx points
+    /// corresponds to dx/zoomScale points of UNSCALED content movement
+    /// (since the content itself is magnified `zoomScale`x), which then
+    /// converts to normalized video-space the same way YawOverlayGeometry
+    /// always has. No separate arbitrary damping factor (the old
+    /// YawMarker's dragScale) -- the zoom itself already provides the
+    /// fine-precision benefit that damping was approximating blindly.
+    /// Reachable from a "Manual Focus" button on either calibration screen
+    /// (see `isShowingManualFocus`'s doc comment) -- lets the user dial in
+    /// the near-focus lens position directly, watching the SAME zoomed
+    /// preview (isShowingManualFocus drives the shared CameraPreviewView's
+    /// scaleEffect exactly like isCalibratingWiperMarker does, see body)
+    /// they'd judge marker sharpness against anyway. The vertical slider
+    /// is a horizontal `Slider` rotated -90 degrees -- SwiftUI has no
+    /// native vertical slider -- which puts its normal max (right) end at
+    /// the top and min (left) end at the bottom post-rotation, matching
+    /// the Far/Near labels. Pushes every change straight to the lens via
+    /// `CameraManager.previewFocusLensPosition` (live, unpersisted) so
+    /// sharpness is visible in real time; only "Done" (`closeManualFocus`)
+    /// actually commits/persists it.
+    private struct ManualFocusScreen: View {
+        @ObservedObject var cameraManager: CameraManager
+        @Binding var sliderValue: Float
+        var onDone: () -> Void
+
+        var body: some View {
+            ZStack {
+                VStack {
+                    Text("Manual Focus")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.7), radius: 3)
+                        .padding(.top, 30)
+                    Text(String(format: "Lens position: %.3f", sliderValue))
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .shadow(color: .black.opacity(0.7), radius: 3)
+                    Spacer()
+                }
+
+                HStack {
+                    Spacer()
+                    VStack(spacing: 12) {
+                        Text("Far")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .shadow(color: .black.opacity(0.7), radius: 3)
+                        Slider(
+                            value: Binding(
+                                get: { Double(sliderValue) },
+                                set: { newValue in
+                                    sliderValue = Float(newValue)
+                                    cameraManager.previewFocusLensPosition(sliderValue)
+                                }
+                            ),
+                            in: 0...1
+                        )
+                        .tint(.yellow)
+                        .frame(width: 240)
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 60, height: 240)
+                        Text("Near")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .shadow(color: .black.opacity(0.7), radius: 3)
+                    }
+                    .padding(.trailing, 30)
+                }
+
+                VStack {
+                    Spacer()
+                    Button(action: onDone) {
+                        Text("Done")
+                            .font(.system(size: 28, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 180, height: 64)
+                            .background(Color.yellow, in: Capsule())
+                    }
+                    .padding(.bottom, 50)
+                }
+            }
+            .ignoresSafeArea()
+        }
+    }
+
+    private struct WiperMarkerConfirmationScreen: View {
+        @ObservedObject var cameraManager: CameraManager
+        // True until CameraManager.refineYawReference's real work (reading
+        // a fresh frame, running the precise detector) actually finishes
+        // -- added by request so the screen can't be dragged against a
+        // stale image or confirmed before a real starting position exists.
+        var isFocusing: Bool
+        var onConfirm: () -> Void
+        // Added by request 2026-08-19 so the user can back out if
+        // something looks wrong here, without that counting as a
+        // confirmation -- see ContentView.cancelWiperMarkerCalibration.
+        var onCancel: () -> Void
+        // Reachable from here too, not just the main screen -- added by
+        // request 2026-08-20, see ContentView.openManualFocus.
+        var onManualFocus: () -> Void
+
+        @State private var dragStart: (x: CGFloat, y: CGFloat)?
+        @State private var live: (x: CGFloat, y: CGFloat)?
+
+        private var displayed: (x: CGFloat, y: CGFloat) {
+            live ?? (cameraManager.yawReferenceNormalizedX, cameraManager.yawReferenceNormalizedY)
+        }
+
+        var body: some View {
+            GeometryReader { geo in
+                let anchor = InferenceView.wiperMarkerZoomAnchor(in: geo)
+                let anchorX = anchor.x * geo.size.width
+                let anchorY = anchor.y * geo.size.height
+                let rawX = YawOverlayGeometry.screenX(forNormalizedX: displayed.x, in: geo)
+                let rawY = YawOverlayGeometry.screenY(forNormalizedY: displayed.y, in: geo)
+                // Same "scale about anchor" formula .scaleEffect itself
+                // uses internally -- keeps this crosshair visually aligned
+                // with the zoomed preview underneath it.
+                let scale = InferenceView.wiperMarkerZoomScale
+                let screenX = anchorX + (rawX - anchorX) * scale
+                let screenY = anchorY + (rawY - anchorY) * scale
+
                 ZStack {
-                    // Generous drag catcher -- the right HALF of the screen
-                    // (away from the OK button and "Distance cal" label,
-                    // both on the left), not a narrow region around the
-                    // line. THREE narrower attempts before this (a nested
-                    // Color.clear+contentShape rectangle; layered .frame+
-                    // .contentShape on the line itself; highPriorityGesture;
-                    // a structural-sibling restructure out of
-                    // withSessionGestures) all registered ZERO drag events
-                    // on-device, confirmed via debug log each time -- this
-                    // sidesteps hit-testing precision entirely rather than
-                    // refining it further. Color.white.opacity(0.001), not
-                    // Color.clear -- a known SwiftUI workaround for cases
-                    // where a truly transparent color's hit-testing doesn't
-                    // reliably register despite .contentShape.
-                    //
-                    // Includes a diagnostic .simultaneousGesture(TapGesture)
-                    // logging separately from the drag: if a plain tap ALSO
-                    // never registers, that points to something more
-                    // fundamental about this screen region intercepting
-                    // ALL touches, not a drag-specific issue.
-                    Color.white.opacity(0.001)
-                        .frame(width: geo.size.width / 2, height: geo.size.height)
-                        .position(x: geo.size.width * 0.75, y: geo.size.height / 2)
+                    Color.black.opacity(0.001)
                         .contentShape(Rectangle())
+                        .allowsHitTesting(!isFocusing)
                         .gesture(
                             DragGesture(minimumDistance: 0)
                                 .onChanged { value in
-                                    let base = dragStartNormalizedX ?? cameraManager.yawReferenceNormalizedX
-                                    if dragStartNormalizedX == nil {
-                                        dragStartNormalizedX = base
-                                        DebugFileLogger.log("yaw-marker: drag STARTED base=\(base)")
+                                    let base = dragStart ?? (cameraManager.yawReferenceNormalizedX, cameraManager.yawReferenceNormalizedY)
+                                    if dragStart == nil {
+                                        dragStart = base
+                                        DebugFileLogger.log("wiper-marker: drag STARTED base=\(base)")
                                     }
                                     let displayedWidth = YawOverlayGeometry.displayedWidth(in: geo)
-                                    let delta = (value.translation.width * Self.dragScale) / displayedWidth
-                                    liveNormalizedX = base + delta
+                                    let displayedHeight = YawOverlayGeometry.displayedHeight(in: geo)
+                                    let dx = (value.translation.width / scale) / displayedWidth
+                                    let dy = (value.translation.height / scale) / displayedHeight
+                                    live = (base.x + dx, base.y + dy)
                                 }
                                 .onEnded { _ in
-                                    DebugFileLogger.log("yaw-marker: drag ENDED")
-                                    if let final = liveNormalizedX {
-                                        cameraManager.setYawReferenceNormalizedX(final)
+                                    DebugFileLogger.log("wiper-marker: drag ENDED")
+                                    if let final = live {
+                                        cameraManager.setYawReferenceNormalized(x: final.x, y: final.y)
                                     }
-                                    dragStartNormalizedX = nil
-                                    liveNormalizedX = nil
+                                    dragStart = nil
+                                    live = nil
                                 }
                         )
-                        .simultaneousGesture(
-                            TapGesture().onEnded {
-                                DebugFileLogger.log("yaw-marker: TAP registered (diagnostic)")
-                            }
-                        )
-                    Rectangle()
-                        .fill(Color.yellow.opacity(isFlashing ? 1.0 : 0.85))
-                        .frame(width: isFlashing ? 8 : 4, height: geo.size.height)
-                        .position(x: x, y: geo.size.height / 2)
-                        .animation(.easeOut(duration: 0.3), value: isFlashing)
+
+                    // CONFIRMED 2026-08-19 (user-reported): a fixed 32pt
+                    // circle read as much smaller than the real marker --
+                    // the marker itself is magnified `scale`x by the zoomed
+                    // preview underneath, but this circle wasn't scaling
+                    // with it. Sized in the SAME unscaled coordinate space
+                    // as the crosshair's own position math, then multiplied
+                    // by scale, so it grows/shrinks in lockstep with
+                    // whatever the preview is showing, matching the
+                    // marker's real apparent size instead of a guessed
+                    // flat pixel size.
+                    Circle()
+                        .strokeBorder(Color.yellow, lineWidth: 3)
+                        .frame(width: 10 * scale, height: 10 * scale)
+                        .position(x: screenX, y: screenY)
                         .allowsHitTesting(false)
+                        .shadow(color: .black.opacity(0.7), radius: 3)
+
+                    VStack {
+                        Text("Confirm wiper-marker position")
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.7), radius: 3)
+                            .padding(.top, 40)
+                        Text("Drag the circle onto the marker's center")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .shadow(color: .black.opacity(0.7), radius: 3)
+                        if isFocusing {
+                            VStack(spacing: 12) {
+                                ProgressView()
+                                    .tint(.yellow)
+                                    .scaleEffect(1.6)
+                                Text("Focusing...")
+                                    .font(.system(size: 26, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .shadow(color: .black.opacity(0.7), radius: 3)
+                            }
+                            .padding(.top, 20)
+                        }
+                        Spacer()
+                        HStack(spacing: 20) {
+                            Button(action: onManualFocus) {
+                                Text("Manual Focus")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(isFocusing ? 0.4 : 1.0))
+                                    .frame(height: 44)
+                                    .padding(.horizontal, 16)
+                                    .background(Color.white.opacity(0.15), in: Capsule())
+                                    .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
+                            }
+                            .disabled(isFocusing)
+                            Button(action: onCancel) {
+                                Text("Cancel")
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(isFocusing ? 0.4 : 1.0))
+                                    .frame(width: 120, height: 64)
+                                    .background(Color.white.opacity(0.15), in: Capsule())
+                                    .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
+                            }
+                            // Same isFocusing flag OK uses -- once a confirm
+                            // is in flight (see confirmWiperMarkerCalibration),
+                            // Cancel shouldn't be able to race it either.
+                            .disabled(isFocusing)
+                            Button(action: onConfirm) {
+                                Text("OK")
+                                    .font(.system(size: 28, weight: .bold))
+                                    .foregroundStyle(.black)
+                                    .frame(width: 180, height: 64)
+                                    .background(Color.yellow.opacity(isFocusing ? 0.4 : 1.0), in: Capsule())
+                            }
+                            .disabled(isFocusing)
+                        }
+                        .padding(.bottom, 50)
+                    }
                 }
             }
-            // Same GeometryReader full-bounds fix as the old YawReferenceLine
-            // needed -- see git history if this regresses ("doesn't go all
-            // the way to the bottom").
             .ignoresSafeArea()
         }
     }
@@ -1131,34 +1677,243 @@ struct InferenceView: View {
         abs(pitchOffsetDegreesRounded) <= 1
     }
 
-    private var isMountYawOK: Bool {
+    /// Pure geometric check -- does the line's CURRENT value fall inside
+    /// the band, regardless of whether that value has actually been
+    /// verified against the real stick this session. Kept split out from
+    /// a verified/unverified check so YawBand's border color (its only
+    /// remaining consumer, on distanceCalibrationPitchScreen -- see that
+    /// struct's doc comment) can show a value that's in-band-but-
+    /// unverified as its own state, not silently identical to
+    /// verified-and-OK.
+    private var isYawWithinBand: Bool {
         abs(cameraManager.yawReferenceNormalizedX - CameraManager.defaultYawMarkerNormalizedX) <= YawBand.halfWidthNormalized
     }
 
-    private var isMountOK: Bool {
-        isMountRollOK && isMountPitchOK && isMountYawOK
+    /// Roll+pitch only now -- yaw has its own separate, LIVE-updating
+    /// signal (the rectangle + `isYawNudgeWarningActive`), not folded into
+    /// this one. RENAMED from `isMountOK` 2026-08-19 when the flow split
+    /// into two screens/OK presses (see `tapOK`): yaw calibration used to
+    /// run automatically before the user ever saw this screen, so by the
+    /// time they pressed OK there was already a real confirmed yaw value
+    /// to fold in here. Now yaw calibration happens AFTER this screen's
+    /// OK, so there's no confirmed value yet to check -- `isMountYawOK`
+    /// (requiring `isYawVerifiedThisSession`) would have been false on
+    /// every single press, permanently showing NUDGE MOUNT regardless of
+    /// actual mount quality. `isYawWithinBand` itself is unaffected and
+    /// still backs the OTHER, unrelated YawBand usage on
+    /// `distanceCalibrationPitchScreen`.
+    private var isAttitudeOK: Bool {
+        isMountRollOK && isMountPitchOK
     }
 
-    /// Runs yaw auto-detection unconditionally on level-screen appear --
-    /// unlike pitch/roll (which has a skip-and-reuse-persisted path, see
-    /// `skipCalibration`), fine yaw calibration has no stationary/level
-    /// precondition to worry about, so there's no reason to ever skip it.
-    /// A short delay gives the camera session (just started by
-    /// `confirmCalibrate`) time to actually produce a frame -- detection
-    /// against no frame yet just leaves the previous value in place (see
-    /// `CameraManager.detectYawMarker`), not a crash, but retrying blind
-    /// immediately would likely just fail the first time every launch.
-    private func runYawAutoDetect() {
-        Task {
-            try? await Task.sleep(for: .seconds(0.4))
-            guard cameraManager.detectYawMarker() != nil else {
-                DebugFileLogger.log("yaw-detect: FAILED no confident marker found")
-                return
+    /// The yaw screen's crop rectangle, in normalized VIDEO-space fractions
+    /// (same space as CameraManager's detector output and
+    /// defaultYawMarkerNormalizedX/Y) -- NOT screen-space; YawRectangle
+    /// converts to screen coordinates itself via YawOverlayGeometry, same
+    /// as everything else here.
+    ///
+    /// Derived from the exact same "scale about anchor" transform
+    /// `.scaleEffect` applies to the live preview: at zoom S anchored at
+    /// normalized point a, a point originally at normX ends up (post-zoom)
+    /// at a + (normX-a)*S. Solving for which normX values land in the
+    /// visible range after that gives [a+(visibleMin-a)/S,
+    /// a+(visibleMax-a)/S] -- a window whose width is (visibleMax-
+    /// visibleMin)/S, using the TRUE pre-zoom visible range for this axis
+    /// (`YawOverlayGeometry.visibleXRange/YRange`, see its doc comment for
+    /// why that's usually NOT [0,1] -- CONFIRMED 2026-08-20: it was
+    /// wrongly assumed to be [0,1] for both axes here originally, ~18%
+    /// too generous vertically as a result). `geoSize` should be the live
+    /// preview's actual on-screen size -- callers with their own
+    /// GeometryReader should pass `geo.size` directly; `pollYawNudgeStatus`
+    /// (outside any view body) passes the captured `previewSize` instead.
+    private static func yawRectangleNormalizedXRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+        let visible = YawOverlayGeometry.visibleXRange(in: geoSize)
+        let a = CameraManager.defaultYawMarkerNormalizedX
+        let left = a + (visible.lowerBound - a) / wiperMarkerZoomScale
+        let right = a + (visible.upperBound - a) / wiperMarkerZoomScale
+        return left...right
+    }
+
+    private static func yawRectangleNormalizedYRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+        let visible = YawOverlayGeometry.visibleYRange(in: geoSize)
+        let a = CameraManager.defaultWiperMarkerNormalizedY
+        let top = a + (visible.lowerBound - a) / wiperMarkerZoomScale
+        let bottom = a + (visible.upperBound - a) / wiperMarkerZoomScale
+        return top...bottom
+    }
+
+    private static func isWithinYawRectangle(x: CGFloat, y: CGFloat, geoSize: CGSize) -> Bool {
+        yawRectangleNormalizedXRange(in: geoSize).contains(x) && yawRectangleNormalizedYRange(in: geoSize).contains(y)
+    }
+
+    /// Text shown alongside the rectangle while isYawNudgeWarningActive --
+    /// gives a left/right/up/down hint when the coarse check found the
+    /// marker but outside the rectangle, or a plain "not visible" message
+    /// when it found nothing at all (no direction to suggest).
+    private var yawNudgeMessage: String {
+        guard let pos = yawNudgeDetectedPosition else {
+            return "Nudge yaw -- marker not visible"
+        }
+        let xRange = Self.yawRectangleNormalizedXRange(in: previewSize)
+        let yRange = Self.yawRectangleNormalizedYRange(in: previewSize)
+        var hints: [String] = []
+        if pos.x < xRange.lowerBound { hints.append("left") }
+        else if pos.x > xRange.upperBound { hints.append("right") }
+        if pos.y < yRange.lowerBound { hints.append("up") }
+        else if pos.y > yRange.upperBound { hints.append("down") }
+        guard !hints.isEmpty else { return "Nudge yaw" }
+        return "Nudge yaw -- \(hints.joined(separator: " and "))"
+    }
+
+    /// Starts the whole two-screen yaw calibration flow -- called once,
+    /// unconditionally, on level-screen appear (unlike pitch/roll, which
+    /// has a skip-and-reuse-persisted path, fine yaw calibration has no
+    /// stationary/level precondition to worry about). Engages the near-
+    /// focus session (see CameraManager.beginYawCalibrationSession's doc
+    /// comment for why this now starts here, on the MAIN screen, rather
+    /// than only once the user reaches the zoomed yaw screen) and, once
+    /// that's genuinely settled, starts the live nudge-check polling loop.
+    private func beginYawCalibrationFlow() {
+        isYawCalibrationSessionActive = false
+        isYawNudgeWarningActive = true
+        yawNudgeDetectedPosition = nil
+        cameraManager.beginYawCalibrationSession {
+            Task { @MainActor in
+                isYawCalibrationSessionActive = true
+                pollYawNudgeStatus()
             }
-            DebugFileLogger.log("yaw-detect: MATCHED x=\(cameraManager.yawReferenceNormalizedX)")
-            withAnimation { showYawDetectionFlash = true }
-            try? await Task.sleep(for: .seconds(0.4))
-            withAnimation { showYawDetectionFlash = false }
+        }
+    }
+
+    /// The live "is the marker somewhere the yaw screen will actually
+    /// find it" loop -- runs roughly every 0.5s while the user is on the
+    /// main (pitch/roll) screen, so `isYawNudgeWarningActive` (and the
+    /// rectangle's color) can clear itself the moment a physical nudge
+    /// fixes the alignment, without the user needing to re-open the yaw
+    /// screen just to check. Self-rescheduling rather than a Timer, so it
+    /// naturally stops the instant either guard fails (session ended, or
+    /// the yaw screen itself is up -- no point polling behind it) instead
+    /// of needing an explicit invalidate() call. `cancelWiperMarkerCalibration`
+    /// restarts this chain explicitly when returning from the yaw screen,
+    /// since the guard broke it there.
+    private func pollYawNudgeStatus() {
+        guard isYawCalibrationSessionActive, !isCalibratingWiperMarker, !isShowingManualFocus else { return }
+        cameraManager.checkYawNudgeNeeded { detected in
+            Task { @MainActor in
+                guard isYawCalibrationSessionActive, !isCalibratingWiperMarker, !isShowingManualFocus else { return }
+                if let detected, Self.isWithinYawRectangle(x: detected.x, y: detected.y, geoSize: previewSize) {
+                    withAnimation { isYawNudgeWarningActive = false }
+                    yawNudgeDetectedPosition = nil
+                } else {
+                    withAnimation { isYawNudgeWarningActive = true }
+                    yawNudgeDetectedPosition = detected
+                }
+                try? await Task.sleep(for: .seconds(0.5))
+                pollYawNudgeStatus()
+            }
+        }
+    }
+
+    /// Second step of the calibration flow -- reached from `calibrateAttitude`
+    /// once pitch/roll are captured (or from the confirmation dialog's
+    /// "Continue Anyway"). The near-focus session is already up (see
+    /// `beginYawCalibrationFlow`), so this just re-runs the PRECISE
+    /// detector (`CameraManager.refineYawReference`) against the
+    /// already-settled view to seed the crosshair -- no fresh focus wait
+    /// needed, unlike the old single-screen flow this replaced.
+    private func enterYawScreen() {
+        withAnimation {
+            isCalibratingWiperMarker = true
+            isWiperMarkerFocusing = true
+        }
+        cameraManager.refineYawReference { detected in
+            if let detected {
+                DebugFileLogger.log("wiper-marker: MATCHED x=\(detected.x) y=\(detected.y)")
+            } else {
+                DebugFileLogger.log("wiper-marker: FAILED no confident marker found")
+            }
+            Task { @MainActor in
+                withAnimation { isWiperMarkerFocusing = false }
+            }
+        }
+    }
+
+    /// "OK" on WiperMarkerConfirmationScreen -- the flow's SECOND and
+    /// final OK, never gated behind a confirmation (by request: the user
+    /// already had their chance to override on the main screen, and
+    /// they're looking directly at the marker here). Unwinds the near-
+    /// focus/stabilization-off/torch-on state `beginYawCalibrationSession`
+    /// put the session into, then proceeds straight to the configuring
+    /// screen -- unlike the old single-screen flow, this does NOT return
+    /// to the level screen first (calibration is complete at this point,
+    /// both OKs have been pressed).
+    private func confirmWiperMarkerCalibration() {
+        // CONFIRMED 2026-08-20 on-device: endYawCalibrationSession's own
+        // far-focus settle regularly takes 2-3s (real AF sweep, not the
+        // instant direct-lock the launch path uses) -- with nothing
+        // disabling this button meanwhile, an impatient user re-tapping
+        // every second or so fired this whole function repeatedly (8x in
+        // one real session, per "wiper-marker: MATCHED confirmed" appearing
+        // 8 times before the screen actually dismissed), each one kicking
+        // off its OWN redundant endYawCalibrationSession/far-settle chain
+        // on top of the one(s) already in flight. Guarding on the same
+        // isWiperMarkerFocusing flag the INCOMING focus wait already uses
+        // (it now means "busy, don't interact" broadly, not just "still
+        // focusing") makes this a single confirm per screen visit.
+        guard !isWiperMarkerFocusing else { return }
+        isWiperMarkerFocusing = true
+        DebugFileLogger.log("wiper-marker: MATCHED confirmed")
+        // Explicit commit even with no drag -- if auto-detect FAILED,
+        // isYawVerifiedThisSession would otherwise stay false (only
+        // setYawReferenceNormalized sets it, and that's only called on
+        // detect-success or an actual drag), so tapping OK on a stale
+        // fallback position wouldn't count as verified -- inconsistent
+        // with the user having just explicitly looked at and accepted it.
+        cameraManager.setYawReferenceNormalized(x: cameraManager.yawReferenceNormalizedX, y: cameraManager.yawReferenceNormalizedY)
+        cameraManager.endYawCalibrationSession {
+            Task { @MainActor in
+                isYawCalibrationSessionActive = false
+                withAnimation { isCalibratingWiperMarker = false }
+                enterConfiguring()
+            }
+        }
+    }
+
+    /// "Cancel" on WiperMarkerConfirmationScreen -- added by request so the
+    /// user can back out if something looks wrong, without that counting
+    /// as a confirmation. Returns to the main screen with the near-focus
+    /// session left running (NOT torn down -- endYawCalibrationSession is
+    /// only for a genuine confirm) so live nudge polling picks back up
+    /// immediately, same as if the user had never opened the yaw screen.
+    private func cancelWiperMarkerCalibration() {
+        DebugFileLogger.log("wiper-marker: CANCELLED")
+        withAnimation { isCalibratingWiperMarker = false }
+        pollYawNudgeStatus()
+    }
+
+    /// Opens the Manual Focus screen -- reachable from EITHER calibration
+    /// screen (see `isShowingManualFocus`'s doc comment). Doesn't touch
+    /// isCalibratingWiperMarker at all: this is a THIRD overlay state that
+    /// takes visual priority (see body's if/else ordering), not a
+    /// replacement for whichever screen was already showing -- "Done"
+    /// simply lets it show through again once isShowingManualFocus goes
+    /// false, no need to separately track which screen to "return to."
+    private func openManualFocus() {
+        manualFocusSliderValue = cameraManager.manualNearFocusLensPosition
+        withAnimation { isShowingManualFocus = true }
+    }
+
+    /// "Done" on the Manual Focus screen -- commits + persists the
+    /// slider's current value (see CameraManager.commitManualNearFocusLensPosition)
+    /// and dismisses back to whichever calibration screen was underneath.
+    /// Resumes yaw-nudge polling only if that's the main screen
+    /// (isCalibratingWiperMarker false) -- the yaw screen never wants it
+    /// running (see pollYawNudgeStatus's own guard).
+    private func closeManualFocus() {
+        cameraManager.commitManualNearFocusLensPosition(manualFocusSliderValue)
+        withAnimation { isShowingManualFocus = false }
+        if !isCalibratingWiperMarker {
+            pollYawNudgeStatus()
         }
     }
 
@@ -1257,24 +2012,23 @@ struct InferenceView: View {
             }
             .padding()
             VStack(spacing: 32) {
-                // The explicit go/no-go verdict -- see isMountOK's doc
-                // comment for why this exists as its own line instead of
-                // leaving Rick to mentally combine the roll color and the
-                // yaw band by eye.
-                Text(isMountOK ? "MOUNT OK" : "NUDGE MOUNT")
+                // The explicit go/no-go verdict for pitch/roll -- see
+                // isAttitudeOK's doc comment for why this exists as its
+                // own line instead of leaving Rick to mentally combine the
+                // roll/pitch readouts by eye. Yaw has its own separate
+                // live verdict now (the rectangle + yawNudgeMessageOverlay
+                // below), not folded into this text.
+                Text(isAttitudeOK ? "MOUNT OK" : "NUDGE MOUNT")
                     .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .foregroundStyle(isMountOK ? .green : .orange)
+                    .foregroundStyle(isAttitudeOK ? .green : .orange)
                     .shadow(color: .black.opacity(0.7), radius: 4)
-                if !isMountOK {
+                if !isAttitudeOK {
                     VStack(spacing: 4) {
                         if !isMountPitchOK {
                             Text("Pitch must be within 1° of reference")
                         }
                         if !isMountRollOK {
                             Text("Roll must be between -1° and 1°")
-                        }
-                        if !isMountYawOK {
-                            Text("Yellow dash stick must be in band")
                         }
                     }
                     .font(.system(size: 16, weight: .medium))
@@ -1315,47 +2069,92 @@ struct InferenceView: View {
                     .shadow(color: .black.opacity(0.7), radius: 4)
             }
 
-            // 2026-08-12: moved out to the far left -- was previously
-            // stacked centered with the roll/pitch readout above, which
-            // covered the yaw marker right when the user needs an
-            // unobstructed view of it (this screen's whole point is
-            // checking yaw alignment against the band). CONFIRMED 2026-08-18
-            // on-device: vertically centered (as it was) put it directly
-            // behind the center readout's left edge once that readout grew
-            // wider (pitch+roll combined, plus reasons/indicators) --
-            // pinned to the bottom-left corner instead so it can't collide
-            // with the center content regardless of that content's width.
-            VStack {
-                Spacer()
-                HStack {
-                    Button {
-                        tapOK()
-                    } label: {
-                        Text("OK")
-                            .font(.system(size: 32, weight: .bold))
-                            .foregroundStyle(.black)
-                            .frame(width: 220, height: 80)
-                            .background(Color.yellow, in: Capsule())
-                    }
-                    .padding(.leading, 12)
-                    .padding(.bottom, 12)
-                    .confirmationDialog(
-                        "Mount out of tolerance -- continue anyway?",
-                        isPresented: $showNudgeMountConfirmation,
-                        titleVisibility: .visible
-                    ) {
-                        Button("Continue Anyway") {
-                            DebugFileLogger.log("tap: MATCHED nudgeMountConfirmed")
-                            calibrateAttitude()
-                        }
-                        Button("Cancel", role: .cancel) {}
-                    }
-                    Spacer()
-                }
-            }
         }
         .onAppear {
-            runYawAutoDetect()
+            // CONFIRMED bug 2026-08-19 (real on-device log): levelScreen
+            // and WiperMarkerConfirmationScreen are mutually-exclusive
+            // branches of the SAME if/else chain in body -- levelScreen
+            // gets removed from the hierarchy while the yaw screen is up
+            // and RE-ADDED whenever it dismisses (a genuine confirm now
+            // skips straight to configuring, see confirmWiperMarkerCalibration
+            // -- but Cancel returns here, see cancelWiperMarkerCalibration),
+            // and .onAppear fires every time a view is (re-)inserted, not
+            // just "the first time ever." Guarding on
+            // isYawCalibrationSessionActive (not isYawVerifiedThisSession,
+            // which only becomes true once the yaw screen is actually
+            // confirmed) makes this genuinely once-per-level-screen-visit
+            // rather than restarting the whole near-focus session/
+            // recording/polling chain every time Cancel brings the user
+            // back here.
+            if !isYawCalibrationSessionActive {
+                beginYawCalibrationFlow()
+            }
+        }
+    }
+
+    /// The level screen's "OK" button, plus its out-of-tolerance
+    /// confirmation dialog -- structural SIBLING to `levelScreen` in the
+    /// outer `body` ZStack (see body's own comment), NOT nested inside it.
+    /// CONFIRMED 2026-08-18 on-device: nested inside `levelScreen` (itself
+    /// wrapped by `withSessionGestures`), the button stopped registering
+    /// taps at all -- zero "tap:"/"calibrate:" debug-log lines over a full
+    /// multi-minute session sitting on the level screen, the exact same
+    /// symptom `YawMarker`'s drag gesture had for the identical reason (see
+    /// `levelScreen`'s own doc comment: something about being a DESCENDANT
+    /// of `withSessionGestures`'s `.contentShape(Rectangle())` +
+    /// `.simultaneousGesture(LongPressGesture)` wrapper swallows touches
+    /// meant for content nested inside it). Pulling it out to a sibling
+    /// sidesteps the same class of bug the same way, rather than digging
+    /// further into exactly why a plain Button -- not just a custom
+    /// DragGesture -- is also affected.
+    private var levelScreenOKButton: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Button {
+                    tapOK()
+                } label: {
+                    Text("OK")
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundStyle(.black)
+                        .frame(width: 220, height: 80)
+                        .background(Color.yellow, in: Capsule())
+                }
+                .padding(.leading, 12)
+                .padding(.bottom, 12)
+                .confirmationDialog(
+                    "Mount out of tolerance -- continue anyway?",
+                    isPresented: $showNudgeMountConfirmation,
+                    titleVisibility: .visible
+                ) {
+                    Button("Continue Anyway") {
+                        DebugFileLogger.log("tap: MATCHED nudgeMountConfirmed")
+                        calibrateAttitude()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                }
+                Spacer()
+                manualFocusButton
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 12)
+            }
+        }
+        .ignoresSafeArea()
+    }
+
+    /// Small, low-key button (matching the yaw screen's Cancel button
+    /// styling, not the primary yellow OK/Done weight) -- reachable from
+    /// both calibration screens (see `isShowingManualFocus`'s doc
+    /// comment), added by request 2026-08-20.
+    private var manualFocusButton: some View {
+        Button(action: openManualFocus) {
+            Text("Manual Focus")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(height: 44)
+                .padding(.horizontal, 16)
+                .background(Color.white.opacity(0.15), in: Capsule())
+                .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
         }
     }
 
@@ -1600,7 +2399,7 @@ struct InferenceView: View {
             // dragging a yaw crosshair on top of it would just be
             // confusing) -- same purpose as before: a stable visual anchor
             // to check the camera hasn't rotated between rounds.
-            YawBand(isMountYawOK: isMountYawOK)
+            YawBand(isYawVerified: cameraManager.isYawVerifiedThisSession, isYawWithinBand: isYawWithinBand)
             distanceCalibrationPitchScreenContent(round: round)
         }
     }
@@ -1700,6 +2499,33 @@ struct InferenceView: View {
         }
     }
 
+    /// Diagnostic "Near-focus test" capture -- see
+    /// `beginNearFocusTestCapture`/`CameraManager.startNearFocusTestCapture`.
+    /// Same no-fixed-duration/manual-Stop shape as `walkaroundRecordingBanner`.
+    private var nearFocusTestCaptureBanner: some View {
+        VStack {
+            Text("● NEAR-FOCUS TEST (1080p, focus locked near)")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .padding()
+                .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.top, 50)
+            Spacer()
+            Button {
+                endNearFocusTestCapture()
+            } label: {
+                Text("Stop")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 32)
+                    .frame(height: 64)
+                    .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 16))
+            }
+            .padding(.bottom, 60)
+        }
+    }
+
     /// Custom replacement for the system `.confirmationDialog` that used to
     /// live here -- see body's comment (2026-08-15) for why. A dimmed scrim
     /// (tap anywhere on it to cancel, matching an action sheet's swipe-down/
@@ -1735,6 +2561,17 @@ struct InferenceView: View {
                     beginWalkaroundRecording()
                 } label: {
                     Text("Walkaround")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 60)
+                        .background(Color.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 16))
+                }
+                Button {
+                    isShowingDistanceCalModePicker = false
+                    beginNearFocusTestCapture()
+                } label: {
+                    Text("Near-focus test")
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
@@ -1793,6 +2630,8 @@ struct InferenceView: View {
                         .shadow(color: .black.opacity(0.6), radius: 2)
                 )
             }
+
+            fourKLabelOverlay(interactive: true)
 
             if cameraOrientationWarning {
                 VStack {
@@ -1858,6 +2697,8 @@ struct InferenceView: View {
                         .hudBoxBackground()
                 }
             }
+
+            fourKLabelOverlay(interactive: false)
         }
     }
 
@@ -1876,20 +2717,36 @@ struct InferenceView: View {
             HStack {
                 topLeading()
                 Spacer()
-                Text(stabilizationLabel)
-                    .hudLabelStyle()
-                    .onTapGesture { toggleStabilization() }
-                    .confirmationDialog(
-                        "Turn stabilization \(pendingStabilizationEnabled ? "on" : "off")?",
-                        isPresented: $showStabilizationConfirmation,
-                        titleVisibility: .visible
-                    ) {
-                        Button(pendingStabilizationEnabled ? "Turn On" : "Turn Off") {
-                            DebugFileLogger.log("tap: MATCHED setStabilization(\(pendingStabilizationEnabled))")
-                            cameraManager.setStabilizationEnabled(pendingStabilizationEnabled)
+                VStack(alignment: .trailing) {
+                    Text(stabilizationLabel)
+                        .hudLabelStyle()
+                        .onTapGesture { toggleStabilization() }
+                        .confirmationDialog(
+                            "Turn stabilization \(pendingStabilizationEnabled ? "on" : "off")?",
+                            isPresented: $showStabilizationConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button(pendingStabilizationEnabled ? "Turn On" : "Turn Off") {
+                                DebugFileLogger.log("tap: MATCHED setStabilization(\(pendingStabilizationEnabled))")
+                                cameraManager.setStabilizationEnabled(pendingStabilizationEnabled)
+                            }
+                            Button("Cancel", role: .cancel) {}
                         }
-                        Button("Cancel", role: .cancel) {}
-                    }
+                    Text(thirtyFpsLabel)
+                        .hudLabelStyle()
+                        .onTapGesture { toggleThirtyFps() }
+                        .confirmationDialog(
+                            "Enable 30fps recording? Roughly doubles video encode load and file size -- for improving yolo26x reference-pass quality, not the live on-device pipeline.",
+                            isPresented: $showThirtyFpsConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Enable") {
+                                DebugFileLogger.log("tap: MATCHED setThirtyFps(true)")
+                                cameraManager.setThirtyFpsEnabled(true)
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        }
+                }
             }
             Spacer()
             HStack {
@@ -1931,6 +2788,43 @@ struct InferenceView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 12)
         .ignoresSafeArea(edges: [.top, .bottom])
+    }
+
+    /// Left side, vertically centered -- deliberately NOT inside
+    /// `settingsHUD` (whose slots are all corner-anchored), used by both
+    /// configuring and driving screens. `interactive` is only true on the
+    /// configuring screen: toggling needs a session reconfigure (see
+    /// `CameraManager.setFourKEnabled`), which only does something
+    /// immediately when no real recording is in progress yet -- on the
+    /// driving screen this is display-only (visual confirmation of which
+    /// resolution is actually recording), not tappable, so there's no dead
+    /// tap that looks like it should do something mid-drive.
+    @ViewBuilder
+    private func fourKLabelOverlay(interactive: Bool) -> some View {
+        HStack {
+            Group {
+                if interactive {
+                    Text(fourKLabel)
+                        .onTapGesture { toggleFourK() }
+                        .confirmationDialog(
+                            "Enable 4K recording? Sustained 4K has previously thermally throttled the device.",
+                            isPresented: $showFourKConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Enable") {
+                                DebugFileLogger.log("tap: MATCHED setFourK(true)")
+                                cameraManager.setFourKEnabled(true)
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        }
+                } else {
+                    Text(fourKLabel)
+                }
+            }
+            .hudLabelStyle()
+            Spacer()
+        }
+        .padding(.leading, 12)
     }
 
     /// Long-press-to-exit, shared by both configuringScreen and
@@ -2008,9 +2902,9 @@ struct InferenceView: View {
 
     private var modelLabel: String {
         switch modelManager.selectedModel {
-        case .small:  return "small"
-        case .nano:   return "nano"
-        case .medium: return "medium"
+        case .small:  return "model: small"
+        case .nano:   return "model: nano"
+        case .medium: return "model: medium"
         }
     }
 
@@ -2021,6 +2915,14 @@ struct InferenceView: View {
 
     private var resolutionLabel: String {
         "res: \(modelManager.currentResolutionLabel)"
+    }
+
+    private var fourKLabel: String {
+        "video: \(cameraManager.isFourKEnabled ? "4K" : "1080p")"
+    }
+
+    private var thirtyFpsLabel: String {
+        "rate: \(cameraManager.isThirtyFpsEnabled ? "30fps" : "15fps")"
     }
 
     private var stabilizationLabel: String {

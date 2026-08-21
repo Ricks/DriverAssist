@@ -47,7 +47,12 @@ from pathlib import Path
 
 from benchmark import iou
 from driverassist_sync import load_detections
-from path_awareness import DEFAULT_MAX_YAW_SHIFT, DEFAULT_YAW_SHIFT_PER_DEG_S, curve_adjusted_center_x
+from path_awareness import (
+    DEFAULT_MAX_YAW_SHIFT,
+    DEFAULT_YAW_SHIFT_PER_DEG_S,
+    curve_adjusted_center_x,
+    lateral_mount_offset_shift,
+)
 from tracker import ByteTracker
 
 # A switch is classified "likely churn" (same physical vehicle, new trackID
@@ -65,6 +70,25 @@ VEHICLE_LABELS = {"car", "truck", "bus", "motorcycle"}
 DEFAULT_CENTER_X = 0.5
 DEFAULT_BAND_HALF_WIDTH = 0.025
 DEFAULT_THRESHOLD = 0.3  # T in Algorithm 1 -- higher is stricter
+
+
+def _aspect_ratio_from_resolution(resolution: str):
+    """Parses a DetectionLogEntry.resolution string ("1152x640",
+    "1920x1088" -- WIDTHxHEIGHT, see ModelManager.swift's
+    baseResolutionLabel/highResResolutionLabel) into width/height, for
+    `classify_leading`'s per-candidate lateral_mount_offset_shift call.
+    Returns None (not a fallback ratio) on anything unparseable, so that
+    shift correctly no-ops for that frame rather than silently applying a
+    wrong aspect ratio -- missing/malformed resolution is a real "we don't
+    know" case, same posture as a missing distanceMeters."""
+    if not resolution or "x" not in resolution:
+        return None
+    try:
+        width_str, height_str = resolution.split("x")
+        width, height = float(width_str), float(height_str)
+        return width / height if height > 0 else None
+    except ValueError:
+        return None
 
 
 # Minimum-evidence gate, added after digging into real switch data: with no
@@ -184,6 +208,7 @@ def classify_leading(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE, min_width: float = DEFAULT_MIN_WIDTH,
     max_bottom_y: float = DEFAULT_MAX_BOTTOM_Y, max_abs_velocity: float = DEFAULT_MAX_ABS_VELOCITY,
     max_aspect_ratio: float = DEFAULT_MAX_ASPECT_RATIO, min_symmetry: float = DEFAULT_MIN_SYMMETRY,
+    aspect_ratio: float = None,
 ):
     """Returns the detection dict (must include trackID) classified as the
     forward-leading vehicle for this frame, or None. Ports Algorithm 1: a
@@ -207,10 +232,21 @@ def classify_leading(
     single-lane-ahead scenario, and not the thesis's distance metric (that
     used width specifically, which needs a calibrated camera we don't have
     here -- see the design discussion), just a placeholder tie-break.
+
+    `center_x` is now the base "straight ahead of the CAMERA" position
+    (whatever curve_adjusted_center_x, if used, already resolved it to) --
+    each candidate's OWN band is further shifted by
+    `path_awareness.lateral_mount_offset_shift`, using that candidate's own
+    `distanceMeters` (already present in `det`, straight from the on-device
+    log) and `aspect_ratio`, to correct for the camera sitting off the car's
+    true centerline. This is a PER-CANDIDATE shift, not a per-frame one --
+    two candidates at different distances get different effective bands --
+    which is why it happens here (once per detection) rather than being
+    folded into a single `center_x` the way the yaw shift is. `aspect_ratio`
+    is required to compute it; omit only if every candidate's `distanceMeters`
+    is expected to be None (the shift is a no-op in that case anyway).
     """
-    s1 = center_x - band_half_width
-    s2 = center_x + band_half_width
-    band_width = s2 - s1
+    band_width = 2 * band_half_width
 
     candidates = []
     for det in detections:
@@ -228,6 +264,13 @@ def classify_leading(
         sym = det.get("sym")
         if sym is not None and sym < min_symmetry:
             continue
+        candidate_center_x = center_x
+        if aspect_ratio is not None:
+            candidate_center_x += lateral_mount_offset_shift(
+                det.get("distanceMeters"), aspect_ratio
+            )
+        s1 = candidate_center_x - band_half_width
+        s2 = candidate_center_x + band_half_width
         x1, x2 = det["x"], det["x"] + det["w"]
         fully_contained = x1 > s1 and x2 < s2
         straddles_with_margin = (x2 - s1) > threshold * band_width and (s2 - x1) > threshold * band_width
@@ -379,13 +422,21 @@ def run_session(
     confirm_frames: int = DEFAULT_CONFIRM_FRAMES, grace_frames: int = DEFAULT_GRACE_FRAMES,
     yaw_rate_key: str = None, yaw_sign: float = 1.0,
     yaw_shift_per_deg_s: float = DEFAULT_YAW_SHIFT_PER_DEG_S, max_yaw_shift: float = DEFAULT_MAX_YAW_SHIFT,
+    apply_lateral_offset: bool = True,
 ) -> dict:
     """`yaw_rate_key`, if given, names the DetectionLogEntry field to read a
     signed yaw rate from (e.g. "rotationRateZDegreesPerSecond") -- which axis
     is actually yaw isn't confirmed yet (see curve_adjusted_center_x), so this
     is left as a choice for the caller rather than hardcoded. None (the
     default) disables curve adjustment entirely, matching every session
-    recorded so far, none of which have rotation rate logged at all."""
+    recorded so far, none of which have rotation rate logged at all.
+
+    `apply_lateral_offset` (default True) feeds each frame's `resolution`
+    (parsed to width/height for aspect_ratio) into `classify_leading`, which
+    then applies `path_awareness.lateral_mount_offset_shift` per candidate --
+    see that function's doc comment. Set False to reproduce pre-r_y-
+    correction behavior (e.g. for an A/B comparison against real labeled
+    data)."""
     tracker = ByteTracker()  # geometry-only (use_gmc defaults False) -- see module docstring
     velocity = VelocityEstimator()
     frames_with_vehicles = 0
@@ -410,10 +461,13 @@ def run_session(
                 center_x, raw_yaw * yaw_sign, yaw_shift_per_deg_s, max_yaw_shift
             )
 
+        aspect_ratio = _aspect_ratio_from_resolution(entry.get("resolution")) if apply_lateral_offset else None
+
         leading = classify_leading(
             dets, frame_center_x, band_half_width, threshold,
             min_confidence=min_confidence, min_width=min_width,
             max_bottom_y=max_bottom_y, max_abs_velocity=max_abs_velocity,
+            aspect_ratio=aspect_ratio,
         )
         raw_ids.append(leading["trackID"] if leading is not None else None)
         box_by_frame.append(leading)

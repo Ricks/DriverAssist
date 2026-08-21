@@ -32,6 +32,17 @@ For EACH raw recording found in the directory, this:
   3. With --benchmark, also runs benchmark.py (slow -- loads the yolo26x
      reference model and runs inference per logged frame), writing
      <video>-benchmark.json/.png into the directory too.
+  4. Runs efficacy_score.py (slow -- loads the yolo26x reference model and
+     runs inference at a dense, near-every-frame interval across the whole
+     session, not just at each logged on-device frame), writing
+     <video>-efficacy-score.json and <video>-track-cache.pkl into the
+     directory. On by default, same as annotation -- pass --skip-efficacy
+     to opt out. The tracking-aware (idf1/mota/miss rate/P(warned-in-time))
+     counterpart to --benchmark's simpler per-frame precision/recall -- see
+     efficacy_score.py's own docstring for the two-gate framework this
+     produces. The cache is what a follow-up per-class analysis (e.g.
+     "what's the bicycle detection rate vs yolo26x") can load directly
+     instead of re-running the expensive dense pass.
 
 The shared logs pool is pulled from the device once per run (not once per
 video) -- all recordings in the directory are sliced out of that single
@@ -294,6 +305,25 @@ def process_video(video: Path, session_dir: Path, args, tools_dir: Path, shared_
                 cmd += ["--reference-model", str(args.reference_model)]
             subprocess.run(cmd, check=True)
 
+    if args.skip_efficacy:
+        print("--skip-efficacy passed -- not running efficacy_score.py's dense reference pass.")
+    else:
+        efficacy_json = session_dir / f"{video.stem}-efficacy-score.json"
+        efficacy_cache = session_dir / f"{video.stem}-track-cache.pkl"
+        if efficacy_json.exists() and efficacy_cache.exists():
+            print(f"{efficacy_json.name}/{efficacy_cache.name} already exist -- skipping "
+                  "(delete them, or pass --rebuild-efficacy-cache, to force regeneration).")
+        else:
+            print("Running efficacy_score.py's dense yolo26x reference pass (slow)...")
+            cmd = [sys.executable, str(tools_dir / "efficacy_score.py"), str(video),
+                   "--detections", str(detections_path), "--debug-log", str(debug_log_path),
+                   "--results", str(efficacy_json), "--cache", str(efficacy_cache)]
+            if args.reference_model:
+                cmd += ["--reference-model", str(args.reference_model)]
+            if args.rebuild_efficacy_cache:
+                cmd += ["--rebuild-cache"]
+            subprocess.run(cmd, check=True)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -306,7 +336,17 @@ def main() -> None:
         "--benchmark", action="store_true",
         help="Also run benchmark.py (slow -- runs the yolo26x reference model) into this directory",
     )
-    parser.add_argument("--reference-model", type=Path, default=None, help="Passed through to benchmark.py if --benchmark is set")
+    parser.add_argument("--reference-model", type=Path, default=None, help="Passed through to benchmark.py/efficacy_score.py if --benchmark is set / --skip-efficacy isn't")
+    parser.add_argument(
+        "--skip-efficacy", action="store_true",
+        help="Skip efficacy_score.py's dense yolo26x reference pass (slow -- runs at a near-every-frame "
+             "interval across the whole session) -- runs by default, same as annotation",
+    )
+    parser.add_argument(
+        "--rebuild-efficacy-cache", action="store_true",
+        help="Passed through as --rebuild-cache to efficacy_score.py -- forces the dense reference pass "
+             "to redo even if efficacy_score.py's own cache signature matches",
+    )
     parser.add_argument(
         "--skip-annotate", action="store_true",
         help="Only extract each session's local detections.jsonl/overlay-debug.log -- skip generating the annotated reconstruction",

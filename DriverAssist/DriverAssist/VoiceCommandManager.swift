@@ -107,6 +107,28 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         audioEngine.stop()
         isListening = false
         wasInterrupted = false
+
+        // CONFIRMED MISSING 2026-08-20: this never deactivated the audio
+        // session -- the .playAndRecord/.duckOthers session `beginSession`
+        // activates stayed active (from iOS's point of view) through every
+        // stop()/beginSession() cycle for the rest of the app's life, only
+        // ever reactivated (setActive(true) again), never cleanly released.
+        // Flagged after two real drives where Google Maps' turn-by-turn
+        // voiceover stopped permanently around 45 minutes in -- an
+        // increasingly stale, never-released session across repeated
+        // interruption/background cycles (a call, Siri, CarPlay, glancing
+        // at Maps itself) is exactly the kind of thing that can leave a
+        // SHARED audio session (and whatever else is relying on it, like
+        // Maps' own playback) in a state it doesn't cleanly recover from.
+        // Deactivating here every time listening genuinely stops -- not
+        // just reactivating later -- gives the system a real chance to
+        // hand the session back cleanly instead of accumulating state.
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            DebugFileLogger.log("voice: audio session deactivated")
+        } catch {
+            DebugFileLogger.log("voice: audio session deactivate FAILED (\(error))")
+        }
     }
 
     /// Recognition silently and permanently stops on any mic interruption (a call,
@@ -127,10 +149,14 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             else { return }
             switch type {
             case .began:
+                let reasonValue = notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
+                DebugFileLogger.log("voice: interruption BEGAN (reason=\(reasonValue.map(String.init) ?? "?"))")
                 Task { @MainActor in self?.pauseForInterruption() }
             case .ended:
                 let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
-                guard AVAudioSession.InterruptionOptions(rawValue: optionsValue).contains(.shouldResume) else { return }
+                let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsValue).contains(.shouldResume)
+                DebugFileLogger.log("voice: interruption ENDED (shouldResume=\(shouldResume))")
+                guard shouldResume else { return }
                 Task { @MainActor in self?.resumeAfterInterruption() }
             @unknown default:
                 break
@@ -140,24 +166,34 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil
         ) { [weak self] _ in
+            DebugFileLogger.log("voice: app entered background")
             Task { @MainActor in self?.pauseForInterruption() }
         }
 
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil
         ) { [weak self] _ in
+            DebugFileLogger.log("voice: app entered foreground")
             Task { @MainActor in self?.resumeAfterInterruption() }
         }
     }
 
     private func pauseForInterruption() {
-        guard isListening else { return }
+        guard isListening else {
+            DebugFileLogger.log("voice: pauseForInterruption SKIPPED (already not listening)")
+            return
+        }
+        DebugFileLogger.log("voice: pausing for interruption/background")
         stop()
         wasInterrupted = true
     }
 
     private func resumeAfterInterruption() {
-        guard wasInterrupted else { return }
+        guard wasInterrupted else {
+            DebugFileLogger.log("voice: resumeAfterInterruption SKIPPED (wasInterrupted=false)")
+            return
+        }
+        DebugFileLogger.log("voice: resuming after interruption/background")
         wasInterrupted = false
         beginSession()
     }
@@ -173,6 +209,14 @@ final class VoiceCommandManager: NSObject, ObservableObject {
             try audioSession.setCategory(.playAndRecord, mode: .measurement, options: .duckOthers)
             try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
+            // CONFIRMED this catch was silent before -- exactly the kind of
+            // gap that could explain "voice listening just stopped forever"
+            // with zero trace: if setCategory/setActive ever fails here
+            // (e.g. right after a real interruption, before the system has
+            // fully released the session), beginSession bails out having
+            // done nothing, isListening never becomes true again, and
+            // nothing ever retries.
+            DebugFileLogger.log("voice: beginSession audio session setup FAILED (\(error))")
             return
         }
 
@@ -187,9 +231,11 @@ final class VoiceCommandManager: NSObject, ObservableObject {
         do {
             try audioEngine.start()
         } catch {
+            DebugFileLogger.log("voice: beginSession audioEngine.start FAILED (\(error))")
             return
         }
 
+        DebugFileLogger.log("voice: session began, audio session active")
         isListening = true
         startRecognitionTask()
     }

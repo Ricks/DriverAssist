@@ -41,9 +41,20 @@ DEFAULT_REFERENCE_MODEL = Path.home() / "DriverAssist" / "yolo26x.pt"
 
 
 def config_label(entry: dict) -> str:
+    # CONFIRMED gap 2026-08-20: resolution wasn't part of this label --
+    # model/two-pass-switching mid-drive predates the high-res ML-inference
+    # toggle (added 2026-08-17), so a model x resolution matrix session
+    # (e.g. nano-low/nano-high/small-low/small-high, all one recording)
+    # would silently MERGE its two resolution legs per model into one
+    # blended accumulator/scorecard here -- same model, same two-pass
+    # state, different resolution, identical label. Added so each of the
+    # matrix's legs actually gets its own scorecard, matching what this
+    # module's own docstring already promises ("each is broken out
+    # separately here").
     model = MODEL_DISPLAY_NAMES.get(entry["model"], entry["model"])
     two_pass = "on" if entry["twoPass"] else "off"
-    return f"{model}, two-pass {two_pass}"
+    resolution = entry.get("resolution", "?")
+    return f"{model}, res {resolution}, two-pass {two_pass}"
 
 
 def to_xyxy(box: dict) -> tuple:
