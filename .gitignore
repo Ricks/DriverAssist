@@ -6,6 +6,7 @@
 # Xcode
 build/
 DerivedData/
+DriverAssist/build_output/
 *.xcuserstate
 *.xcuserdatad/
 xcuserdata/
