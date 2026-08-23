@@ -30,6 +30,15 @@ final class CameraManager: NSObject, ObservableObject {
     /// an explicit override.
     @Published private(set) var isAutoLowLightEnabled = true
 
+    /// Bypasses this app's OWN exposure tuning entirely -- both the low-
+    /// light bias AND `restrictMaxExposureDuration`'s 1/60s shutter cap --
+    /// for testing against stock iPhone AE. Added by request 2026-08-22 as
+    /// a 4th low-light-cycle state: low-light "off" alone still leaves the
+    /// 1/60s cap in effect (a separate, unconditional motion-blur
+    /// mitigation applied in `configure()`, not tied to the boost toggle),
+    /// so it was never actually stock AE -- this is. See `setNormalAE`.
+    @Published private(set) var isNormalAEEnabled = false
+
     /// Whether frames are actively being written to a recording segment right now.
     /// Published so the HUD can surface a loud warning the moment this goes false —
     /// a silent recording failure is otherwise invisible, since live detection keeps
@@ -150,12 +159,11 @@ final class CameraManager: NSObject, ObservableObject {
     /// laser dot, 2026-08-15/16 walkaround/drive re-measures, 2026-08-19
     /// post-laser-readjustment manual value). Retired by request: Rick
     /// flagged the stick as not mounted firmly enough to trust as a yaw
-    /// reference (see `detectWiperMarkerNormalized`'s doc comment for the
-    /// replacement's own rationale) -- a loose object can shift
-    /// independently of the mount, defeating the entire point of using it
-    /// to measure the mount's own drift. Now points at the wiper-cowl
-    /// marker instead, which is rigidly part of the car and can't do that.
-    /// See `defaultWiperMarkerNormalizedY` for the y-axis measurement this
+    /// reference -- a loose object can shift independently of the mount,
+    /// defeating the entire point of using it to measure the mount's own
+    /// drift. Now points at the wiper-cowl marker instead, which is
+    /// rigidly part of the car and can't do that. See
+    /// `defaultWiperMarkerNormalizedY` for the y-axis measurement this
     /// pairs with.
     ///
     /// RE-MEASURED 2026-08-19 (later same day): the value above was from
@@ -169,8 +177,9 @@ final class CameraManager: NSObject, ObservableObject {
     /// connected-component analysis offline (a naive whole-ROI centroid was
     /// getting pulled toward a second, larger dark blob -- the wiper cap's
     /// shadowed edge, immediately left of the marker -- see
-    /// `detectWiperMarkerNormalized`'s doc comment for how the ROI was
-    /// retightened to exclude it).
+    /// `detectWiperMarkerCoarse`'s doc comment for how the live detector
+    /// now avoids that by size-filtering connected blobs instead of a
+    /// narrow ROI).
     ///
     /// RE-MEASURED AGAIN 2026-08-20: two fresh, correctly near-focused
     /// sessions (`wipercal-20260820-104855.mov`, `wipercal-20260820-110040.mov`
@@ -190,11 +199,71 @@ final class CameraManager: NSObject, ObservableObject {
     /// 0.7269 sample straddles it) -- read as ordinary detector noise, not
     /// drift, so updated to match this same session's own X reading rather
     /// than left inconsistent with the new Y.
-    static let defaultYawMarkerNormalizedX: CGFloat = 0.8455
+    ///
+    /// RE-MEASURED AGAIN 2026-08-21: real device report ("auto-detect still
+    /// not working, marker too low in the rectangle") traced to genuine
+    /// mount drift since 2026-08-20, not just a detector bug -- confirmed
+    /// via offline connected-component analysis of `wipercal-20260821-103314.mov`
+    /// (3 frames sampled: (0.8382,0.7572), (0.8394,0.7579), (0.8395,0.7579),
+    /// a tight, ~148-149-sample circularity-0.97 cluster, unambiguously the
+    /// true marker vs. the ~1280-sample trim-shadow blob nearby). Averaged
+    /// to (0.8390, 0.7576) -- both this default AND the old
+    /// `detectWiperMarkerNormalized`'s narrow, no-longer-matching ROI were
+    /// contributing to the reported symptoms; see `refineYawReference`'s
+    /// doc comment for the detector-side fix (switched to the size-filtered
+    /// `detectWiperMarkerCoarse`, robust to exactly this kind of drift
+    /// without needing hand re-centering every time).
+    ///
+    /// CORRECTED TO NOMINAL MOUNT 2026-08-22: the value above is where the
+    /// marker was actually observed on 2026-08-21, at whatever roll/pitch/
+    /// yaw that specific mount attachment happened to have -- by request,
+    /// this now instead represents where the marker would appear at a
+    /// PERFECTLY calibrated mount (roll drift = 0, pitch drift = 0, camera-
+    /// to-vehicle yaw = 0 per the FOE measurement in tools/camera_yaw_alignment.py),
+    /// so the zoom/rectangle target is a principled reference point rather
+    /// than wherever one specific attachment happened to leave the marker.
+    /// Derived from the raw (0.8390, 0.7576) observation by undoing the
+    /// mount state present at that exact moment (detections-1787341888.jsonl,
+    /// t=1787333598.55, 0.065s from the detector's own MATCHED log line):
+    /// pitchDrift=-0.0291deg, rollDrift=-0.0194deg (both already tiny,
+    /// confirming the level screen's own pitch/roll gate was working as
+    /// intended), plus the combined FOE yaw estimate from the two
+    /// current-calibration-regime sessions (26_08_20: median -0.608deg;
+    /// 26_08_21, 2-outlier-cleaned: weighted mean -0.605deg -- these two
+    /// independent sessions agreeing this closely is why the combined
+    /// -0.6065deg figure is trusted here at all).
+    ///
+    /// Method: convert the observed pixel position to normalized angular
+    /// camera-space coordinates (x=(col-principalCol)*aspect/f, y=(row-
+    /// principalRow)/f -- the exact parameterization `DistanceEstimator
+    /// .fit()`'s own de-roll step uses), then undo each rotation as a
+    /// small-angle camera-frame rotation: roll via the SAME `-x*sin(psi)+
+    /// y*cos(psi)` rotation `DistanceEstimator.fit()` already validated
+    /// against real tape-mark data (psi=rollDrift, not full rollDegrees --
+    /// "0" here means "matches reference," same convention as
+    /// pitchOffsetDegreesRounded/YawBand elsewhere in this app); pitch and
+    /// yaw as pure-rotation angular shifts (y += pitchDrift, x -=
+    /// yawOffset), the same "a camera rotation shifts every point by the
+    /// same angle regardless of depth" reasoning `ByteTracker
+    /// .yawFallbackTransform` already relies on for yaw. The pitch shift's
+    /// direction was cross-checked against `DistanceEstimator
+    /// .distanceMeters`'s own validated `phi = alpha + theta` relationship
+    /// (alpha_corrected = alpha_observed + pitchDrift), not just reasoned
+    /// fresh -- this codebase has a documented history of pitch-sign bugs,
+    /// see PitchSensor.swift's own file-level note, so this was treated
+    /// with the same suspicion.
+    ///
+    /// Net effect: (0.8390, 0.7576) -> (0.8468, 0.7571) -- a 15px rightward
+    /// shift at 1920x1080 (the yaw term, by far the dominant one: pitch/roll
+    /// contributed under a pixel combined, consistent with the level
+    /// screen's gate already keeping live drift small at observation time)
+    /// and a negligible ~0.5px vertical shift.
+    static let defaultYawMarkerNormalizedX: CGFloat = 0.8468
 
     /// Y-axis companion to `defaultYawMarkerNormalizedX` above -- see that
-    /// constant's doc comment for the 2026-08-20 re-measurement.
-    static let defaultWiperMarkerNormalizedY: CGFloat = 0.7351
+    /// constant's doc comment for the full 2026-08-22 nominal-mount
+    /// derivation.
+    static let defaultWiperMarkerNormalizedY: CGFloat = 0.7571
 
     /// Current system thermal state. Published so the HUD can warn when the device
     /// is under thermal pressure — the ML/capture workload can degrade 10-15x under
@@ -242,6 +311,17 @@ final class CameraManager: NSObject, ObservableObject {
         set { overlayLock.lock(); _currentAutoLowLightEnabled = newValue; overlayLock.unlock() }
     }
 
+    /// Nonisolated mirror of `isNormalAEEnabled`, readable from `sessionQueue`
+    /// in `configure()` to decide whether to apply `restrictMaxExposureDuration`'s
+    /// cap or `restoreNativeMaxExposureDuration` instead -- needed on a
+    /// mid-session reconfigure (e.g. `setFourKEnabled`'s teardown+configure),
+    /// not just initial launch, so toggling 4K while normal-AE testing is
+    /// active doesn't silently reinstate the cap.
+    private nonisolated var currentNormalAEEnabled: Bool {
+        get { overlayLock.lock(); defer { overlayLock.unlock() }; return _currentNormalAEEnabled }
+        set { overlayLock.lock(); _currentNormalAEEnabled = newValue; overlayLock.unlock() }
+    }
+
     /// Nonisolated mirror of `isStabilizationEnabled`, readable from `sessionQueue`
     /// while applying the mode to the capture connection in
     /// `configure()`/`applyStabilizationMode`.
@@ -274,6 +354,7 @@ final class CameraManager: NSObject, ObservableObject {
     private let overlayLock = NSLock()
     private nonisolated(unsafe) var _currentLowLightEnabled: Bool = false
     private nonisolated(unsafe) var _currentAutoLowLightEnabled: Bool = true
+    private nonisolated(unsafe) var _currentNormalAEEnabled: Bool = false
     private nonisolated(unsafe) var _currentStabilizationEnabled: Bool = false
     private nonisolated(unsafe) var _currentFourKEnabled: Bool = false
     private nonisolated(unsafe) var _currentNearFocusLensPosition: Float = CameraManager.defaultNearFocusLensPosition
@@ -362,6 +443,17 @@ final class CameraManager: NSObject, ObservableObject {
     // to the main actor first.
     private nonisolated static let autoLowLightOnLuminance: Double = 50
     private nonisolated static let autoLowLightOffLuminance: Double = 90
+
+    /// Wide search window for the wiper-cowl marker -- shared by
+    /// `detectWiperMarkerCoarse` (what it searches) and the wiper-marker
+    /// torch check (what it measures brightness over, as of 2026-08-21 --
+    /// see that call site's own doc comment for why). Comfortably contains
+    /// the yaw-screen rectangle (roughly 0.715-0.882 x, 0.606-0.772 y at
+    /// the current default center/zoom) with margin on every side for a
+    /// realistic nudge-range mount misalignment, without spanning far
+    /// enough to reach unrelated dark regions of the dash/hood.
+    private nonisolated static let wiperMarkerSearchXFraction: ClosedRange<Double> = 0.70...0.95
+    private nonisolated static let wiperMarkerSearchYFraction: ClosedRange<Double> = 0.60...0.85
 
     /// Consecutive at/below-threshold readings required before the boost actually
     /// turns on -- added after a real false-positive on session
@@ -971,115 +1063,6 @@ final class CameraManager: NSObject, ObservableObject {
         return bandCount
     }
 
-    /// Detects the wiper-cowl marker -- a small, DARKER-than-its-
-    /// surroundings circular feature on the wiper arm cover, rigidly part
-    /// of the car -- and returns its centroid as normalized [0,1] (x,y),
-    /// or nil if nothing confidently matched. Replaces the retired yellow-
-    /// stick detector (see `defaultYawMarkerNormalizedX`'s doc comment for
-    /// why): a loose clipped-on object can shift independently of the
-    /// mount, defeating the whole point of using it to measure the
-    /// mount's own drift; this can't.
-    ///
-    /// Only meaningful against a NEAR-focused frame -- see
-    /// `settleAndLockNearFieldFocus`/`knownGoodNearLensPosition`, and
-    /// `calibrateWiperMarker` (this function's only caller) for why the
-    /// whole point of that near-focus detour exists. Under the normal
-    /// far-focused driving view this region is soft.
-    ///
-    /// ROI and threshold RE-MEASURED 2026-08-19 (later same day) against
-    /// `wipercal-20260819-183622.mov`, the first capture where the marker
-    /// was both correctly near-focused AND from the mount's actual current
-    /// position -- every earlier attempt had one or the other wrong (see
-    /// `defaultYawMarkerNormalizedX`'s doc comment for the stale-frame
-    /// history, and `lockKnownGoodFarFocus` for the focus-race bug). Offline
-    /// connected-component analysis of that frame found the true marker as
-    /// a compact ~21x24px blob centered at pixel (1647.7, 785.0) of
-    /// 1920x1080 -- and, critically, a SECOND, larger dark blob immediately
-    /// to its left (the wiper cap's own shadowed edge, bbox roughly
-    /// 1555-1581 x 765-830, over 3x the marker's pixel count) that the old
-    /// ROI (0.85-0.94 x, 0.68-0.80 y) was wide enough to catch, biasing a
-    /// naive whole-ROI centroid rightward toward it -- which is exactly the
-    /// rightward bias real on-device sessions kept showing, and why a prior
-    /// same-day tightening pass (reasoned from log evidence rather than a
-    /// fresh pixel measurement) didn't fix it: it narrowed the ROI but
-    /// didn't move it, so the shadow blob was still inside. This pass
-    /// re-centers the ROI tightly enough around the real marker to exclude
-    /// that shadow blob by x-range alone, and re-derives the threshold
-    /// multiplier (0.6 -> 0.75) against the new, correctly-centered ROI's
-    /// own mean brightness -- 0.6 was tuned for the old, wider ROI and
-    /// produces zero matches in this tighter one. Threshold stays relative
-    /// to the ROI's own mean, not a fixed absolute value -- same "ratio
-    /// holds across lighting, absolute doesn't" lesson the retired yellow-
-    /// stick detector's color thresholds already had to learn twice.
-    private nonisolated func detectWiperMarkerNormalized(in pixelBuffer: CVPixelBuffer) -> (x: CGFloat, y: CGFloat)? {
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let bytes = base.assumingMemoryBound(to: UInt8.self)
-
-        // Tight around the re-measured (0.8582, 0.7269) center -- see this
-        // function's doc comment for why the previous, wider ROI reached
-        // far enough left to catch the wiper cap's own shadow blob. Still
-        // has margin for real session-to-session mount drift (~15-30px
-        // each side), just not enough to reach that shadow region again.
-        let roiXRange = Int(0.83 * Double(width))..<Int(0.89 * Double(width))
-        let roiYRange = Int(0.70 * Double(height))..<Int(0.76 * Double(height))
-        let stride = 2
-
-        func brightness(atByteOffset offset: Int) -> Double {
-            // kCVPixelFormatType_32BGRA byte order: B, G, R, A.
-            let b = Double(bytes[offset])
-            let g = Double(bytes[offset + 1])
-            let r = Double(bytes[offset + 2])
-            return (r + g + b) / 3
-        }
-
-        var total = 0.0
-        var sampleCount = 0
-        var row = roiYRange.lowerBound
-        while row < roiYRange.upperBound {
-            var col = roiXRange.lowerBound
-            while col < roiXRange.upperBound {
-                total += brightness(atByteOffset: row * bytesPerRow + col * 4)
-                sampleCount += 1
-                col += stride
-            }
-            row += stride
-        }
-        guard sampleCount > 0 else { return nil }
-        let threshold = (total / Double(sampleCount)) * 0.75
-
-        var sumX = 0.0
-        var sumY = 0.0
-        var darkCount = 0
-        row = roiYRange.lowerBound
-        while row < roiYRange.upperBound {
-            var col = roiXRange.lowerBound
-            while col < roiXRange.upperBound {
-                if brightness(atByteOffset: row * bytesPerRow + col * 4) < threshold {
-                    sumX += Double(col)
-                    sumY += Double(row)
-                    darkCount += 1
-                }
-                col += stride
-            }
-            row += stride
-        }
-
-        // Require enough matching samples to trust this as the real
-        // marker, not scattered dark noise (shadow, dirt, a gap in the
-        // grille texture).
-        let minSamples = 30
-        guard darkCount >= minSamples else { return nil }
-        return (
-            CGFloat(sumX / Double(darkCount)) / CGFloat(width),
-            CGFloat(sumY / Double(darkCount)) / CGFloat(height)
-        )
-    }
-
     /// Remembers what to restore once `endYawCalibrationSession` runs --
     /// only meaningful between a `beginYawCalibrationSession` call and its
     /// matching `end`. Spans BOTH the main (pitch/roll) calibration screen
@@ -1087,6 +1070,40 @@ final class CameraManager: NSObject, ObservableObject {
     /// comment for why this moved up from just the zoomed screen.
     private nonisolated(unsafe) var wiperMarkerCalibrationRestoreStabilization = false
     private nonisolated(unsafe) var wiperMarkerCalibrationTorchEngaged = false
+
+    /// UI-facing mirror of the torch's actual on/off state during a yaw
+    /// calibration session -- added by request 2026-08-21 for a manual
+    /// torch toggle button on both calibration screens. Kept in sync with
+    /// `wiperMarkerCalibrationTorchEngaged` (which `endYawCalibrationSession`
+    /// reads to decide whether to turn the torch back off) by every call
+    /// site that changes either -- the auto luminance-based engage, the
+    /// manual `toggleTorch()`, and the session-start/session-end resets.
+    @Published private(set) var isTorchOn = false
+
+    /// Manually flips the torch, independent of the automatic luminance-
+    /// based decision in `beginYawCalibrationSession` -- for the manual
+    /// toggle button, added by request 2026-08-21 (real device reports of
+    /// the auto-decision missing genuinely-needed cases, e.g. a shadowed
+    /// target area under a brighter overall scene). Updates
+    /// `wiperMarkerCalibrationTorchEngaged` too, so `endYawCalibrationSession`
+    /// still correctly turns off whatever's on when the session ends,
+    /// whether the auto-check or this manual toggle turned it on.
+    func toggleTorch() {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice, device.hasTorch, device.isTorchModeSupported(.on) else { return }
+            let turnOn = device.torchMode != .on
+            do {
+                try device.lockForConfiguration()
+                device.torchMode = turnOn ? .on : .off
+                device.unlockForConfiguration()
+                self.wiperMarkerCalibrationTorchEngaged = turnOn
+                DebugFileLogger.log("wiper-marker-calibrate: torch manually toggled \(turnOn ? "on" : "off")")
+                DispatchQueue.main.async { self.isTorchOn = turnOn }
+            } catch {
+                DebugFileLogger.log("wiper-marker-calibrate: manual torch toggle failed (\(error))")
+            }
+        }
+    }
 
     /// Begins a yaw calibration session -- called once, when the MAIN
     /// (pitch/roll) calibration screen first appears, not just when the
@@ -1183,6 +1200,7 @@ final class CameraManager: NSObject, ObservableObject {
                 self.applyStabilizationMode(enabled: false)
             }
             self.wiperMarkerCalibrationTorchEngaged = false
+            DispatchQueue.main.async { self.isTorchOn = false }
             // No longer racing the app's own launch-time far settle here --
             // `configure()` now direct-locks far focus at launch instead of
             // running a multi-second AF sweep (see `lockKnownGoodFarFocus`),
@@ -1206,14 +1224,37 @@ final class CameraManager: NSObject, ObservableObject {
                 // after the near-focus lock has genuinely completed, by
                 // which point real frames are guaranteed to have been
                 // flowing for a while.
+                //
+                // CONFIRMED gap 2026-08-21: real device report ("flashlight
+                // did not come on... even though it was night",
+                // 26_08_21_Night_Matrix) traced to a WHOLE-FRAME luminance
+                // reading (76.0, matches the logged value exactly) getting
+                // pulled up by a lit building the car was parked facing,
+                // while the actual wiper-marker search window in that same
+                // frame read meaningfully darker (57.1, offline-confirmed).
+                // Sampling the SAME window `detectWiperMarkerCoarse`
+                // actually needs to see, not the whole frame, measures what
+                // matters instead of an average that background light can
+                // skew bright. NOTE: in that specific session this reading
+                // (57.1) was still just above the 50 threshold, so it
+                // wouldn't have flipped THAT exact decision either --
+                // detection's actual failure 74s later coincided with a
+                // separate, large overexposure/glare artifact (a bright
+                // light source very close to frame), not underexposure, so
+                // torch alone likely wasn't the whole story that night. This
+                // fixes a real, confirmed measurement mismatch either way.
                 if let pixelBuffer = self.latestPreviewPixelBuffer,
-                   let luminance = self.averageLuminance(of: pixelBuffer) {
+                   let luminance = self.averageLuminance(
+                       of: pixelBuffer,
+                       roi: (x: Self.wiperMarkerSearchXFraction, y: Self.wiperMarkerSearchYFraction)
+                   ) {
                     if luminance <= Self.autoLowLightOnLuminance, device.hasTorch, device.isTorchModeSupported(.on) {
                         do {
                             try device.lockForConfiguration()
                             device.torchMode = .on
                             device.unlockForConfiguration()
                             self.wiperMarkerCalibrationTorchEngaged = true
+                            DispatchQueue.main.async { self.isTorchOn = true }
                             DebugFileLogger.log("wiper-marker-calibrate: torch on (luminance=\(luminance))")
                         } catch {
                             DebugFileLogger.log("wiper-marker-calibrate: torch lockForConfiguration failed (\(error))")
@@ -1229,26 +1270,49 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Re-runs the precise, tightly-centered detector
-    /// (`detectWiperMarkerNormalized`) and, on a confident match, commits
-    /// it as the new yaw reference -- used once, when the user actually
-    /// opens the zoomed yaw screen (to seed its crosshair), NOT by the
-    /// main screen's live nudge polling (see `checkYawNudgeNeeded` for
-    /// that -- deliberately a separate, wider-search function, since this
-    /// one's whole point is precision within a small ROI, not tolerance
-    /// for a still-misaligned mount). `completion` reports the detected
-    /// (x,y), or nil if nothing confidently matched -- yawReferenceNormalizedX/Y
-    /// are left unchanged on failure (same "fall back to the last-known/
-    /// persisted value" contract `detectYawMarker` used to have) so the
-    /// yaw screen still has a starting position to show and let the user
-    /// manually adjust.
+    /// Re-runs the wide-search blob detector (`detectWiperMarkerCoarse`)
+    /// and, on a confident match, commits it as the new yaw reference --
+    /// used once, when the user actually opens the zoomed yaw screen (to
+    /// seed its crosshair).
+    ///
+    /// SWITCHED 2026-08-21 from a separate, narrower `detectWiperMarkerNormalized`
+    /// (whole-ROI brightness centroid over a small, hand-centered box) --
+    /// CONFIRMED via a real `wipercal-*.mov` recording, not log-reasoning,
+    /// this was the actual cause of a real device report ("auto-detect
+    /// still not working, have to move the circle manually almost every
+    /// time"): the true marker (a genuinely circular, ~28x28px hole in the
+    /// wiper cowl trim, confirmed via connected-component circularity
+    /// analysis: 0.97, vs. 0.09 for the large trim-shadow blob) had drifted
+    /// to (0.839, 0.758), OUTSIDE that function's fixed 0.83-0.89/0.70-0.76
+    /// ROI's y-range -- so its whole-region centroid was instead pulled
+    /// toward the edge of the trim's own shadow bleeding into the box,
+    /// landing at (0.850, 0.736): off by little in normalized terms, but
+    /// ~140px on the 6x-zoomed confirmation screen. This is the SAME
+    /// failure mode `detectWiperMarkerCoarse`'s own doc comment already
+    /// documents being fixed for once (the retired yellow-stick detector's
+    /// naive whole-ROI centroid getting dragged toward the shadow blob) --
+    /// `detectWiperMarkerNormalized` just never got the same fix, because
+    /// it was still being re-centered by hand each time instead. Its size-
+    /// filtered connected-component search (already proven here: 3 of 4
+    /// real sampled frames matched a tight ~148-149-sample cluster at
+    /// (0.839, 0.758), correctly rejecting the ~1280-sample shadow blob by
+    /// size) is structurally robust to this kind of session-to-session
+    /// marker drift in a way a fixed narrow ROI can never be, since it
+    /// searches a wide area instead of assuming the marker stays put.
+    /// `detectWiperMarkerNormalized` itself is now dead code, removed.
+    ///
+    /// `completion` reports the detected (x,y), or nil if nothing
+    /// confidently matched -- yawReferenceNormalizedX/Y are left unchanged
+    /// on failure (same "fall back to the last-known/persisted value"
+    /// contract `detectYawMarker` used to have) so the yaw screen still has
+    /// a starting position to show and let the user manually adjust.
     func refineYawReference(completion: @escaping @Sendable ((x: CGFloat, y: CGFloat)?) -> Void) {
         sessionQueue.async { [weak self] in
             guard let self else {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            let detected = self.latestPreviewPixelBuffer.flatMap { self.detectWiperMarkerNormalized(in: $0) }
+            let detected = self.latestPreviewPixelBuffer.flatMap { self.detectWiperMarkerCoarse(in: $0) }
             if let detected {
                 DebugFileLogger.log("wiper-marker-calibrate: MATCHED x=\(detected.x) y=\(detected.y)")
             } else {
@@ -1269,26 +1333,29 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// Wide-search variant of `detectWiperMarkerNormalized`, used for the
-    /// main calibration screen's live "yaw nudge" check -- that screen
-    /// shows a rectangle previewing where the yaw screen will zoom to, and
-    /// needs to know, well before the user ever opens that zoomed screen,
-    /// whether the marker is inside it, outside it, or not visible at
-    /// all, so it can warn the user to nudge the mount (see ContentView's
-    /// yaw-nudge polling).
+    /// Wide-search, size-filtered blob detector for the wiper-cowl marker
+    /// -- used by BOTH the main calibration screen's live "yaw nudge" check
+    /// (that screen shows a rectangle previewing where the yaw screen will
+    /// zoom to, and needs to know, well before the user ever opens that
+    /// zoomed screen, whether the marker is inside it, outside it, or not
+    /// visible at all, so it can warn the user to nudge the mount -- see
+    /// ContentView's yaw-nudge polling) AND, since 2026-08-21,
+    /// `refineYawReference`'s precise per-session detection (see that
+    /// function's doc comment for why the narrower detector it used to use
+    /// was retired).
     ///
-    /// A plain widened version of `detectWiperMarkerNormalized`'s ROI/
-    /// threshold approach doesn't work here -- CONFIRMED 2026-08-19, same
-    /// session: a wide net over a naive whole-ROI centroid gets dragged
-    /// toward whichever dark region is BIGGEST, not necessarily the
-    /// marker itself (the wiper cap's own shadowed edge is ~3x the
-    /// marker's pixel count -- see `detectWiperMarkerNormalized`'s doc
-    /// comment for the full story of how that fooled the original
-    /// detector). This searches a wide window but finds CONNECTED dark
-    /// blobs and filters by the marker's real measured size, rather than
-    /// trusting a single whole-region centroid -- the shadow blob and any
-    /// other incidental dark region get rejected as too big (or too
-    /// small, for noise), not blended in.
+    /// A naive whole-ROI brightness centroid doesn't work here -- CONFIRMED
+    /// 2026-08-19, and again 2026-08-21 after real mount drift moved the
+    /// marker: it gets dragged toward whichever dark region is BIGGEST, not
+    /// necessarily the marker itself (the wiper cap's own shadowed edge has
+    /// run 3-8x the marker's own pixel count across different sessions).
+    /// This searches a wide window but finds CONNECTED dark blobs and
+    /// filters by the marker's real measured size AND rejects anything
+    /// outside it, rather than trusting a single whole-region centroid --
+    /// the shadow blob and any other incidental dark region get rejected as
+    /// too big (or too small, for noise), not blended in. Robust to
+    /// ordinary session-to-session mount drift for the same reason: it
+    /// doesn't assume the marker sits in a fixed, narrow box at all.
     ///
     /// Returns the largest accepted blob's centroid (there's normally at
     /// most one real candidate in range; size is just the simplest
@@ -1302,13 +1369,8 @@ final class CameraManager: NSObject, ObservableObject {
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let bytes = base.assumingMemoryBound(to: UInt8.self)
 
-        // Comfortably contains the yaw-screen rectangle (roughly 0.715-
-        // 0.882 x, 0.606-0.772 y at the current default center/zoom) with
-        // margin on every side for a realistic nudge-range mount
-        // misalignment, without spanning far enough to reach unrelated
-        // dark regions of the dash/hood.
-        let roiXRange = Int(0.70 * Double(width))..<Int(0.95 * Double(width))
-        let roiYRange = Int(0.60 * Double(height))..<Int(0.85 * Double(height))
+        let roiXRange = Int(Self.wiperMarkerSearchXFraction.lowerBound * Double(width))..<Int(Self.wiperMarkerSearchXFraction.upperBound * Double(width))
+        let roiYRange = Int(Self.wiperMarkerSearchYFraction.lowerBound * Double(height))..<Int(Self.wiperMarkerSearchYFraction.upperBound * Double(height))
         let stride = 2
 
         func brightness(atByteOffset offset: Int) -> Double {
@@ -1348,13 +1410,31 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         // Connected-component flood fill (4-connectivity) over the grid,
-        // sized in stride-2 SAMPLE count -- calibrated against
-        // `detectWiperMarkerNormalized`'s own real measurements of the
-        // genuine marker (89-129 samples at stride 2 within a tightly-
-        // centered ROI) vs. the shadow blob it was confused with (~325
-        // equivalent) -- see that function's doc comment.
+        // sized in stride-2 SAMPLE count -- originally calibrated 2026-08-19
+        // against the genuine marker (89-129 samples) vs. the shadow blob it
+        // was confused with (~325 equivalent), and RECONFIRMED 2026-08-21
+        // against a fully independent real measurement after mount drift
+        // (~148-149 samples for the marker vs. ~1280 for the shadow blob) --
+        // both real sessions' true-marker sizes comfortably clear of both
+        // bounds, so the range holds across at least two different mount
+        // positions, not just the one it was originally tuned on.
+        //
+        // CONFIRMED gap 2026-08-21, same day: size alone isn't enough --
+        // a real `wipercal-*.mov` (26_08_21_Day_Small) showed a spurious
+        // thin reflection streak (21x14 grid-cells, circularity 0.10) land
+        // in-range and get picked over the true marker (14x14, circularity
+        // 0.95) simply because it happened to have more samples that frame.
+        // The true marker is a real physical circular hole and reliably
+        // measures circularity 0.95-0.97 across three independent
+        // measurements today; every false-positive candidate seen so far
+        // (shadow blobs, reflection streaks, trim edges) measured well
+        // under 0.5. Picking the highest-circularity candidate above this
+        // threshold, not the largest, directly fixes a real reported bug
+        // ("the circle was not anywhere near the marker") rather than
+        // guessing at another size retune.
+        let minCircularity = 0.75
         var visited = [Bool](repeating: false, count: gridCols * gridRows)
-        var best: (size: Int, sumGX: Int, sumGY: Int)?
+        var best: (size: Int, sumGX: Int, sumGY: Int, circularity: Double)?
         let minBlobSize = 25
         let maxBlobSize = 260
         for start in 0..<(gridCols * gridRows) where dark[start] && !visited[start] {
@@ -1363,12 +1443,15 @@ final class CameraManager: NSObject, ObservableObject {
             var size = 0
             var sumGX = 0
             var sumGY = 0
+            var minGX = Int.max, maxGX = Int.min, minGY = Int.max, maxGY = Int.min
             while let idx = stack.popLast() {
                 size += 1
                 let gx = idx % gridCols
                 let gy = idx / gridCols
                 sumGX += gx
                 sumGY += gy
+                minGX = min(minGX, gx); maxGX = max(maxGX, gx)
+                minGY = min(minGY, gy); maxGY = max(maxGY, gy)
                 for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                     let nx = gx + dx, ny = gy + dy
                     guard nx >= 0, nx < gridCols, ny >= 0, ny < gridRows else { continue }
@@ -1380,8 +1463,13 @@ final class CameraManager: NSObject, ObservableObject {
                 }
             }
             guard (minBlobSize...maxBlobSize).contains(size) else { continue }
-            if best == nil || size > best!.size {
-                best = (size, sumGX, sumGY)
+            let blobWidth = maxGX - minGX + 1
+            let blobHeight = maxGY - minGY + 1
+            let radius = Double(max(blobWidth, blobHeight)) / 2
+            let circularity = radius > 0 ? Double(size) / (.pi * radius * radius) : 0
+            guard circularity >= minCircularity else { continue }
+            if best == nil || circularity > best!.circularity {
+                best = (size, sumGX, sumGY, circularity)
             }
         }
         guard let match = best else { return nil }
@@ -1440,6 +1528,7 @@ final class CameraManager: NSObject, ObservableObject {
                     DebugFileLogger.log("wiper-marker-calibrate: torch-off lockForConfiguration failed (\(error))")
                 }
                 self.wiperMarkerCalibrationTorchEngaged = false
+                DispatchQueue.main.async { self.isTorchOn = false }
             }
             if self.wiperMarkerCalibrationRestoreStabilization {
                 self.applyStabilizationMode(enabled: true)
@@ -1577,18 +1666,51 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// Sets the low-light exposure boost to an explicit state (voice commands "low
     /// light on"/"off"). Suspends auto-detection until `enableAutoLowLight()` is
-    /// called again, so the two don't immediately fight.
+    /// called again, so the two don't immediately fight. Also leaves normal-AE
+    /// testing mode (see `setNormalAE`) if it was active -- these are mutually
+    /// exclusive states in the same tap-to-cycle control.
     func setLowLightBoost(_ enabled: Bool) {
         isAutoLowLightEnabled = false
         currentAutoLowLightEnabled = false
+        if isNormalAEEnabled { setNormalAE(false) }
         applyLowLightState(enabled)
     }
 
     /// Hands control back to the auto-detector (voice: "low light auto"). The next
     /// captured frame will re-evaluate the scene (see `sampleAutoLowLightIfDue`).
+    /// Also leaves normal-AE testing mode if it was active -- see `setLowLightBoost`.
     func enableAutoLowLight() {
         isAutoLowLightEnabled = true
         currentAutoLowLightEnabled = true
+        if isNormalAEEnabled { setNormalAE(false) }
+    }
+
+    /// Bypasses this app's own exposure tuning entirely -- both the
+    /// low-light bias (forced to 0, same as low-light "off") AND
+    /// `restrictMaxExposureDuration`'s 1/60s shutter cap, which "off" alone
+    /// never touched (see `isNormalAEEnabled`'s doc comment). Added by
+    /// request 2026-08-22 to let a real night drive be measured against
+    /// stock iPhone AE, isolating whether this app's own exposure tuning
+    /// (not just the low-light boost) is contributing to poor night
+    /// detection recall. Suspends auto-low-light the same way
+    /// `setLowLightBoost` does -- auto re-engaging the bias while this mode
+    /// is active would defeat the point.
+    func setNormalAE(_ enabled: Bool) {
+        isAutoLowLightEnabled = false
+        currentAutoLowLightEnabled = false
+        isNormalAEEnabled = enabled
+        currentNormalAEEnabled = enabled
+        isLowLightBoostEnabled = false
+        currentLowLightEnabled = false
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            self.applyExposureBias(enabled: false)
+            if enabled {
+                self.restoreNativeMaxExposureDuration(for: device)
+            } else {
+                self.restrictMaxExposureDuration(for: device)
+            }
+        }
     }
 
     /// Sets `.standard` video stabilization on/off (voice: "stabilization on"/"off").
@@ -1698,6 +1820,23 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    /// Undoes `restrictMaxExposureDuration`'s cap -- restores the device's
+    /// own native max exposure duration, letting AE reach for a slower
+    /// shutter at night the same way stock Camera would. Added alongside
+    /// `setNormalAE` (see that function's doc comment) -- this is the piece
+    /// low-light "off" alone never touched, since the cap above is applied
+    /// unconditionally in `configure()`, independent of the low-light
+    /// boost toggle.
+    private nonisolated func restoreNativeMaxExposureDuration(for device: AVCaptureDevice) {
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.activeMaxExposureDuration = device.activeFormat.maxExposureDuration
+        } catch {
+            DebugFileLogger.log("normal-ae: restoreNativeMaxExposureDuration lockForConfiguration failed (\(error))")
+        }
+    }
+
     /// Locks capture to a fixed frame rate -- 15fps by default (half the
     /// ISP/encode work of the device's own default 30fps, on top of the 4x
     /// cut from dropping to 1080p, see `configure`), or 30fps when
@@ -1770,7 +1909,24 @@ final class CameraManager: NSObject, ObservableObject {
     /// Rough average brightness (0-255) of a BGRA buffer, subsampled for speed —
     /// this only needs to be a consistent relative signal for thresholding, not a
     /// precise photometric measurement.
-    private nonisolated func averageLuminance(of pixelBuffer: CVPixelBuffer) -> Double? {
+    ///
+    /// `roi` restricts the sample to a fractional (x, y) sub-window of the
+    /// frame, instead of the whole thing -- added 2026-08-21 for the
+    /// wiper-marker torch check (see that call site's doc comment): a
+    /// real night session showed the WHOLE-FRAME average reading brighter
+    /// (74-76) than the actual wiper-marker search window in the SAME
+    /// frame (57.1, confirmed via offline analysis of
+    /// `wipercal-20260821-205111.mov`) -- background light (a lit
+    /// building the car happened to be parked facing) can pull the
+    /// whole-frame average up while the shadowed dash area that actually
+    /// needs to be readable for detection stays meaningfully darker. Other
+    /// callers (general driving auto-low-light) still want the whole
+    /// frame, so this defaults to nil (unchanged behavior) rather than
+    /// forcing every call site to specify one.
+    private nonisolated func averageLuminance(
+        of pixelBuffer: CVPixelBuffer,
+        roi: (x: ClosedRange<Double>, y: ClosedRange<Double>)? = nil
+    ) -> Double? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
@@ -1780,14 +1936,17 @@ final class CameraManager: NSObject, ObservableObject {
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let buffer      = base.assumingMemoryBound(to: UInt8.self)
 
-        let stride: Int = 8
+        let xRange = roi.map { Int($0.x.lowerBound * Double(width))..<Int($0.x.upperBound * Double(width)) } ?? 0..<width
+        let yRange = roi.map { Int($0.y.lowerBound * Double(height))..<Int($0.y.upperBound * Double(height)) } ?? 0..<height
+
+        let stride: Int = roi == nil ? 8 : 4
         var total = 0
         var count = 0
-        var y = 0
-        while y < height {
+        var y = yRange.lowerBound
+        while y < yRange.upperBound {
             let rowStart = y * bytesPerRow
-            var x = 0
-            while x < width {
+            var x = xRange.lowerBound
+            while x < xRange.upperBound {
                 // BGRA byte order in memory (premultipliedFirst + byteOrder32Little) —
                 // matches the pixel format requested for the video output.
                 let offset = rowStart + x * 4
@@ -1910,7 +2069,15 @@ final class CameraManager: NSObject, ObservableObject {
         if settleFocus {
             lockKnownGoodFarFocus(device: device)
         }
-        restrictMaxExposureDuration(for: device)
+        // Preserves normal-AE testing mode (see `setNormalAE`) across a
+        // mid-session reconfigure (e.g. `setFourKEnabled`'s teardown+
+        // configure) -- without this check, toggling 4K while normal-AE is
+        // active would silently reinstate the 1/60s cap.
+        if currentNormalAEEnabled {
+            restoreNativeMaxExposureDuration(for: device)
+        } else {
+            restrictMaxExposureDuration(for: device)
+        }
         restrictFrameRate(for: device, to: currentThirtyFpsEnabled ? 30 : 15)
 
         // Apply a persisted (non-auto) low-light boost to the newly configured

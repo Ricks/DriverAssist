@@ -8,17 +8,21 @@
 import SwiftUI
 import UIKit
 
-/// The three states toggleLowLight() cycles through -- named here so a
+/// The four states toggleLowLight() cycles through -- named here so a
 /// pending confirmation (see ContentView.pendingLowLightTarget) can name its
 /// target without re-deriving it from CameraManager's raw booleans.
+/// `normalAE` added 2026-08-22 -- see `CameraManager.setNormalAE`'s doc
+/// comment: unlike `off` (bias=0, but still capped to a 1/60s max shutter),
+/// this also bypasses that cap, for testing against genuinely stock iPhone AE.
 private enum LowLightTarget {
-    case auto, on, off
+    case auto, on, off, normalAE
 
     var label: String {
         switch self {
         case .auto: return "auto"
         case .on: return "on"
         case .off: return "off"
+        case .normalAE: return "normal AE"
         }
     }
 }
@@ -861,14 +865,18 @@ struct InferenceView: View {
             flashToast("LOCKED")
             return
         }
-        // Cycles auto -> on -> off -> auto -- all three states, since voice
-        // commands (the only other way to reach "auto") are currently off.
+        // Cycles auto -> on -> off -> normal AE -> auto -- all four states,
+        // since voice commands (the only other way to reach "auto") are
+        // currently off. normal AE added 2026-08-22, see LowLightTarget's
+        // doc comment.
         if cameraManager.isAutoLowLightEnabled {
             pendingLowLightTarget = .on
         } else if cameraManager.isLowLightBoostEnabled {
             pendingLowLightTarget = .off
-        } else {
+        } else if cameraManager.isNormalAEEnabled {
             pendingLowLightTarget = .auto
+        } else {
+            pendingLowLightTarget = .normalAE
         }
         DebugFileLogger.log("tap: MATCHED lowLightConfirmationPrompt(\(pendingLowLightTarget.label))")
         showLowLightConfirmation = true
@@ -885,6 +893,9 @@ struct InferenceView: View {
         case .auto:
             DebugFileLogger.log("tap: MATCHED enableAutoLowLight")
             cameraManager.enableAutoLowLight()
+        case .normalAE:
+            DebugFileLogger.log("tap: MATCHED setNormalAE(true)")
+            cameraManager.setNormalAE(true)
         }
     }
 
@@ -1123,6 +1134,7 @@ struct InferenceView: View {
                     pixelBuffer: pixelBuffer,
                     lowLightEnabled: cameraManager?.isLowLightBoostEnabled ?? false,
                     autoLowLightEnabled: cameraManager?.isAutoLowLightEnabled ?? true,
+                    normalAEEnabled: cameraManager?.isNormalAEEnabled ?? false,
                     stabilizationEnabled: cameraManager?.isStabilizationEnabled ?? false,
                     parametersLocked: isLocked.wrappedValue,
                     yawReferenceNormalizedX: cameraManager?.yawReferenceNormalizedX ?? CameraManager.defaultYawMarkerNormalizedX
@@ -1606,6 +1618,7 @@ struct InferenceView: View {
                         }
                         Spacer()
                         HStack(spacing: 20) {
+                            TorchButton(cameraManager: cameraManager, disabled: isFocusing)
                             Button(action: onManualFocus) {
                                 Text("Manual Focus")
                                     .font(.system(size: 16, weight: .semibold))
@@ -1706,27 +1719,71 @@ struct InferenceView: View {
         isMountRollOK && isMountPitchOK
     }
 
-    /// The yaw screen's crop rectangle, in normalized VIDEO-space fractions
-    /// (same space as CameraManager's detector output and
-    /// defaultYawMarkerNormalizedX/Y) -- NOT screen-space; YawRectangle
-    /// converts to screen coordinates itself via YawOverlayGeometry, same
-    /// as everything else here.
-    ///
-    /// Derived from the exact same "scale about anchor" transform
-    /// `.scaleEffect` applies to the live preview: at zoom S anchored at
-    /// normalized point a, a point originally at normX ends up (post-zoom)
-    /// at a + (normX-a)*S. Solving for which normX values land in the
-    /// visible range after that gives [a+(visibleMin-a)/S,
-    /// a+(visibleMax-a)/S] -- a window whose width is (visibleMax-
-    /// visibleMin)/S, using the TRUE pre-zoom visible range for this axis
-    /// (`YawOverlayGeometry.visibleXRange/YRange`, see its doc comment for
-    /// why that's usually NOT [0,1] -- CONFIRMED 2026-08-20: it was
-    /// wrongly assumed to be [0,1] for both axes here originally, ~18%
-    /// too generous vertically as a result). `geoSize` should be the live
-    /// preview's actual on-screen size -- callers with their own
-    /// GeometryReader should pass `geo.size` directly; `pollYawNudgeStatus`
-    /// (outside any view body) passes the captured `previewSize` instead.
+    /// A window centered on the expected marker position
+    /// (defaultYawMarkerNormalizedX/Y), in normalized VIDEO-space fractions
+    /// -- NOT screen-space; YawRectangle converts to screen coordinates
+    /// itself via YawOverlayGeometry, same as everything else here. Used
+    /// both to draw the level screen's preview box AND as the nudge-check
+    /// pass/fail bounds (`isWithinYawRectangle`) -- deliberately NOT a
+    /// literal preview of the real anchored `.scaleEffect` zoom's crop
+    /// (see this function's own doc comment on the 2026-08-21 fix for why
+    /// that formula put the marker off-center even at a correctly aligned
+    /// mount); this is a simple symmetric tolerance band instead. Sized
+    /// from the same visible-range/zoom-scale relationship as before (so it
+    /// still reflects the actual zoom level), just centered rather than
+    /// skewed. `geoSize` should be the live preview's actual on-screen
+    /// size -- callers with their own GeometryReader should pass
+    /// `geo.size` directly; `pollYawNudgeStatus` (outside any view body)
+    /// passes the captured `previewSize` instead.
+    // CONFIRMED gap 2026-08-21: the anchor-about-zoom formula this replaced
+    // (`a + (visible.bound - a) / scale`) is a faithful preview of what the
+    // real anchored `.scaleEffect` zoom shows, but that's exactly the
+    // problem for a "does the mount look right" indicator -- the anchor `a`
+    // sits well below the frame's own vertical midpoint (~0.73 vs ~0.5),
+    // and an anchored zoom keeps `a` fixed at its OWN (off-center) screen
+    // position rather than recentering around it. So the old rectangle put
+    // the marker at ~83% down the box even at perfect mount alignment, not
+    // centered -- CONFIRMED via a real device report ("mark is still too
+    // low in the rectangle when pitch is correctly aligned"). Redefined
+    // here as a plain window of the SAME footprint (still sized from the
+    // visible-range/zoom-scale relationship, so it still reflects the
+    // actual zoom LEVEL), just centered on `a` directly instead of skewed
+    // by the visible-range midpoint -- at correct mount alignment the
+    // marker now lands dead center, which is what this box exists to show
+    // the user. Deliberately does NOT touch `wiperMarkerZoomAnchor`/the
+    // real confirmation screen's zoom -- that's a separate, intentional
+    // "keep content visually stable, don't recenter under the user's
+    // finger" design (see wiperMarkerZoomScale's doc comment), unrelated to
+    // this box's job as a simple pass/fail visual gut-check.
     private static func yawRectangleNormalizedXRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+        let visible = YawOverlayGeometry.visibleXRange(in: geoSize)
+        let halfWidth = (visible.upperBound - visible.lowerBound) / (2 * wiperMarkerZoomScale)
+        let a = CameraManager.defaultYawMarkerNormalizedX
+        return (a - halfWidth)...(a + halfWidth)
+    }
+
+    private static func yawRectangleNormalizedYRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+        let visible = YawOverlayGeometry.visibleYRange(in: geoSize)
+        let halfHeight = (visible.upperBound - visible.lowerBound) / (2 * wiperMarkerZoomScale)
+        let a = CameraManager.defaultWiperMarkerNormalizedY
+        return (a - halfHeight)...(a + halfHeight)
+    }
+
+    /// What the real anchored `.scaleEffect` zoom will ACTUALLY show,
+    /// unlike `yawRectangleNormalizedXRange`/`YRange` above (which is
+    /// deliberately a centered, non-literal preview box -- see that
+    /// function's own doc comment). This is the same "a + (visible.bound -
+    /// a) / scale" formula that used to back the rectangle before the
+    /// 2026-08-21 recentering fix -- still exactly correct for its
+    /// original purpose, just not for a visual gut-check anymore. Used by
+    /// `enterYawScreen` to clamp the crosshair's starting position into
+    /// whatever will genuinely be on screen, since a bad auto-detect (or a
+    /// stale persisted value from before a mount/default change) can land
+    /// far enough from the zoom anchor that, magnified `wiperMarkerZoomScale`x,
+    /// it lands off-screen entirely -- CONFIRMED via a real device report
+    /// ("the circle was offscreen") after a spurious detection landed ~0.07
+    /// normalized units from the anchor.
+    private static func postZoomVisibleXRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
         let visible = YawOverlayGeometry.visibleXRange(in: geoSize)
         let a = CameraManager.defaultYawMarkerNormalizedX
         let left = a + (visible.lowerBound - a) / wiperMarkerZoomScale
@@ -1734,12 +1791,31 @@ struct InferenceView: View {
         return left...right
     }
 
-    private static func yawRectangleNormalizedYRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
+    private static func postZoomVisibleYRange(in geoSize: CGSize) -> ClosedRange<CGFloat> {
         let visible = YawOverlayGeometry.visibleYRange(in: geoSize)
         let a = CameraManager.defaultWiperMarkerNormalizedY
         let top = a + (visible.lowerBound - a) / wiperMarkerZoomScale
         let bottom = a + (visible.upperBound - a) / wiperMarkerZoomScale
         return top...bottom
+    }
+
+    /// Clamps a normalized (x,y) into `postZoomVisibleXRange/YRange`, inset
+    /// by `margin` (as a fraction of that range's own width/height) so a
+    /// clamped point lands comfortably inside the visible area instead of
+    /// exactly on its edge, where the crosshair circle itself (drawn at a
+    /// real on-screen size) could still clip. Used only as a safety net for
+    /// the crosshair's STARTING position -- never applied to a live drag,
+    /// which should let the user place it whatever the zoom shows.
+    private static func clampToVisibleAfterZoom(x: CGFloat, y: CGFloat, geoSize: CGSize, margin: CGFloat = 0.15) -> (x: CGFloat, y: CGFloat) {
+        func inset(_ range: ClosedRange<CGFloat>) -> ClosedRange<CGFloat> {
+            let pad = (range.upperBound - range.lowerBound) * margin
+            let lower = range.lowerBound + pad
+            let upper = range.upperBound - pad
+            return lower <= upper ? lower...upper : range
+        }
+        let xRange = inset(postZoomVisibleXRange(in: geoSize))
+        let yRange = inset(postZoomVisibleYRange(in: geoSize))
+        return (min(max(x, xRange.lowerBound), xRange.upperBound), min(max(y, yRange.lowerBound), yRange.upperBound))
     }
 
     private static func isWithinYawRectangle(x: CGFloat, y: CGFloat, geoSize: CGSize) -> Bool {
@@ -1833,6 +1909,24 @@ struct InferenceView: View {
                 DebugFileLogger.log("wiper-marker: FAILED no confident marker found")
             }
             Task { @MainActor in
+                // CONFIRMED gap 2026-08-21: a bad auto-detect (or a stale
+                // persisted value from before a mount/default change) can
+                // land far enough from the zoom anchor that the crosshair
+                // starts off-screen entirely -- real device report ("the
+                // circle was offscreen"). Clamps into whatever will
+                // genuinely be visible after the real zoom -- see
+                // `clampToVisibleAfterZoom`'s doc comment. Runs regardless
+                // of whether THIS detection succeeded, since a stale
+                // fallback value can be just as far off.
+                let clamped = Self.clampToVisibleAfterZoom(
+                    x: cameraManager.yawReferenceNormalizedX,
+                    y: cameraManager.yawReferenceNormalizedY,
+                    geoSize: previewSize
+                )
+                if clamped.x != cameraManager.yawReferenceNormalizedX || clamped.y != cameraManager.yawReferenceNormalizedY {
+                    DebugFileLogger.log("wiper-marker: clamped off-screen start (\(cameraManager.yawReferenceNormalizedX),\(cameraManager.yawReferenceNormalizedY)) -> (\(clamped.x),\(clamped.y))")
+                    cameraManager.setYawReferenceNormalized(x: clamped.x, y: clamped.y)
+                }
                 withAnimation { isWiperMarkerFocusing = false }
             }
         }
@@ -2134,9 +2228,12 @@ struct InferenceView: View {
                     Button("Cancel", role: .cancel) {}
                 }
                 Spacer()
-                manualFocusButton
-                    .padding(.trailing, 12)
-                    .padding(.bottom, 12)
+                HStack(spacing: 12) {
+                    TorchButton(cameraManager: cameraManager)
+                    manualFocusButton
+                }
+                .padding(.trailing, 12)
+                .padding(.bottom, 12)
             }
         }
         .ignoresSafeArea()
@@ -2155,6 +2252,36 @@ struct InferenceView: View {
                 .padding(.horizontal, 16)
                 .background(Color.white.opacity(0.15), in: Capsule())
                 .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
+        }
+    }
+
+    /// Manual torch toggle, reachable from both calibration screens --
+    /// added by request 2026-08-21, alongside the automatic luminance-
+    /// based decision in `CameraManager.beginYawCalibrationSession` (which
+    /// has already shown real cases of guessing wrong -- see that
+    /// function's own doc comment). Icon-only circular button, same visual
+    /// weight as `manualFocusButton`'s capsule but round (matching this
+    /// button's own icon-first nature, not a wordier label). Uses the same
+    /// `flashlight.on.fill`/`flashlight.off.fill` SF Symbols pair Apple's
+    /// own Control Center/Camera app flashlight toggle uses, so it reads
+    /// as a familiar system control rather than an app-specific one; lit
+    /// yellow when on, matching this app's existing accent color for an
+    /// active state (see the OK button, YawBand's verified/in-band green
+    /// aside).
+    private struct TorchButton: View {
+        @ObservedObject var cameraManager: CameraManager
+        var disabled: Bool = false
+
+        var body: some View {
+            Button(action: { cameraManager.toggleTorch() }) {
+                Image(systemName: cameraManager.isTorchOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(cameraManager.isTorchOn ? Color.yellow : Color.white.opacity(disabled ? 0.4 : 1.0))
+                    .frame(width: 44, height: 44)
+                    .background(Color.white.opacity(0.15), in: Circle())
+                    .overlay(Circle().stroke(Color.white.opacity(0.5), lineWidth: 1.5))
+            }
+            .disabled(disabled)
         }
     }
 
@@ -2909,6 +3036,7 @@ struct InferenceView: View {
     }
 
     private var lowLightLabel: String {
+        if cameraManager.isNormalAEEnabled { return "low-light: normal AE" }
         let state = cameraManager.isLowLightBoostEnabled ? "on" : "off"
         return cameraManager.isAutoLowLightEnabled ? "low-light: auto (\(state))" : "low-light: \(state)"
     }

@@ -317,6 +317,7 @@ final class InferenceEngine: ObservableObject {
         pixelBuffer: CVPixelBuffer,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
+        normalAEEnabled: Bool,
         stabilizationEnabled: Bool,
         parametersLocked: Bool,
         yawReferenceNormalizedX: CGFloat
@@ -381,6 +382,7 @@ final class InferenceEngine: ObservableObject {
                         twoPass: twoPass,
                         lowLightEnabled: lowLightEnabled,
                         autoLowLightEnabled: autoLowLightEnabled,
+                        normalAEEnabled: normalAEEnabled,
                         stabilizationEnabled: stabilizationEnabled,
                         parametersLocked: parametersLocked,
                         yawReferenceNormalizedX: yawReferenceNormalizedX
@@ -418,6 +420,7 @@ final class InferenceEngine: ObservableObject {
         twoPass: Bool,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
+        normalAEEnabled: Bool,
         stabilizationEnabled: Bool,
         parametersLocked: Bool,
         yawReferenceNormalizedX: CGFloat
@@ -459,6 +462,7 @@ final class InferenceEngine: ObservableObject {
             elapsedMs: elapsedMs,
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
+            normalAEEnabled: normalAEEnabled,
             stabilizationEnabled: stabilizationEnabled,
             parametersLocked: parametersLocked,
             trackingLevel: trackingManager.trackingLevel.rawValue,
@@ -476,6 +480,10 @@ final class InferenceEngine: ObservableObject {
             rotationRateZDegreesPerSecond: pitchSensor.rotationRateZDegreesPerSecond,
             yawRateDegreesPerSecond: pitchSensor.yawRateDegreesPerSecond,
             smoothedYawRateDegreesPerSecond: pitchSensor.smoothedYawRateDegreesPerSecond,
+            pitchRateDegreesPerSecond: pitchSensor.pitchRateDegreesPerSecond,
+            rollRateDegreesPerSecond: pitchSensor.rollRateDegreesPerSecond,
+            smoothedPitchRateDegreesPerSecond: pitchSensor.smoothedPitchRateDegreesPerSecond,
+            smoothedRollRateDegreesPerSecond: pitchSensor.smoothedRollRateDegreesPerSecond,
             rollDegrees: pitchSensor.rollDegrees,
             rollDriftDegrees: pitchSensor.rollDriftDegrees,
             referenceRollDegrees: pitchSensor.referenceRollDegrees,

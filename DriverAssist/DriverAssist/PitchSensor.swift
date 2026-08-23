@@ -149,6 +149,37 @@ final class PitchSensor: ObservableObject {
     @Published private(set) var smoothedYawRateDegreesPerSecond: Double?
     private static let yawRateSmoothingAlpha: Double = 0.2
 
+    /// Pitch/roll rate (deg/s), finite-differenced from consecutive
+    /// `pitchDegrees`/`rollDegrees` readings over the actual elapsed time
+    /// between CoreMotion callbacks (`motion.timestamp`, not the nominal
+    /// 1/15s update interval -- real callback spacing jitters a bit and
+    /// dividing by the wrong dt would bias the rate). Deliberately NOT
+    /// projected through `rotationRate`/the attitude matrix the way yaw rate
+    /// is: yaw needs that projection because "vertical" is the only axis
+    /// that's fixed in world coordinates regardless of vehicle heading, but
+    /// pitch/roll are gravity-relative by construction already (see
+    /// pitchDegrees/rollDegrees's own derivations, both pure functions of
+    /// the gravity vector) -- differentiating them directly is exact, not
+    /// an approximation, and heading-independent for the same reason those
+    /// two properties already are. nil for the very first sample (no prior
+    /// reading to difference against) and any sample where dt <= 0.
+    @Published private(set) var pitchRateDegreesPerSecond: Double?
+    @Published private(set) var rollRateDegreesPerSecond: Double?
+
+    /// EMA-smoothed versions of the two rates above, same role
+    /// `smoothedYawRateDegreesPerSecond` plays for yaw (a differentiated
+    /// gravity-derived angle is noisier per-sample than a direct gyro
+    /// reading, so any per-frame consumer should read these, not the raw
+    /// values) -- reuses `yawRateSmoothingAlpha` since the underlying
+    /// derivation (dt=1/15s, tau=0.3s) is axis-agnostic. Not yet validated
+    /// against a real drive's pitch/roll excursions the way yaw's alpha was.
+    @Published private(set) var smoothedPitchRateDegreesPerSecond: Double?
+    @Published private(set) var smoothedRollRateDegreesPerSecond: Double?
+
+    private var previousPitchDegrees: Double?
+    private var previousRollDegrees: Double?
+    private var previousMotionTimestamp: TimeInterval?
+
     /// Rotation about the camera's own forward (boresight) axis -- how
     /// tilted the video frame's horizon is, i.e. "degrees from level" for
     /// the mount. Deliberately NOT `CMAttitude.roll`: that Euler angle
@@ -266,7 +297,8 @@ final class PitchSensor: ObservableObject {
             // already expected nose-down-positive, this formula just wasn't
             // delivering that.
             let gx = motion.gravity.x, gy = motion.gravity.y, gz = motion.gravity.z
-            self?.pitchDegrees = -atan2(gz, (gx * gx + gy * gy).squareRoot()) * 180 / .pi
+            let pitchValue = -atan2(gz, (gx * gx + gy * gy).squareRoot()) * 180 / .pi
+            self?.pitchDegrees = pitchValue
             // Rotating about the boresight (device Z) axis exchanges gravity
             // between X and Y while leaving Z untouched, so atan2(y, -x)
             // isolates exactly that rotation -- and, per the small-angle
@@ -276,7 +308,29 @@ final class PitchSensor: ObservableObject {
             // gravityX ~= -1, which this needs to map to 0 degrees. Sign
             // not yet bench-confirmed -- same discipline as gravityX's own
             // mount-orientation check.
-            self?.rollDegrees = atan2(gy, -gx) * 180 / .pi
+            let rollValue = atan2(gy, -gx) * 180 / .pi
+            self?.rollDegrees = rollValue
+
+            if let self, let prevPitch = self.previousPitchDegrees, let prevRoll = self.previousRollDegrees,
+               let prevTimestamp = self.previousMotionTimestamp {
+                let dt = motion.timestamp - prevTimestamp
+                if dt > 0 {
+                    let rawPitchRate = (pitchValue - prevPitch) / dt
+                    let rawRollRate = (rollValue - prevRoll) / dt
+                    self.pitchRateDegreesPerSecond = rawPitchRate
+                    self.rollRateDegreesPerSecond = rawRollRate
+                    self.smoothedPitchRateDegreesPerSecond = self.smoothedPitchRateDegreesPerSecond.map {
+                        Self.yawRateSmoothingAlpha * rawPitchRate + (1 - Self.yawRateSmoothingAlpha) * $0
+                    } ?? rawPitchRate
+                    self.smoothedRollRateDegreesPerSecond = self.smoothedRollRateDegreesPerSecond.map {
+                        Self.yawRateSmoothingAlpha * rawRollRate + (1 - Self.yawRateSmoothingAlpha) * $0
+                    } ?? rawRollRate
+                }
+            }
+            self?.previousPitchDegrees = pitchValue
+            self?.previousRollDegrees = rollValue
+            self?.previousMotionTimestamp = motion.timestamp
+
             self?.rotationRateXDegreesPerSecond = motion.rotationRate.x * 180 / .pi
             self?.rotationRateYDegreesPerSecond = motion.rotationRate.y * 180 / .pi
             self?.rotationRateZDegreesPerSecond = motion.rotationRate.z * 180 / .pi

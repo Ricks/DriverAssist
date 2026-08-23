@@ -118,6 +118,16 @@ final class WidthDistanceOverrideManager {
     /// candidate this far out is never something the override should be
     /// deciding between, regardless of which formula produced it.
     private static let maxPlausibleDistanceMeters: Double = 150
+    /// How close to the LEFT/RIGHT frame edge (normalized [0,1] fraction)
+    /// a box may sit before it's treated as edge-truncated and rejected --
+    /// see the CONFIRMED comment in `evaluateGate`. Not an exact 0.0/1.0
+    /// equality check since a genuinely fully-in-frame box can still land
+    /// a hair off either boundary from ordinary detector noise/rounding;
+    /// a real truncated box in the confirming data sat pinned at exactly
+    /// 0.000 or 1.000 (x+w), so this margin is deliberately tight -- a
+    /// reasoned starting point, not yet validated against a wider set of
+    /// edge-crossing real detections.
+    private static let edgeTruncationMarginNormalized: Double = 0.01
     private let confirmFrames: Int
     private let graceFrames: Int
 
@@ -231,6 +241,30 @@ final class WidthDistanceOverrideManager {
             aspectRatio: aspectRatio
         ) else { return false }
         detection.widthDistanceMeters = widthDistance
+
+        // CONFIRMED 2026-08-22 (real drive, data/26_08_21_Day_Small, ~2:03):
+        // a box truncated by the LEFT or RIGHT frame edge (a parked car the
+        // vehicle is passing, partially cropped out of frame) has an
+        // apparent width narrower than the real object's, for a reason that
+        // has nothing to do with distance -- part of it is simply off-
+        // screen. widthBasedDistanceMeters has no way to tell that apart
+        // from a genuinely narrow/far object, so it reads a rapidly
+        // inflating distance as the crop worsens: two real, stationary
+        // parked cars in this session showed distanceMeters balloon from
+        // 6.2m to 20.9m and 4.6m to 6.2m in under a second, purely from
+        // edge cropping, not real motion -- surfaced by a downstream optic-
+        // flow visualization whose arrows depend on distance accuracy, but
+        // this is a real distance-estimation bug independent of that tool.
+        // This is the LEFT/RIGHT counterpart to the file's existing hood-
+        // truncation handling (bottom edge, near-field) -- that one is
+        // about the box bottom being pinned to the ego hood instead of the
+        // object's real ground contact; this one is about the box's own
+        // width being an underestimate of the real object's width. widthDistanceMeters
+        // stays attached/logged either way (same "log everything" discipline
+        // as the rest of this file) -- only the trigger below is gated.
+        let isEdgeTruncated = Double(detection.boundingBox.minX) <= Self.edgeTruncationMarginNormalized
+            || Double(detection.boundingBox.maxX) >= 1.0 - Self.edgeTruncationMarginNormalized
+        guard !isEdgeTruncated else { return false }
 
         // CONFIRMED 2026-08-16 (real test drive): the trigger below is a pure
         // RATIO comparison (is width closer than row) -- it has no absolute

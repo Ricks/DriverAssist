@@ -22,12 +22,15 @@ See driverassist_sync.py for how frame-to-timestamp sync and log matching
 actually work.
 """
 import argparse
+import bisect
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Optional
 
 import cv2
+import numpy as np
 
 from driverassist_sync import (
     DEFAULT_LOGS_DIR,
@@ -155,6 +158,641 @@ def draw_tint(frame, det: dict, color_bgr, label: str, label_below: bool = False
     draw_label_text(frame, label, x + 4, label_y, thickness=2)
 
 
+# Calibrated intrinsics + the ego-motion flow model itself now live in
+# flow_model.py (extracted 2026-08-22 so tracker.py can share it too, as a
+# matching-time position-prediction gate) -- aliased back to their original
+# FLOW_*-prefixed names here so nothing else in this file needs to change.
+from flow_model import (  # noqa: E402
+    FOCAL_LENGTH_ROW_NORMALIZED as FLOW_FOCAL_LENGTH_ROW_NORMALIZED,
+    PRINCIPAL_ROW_NORMALIZED as FLOW_PRINCIPAL_ROW_NORMALIZED,
+    PRINCIPAL_COLUMN_NORMALIZED as FLOW_PRINCIPAL_COLUMN_NORMALIZED,
+    LEVER_ARM_FORWARD_M as FLOW_LEVER_ARM_FORWARD_M,
+    LEVER_ARM_LEFT_M as FLOW_LEVER_ARM_LEFT_M,
+    camera_velocity_from_yaw,
+    angular_coords,
+    predicted_flow_angular_raw,
+)
+
+FLOW_ARROW_COLOR_BGR = (255, 255, 0)  # cyan -- predicted ego-motion flow, this frame
+PREVIOUS_FLOW_ARROW_COLOR_BGR = (0, 255, 0)  # green -- predicted ego-motion flow, previous frame
+OBSERVED_RATE_ARROW_COLOR_BGR = (255, 0, 0)  # blue -- raw observed base-center displacement rate, unadjusted
+MOTION_ARROW_COLOR_BGR = (255, 0, 255)  # magenta -- the object's own independent motion (flow subtracted out)
+FLOW_ARROW_THICKNESS = 2
+# Fixed pixel size, not proportional to the arrow's own length (cv2
+# .arrowedLine's own tipLength is a fraction of the shaft, so a short arrow
+# got a tiny head and a long one an oversized one) -- keeps every
+# arrowhead the same visual weight regardless of flow magnitude.
+FLOW_ARROWHEAD_LENGTH_PX = 16
+FLOW_ARROWHEAD_ANGLE_DEG = 32
+
+
+PIXEL_SHIFT_BITS = 4
+"""cv2.line/cv2.fillConvexPoly's own sub-pixel drawing mechanism: pass
+coordinates pre-multiplied by 2**PIXEL_SHIFT_BITS (rounded to the nearest
+integer) alongside shift=PIXEL_SHIFT_BITS, and OpenCV anti-aliases each
+shape at its true fractional-pixel position instead of snapping every
+point to the pixel grid first. Added 2026-08-22, real request -- coordinate
+rounding was previously done in float space (int(...) or int(round(...)))
+BEFORE handing off to cv2.line/fillConvexPoly, discarding sub-pixel
+precision that mattered for exactly the kind of small, precise vectors
+this file draws (see draw_arrow's/the *_arrow draw functions' own
+CONFIRMED-exact vector-algebra identities elsewhere in this file -- that
+algebra is exact in the underlying floats; drawing should not reintroduce
+error the math doesn't have). 4 bits (1/16 pixel) is far finer than a
+display can resolve or antialiasing can meaningfully use, so this is not a
+tuning parameter in practice."""
+_PIXEL_SHIFT_SCALE = 1 << PIXEL_SHIFT_BITS
+
+
+def _shifted_point(pt: tuple) -> tuple:
+    """A float (x, y) point converted to PIXEL_SHIFT_BITS fixed-point
+    integer coordinates, for cv2 drawing calls' own shift= parameter."""
+    return int(round(pt[0] * _PIXEL_SHIFT_SCALE)), int(round(pt[1] * _PIXEL_SHIFT_SCALE))
+
+
+def draw_arrow(frame, start: tuple, end: tuple, color, thickness: int) -> None:
+    """Plain shaft (cv2.line) plus a small SOLID (filled) triangular head --
+    cv2.arrowedLine's own built-in head is an open two-line chevron, not a
+    filled triangle, which is what was actually wanted here (smaller,
+    solid arrowheads -- CONFIRMED 2026-08-22 real request, replacing the
+    original cv2.arrowedLine/tipLength=0.3 version). `start`/`end` are
+    FLOAT pixel coordinates -- kept as floats all the way through this
+    function (including the arrowhead geometry) and only converted to
+    OpenCV's fixed-point sub-pixel representation at the final draw calls
+    (see PIXEL_SHIFT_BITS) -- no coordinate here is ever snapped to a
+    whole pixel before that single, antialiased conversion."""
+    x0, y0 = start
+    x1, y1 = end
+    length = math.hypot(x1 - x0, y1 - y0)
+    if length < 1e-3:
+        return
+    cv2.line(frame, _shifted_point(start), _shifted_point(end), color, thickness, cv2.LINE_AA, PIXEL_SHIFT_BITS)
+    angle = math.atan2(y1 - y0, x1 - x0)
+    head_angle = math.radians(FLOW_ARROWHEAD_ANGLE_DEG)
+    p2 = (
+        x1 - FLOW_ARROWHEAD_LENGTH_PX * math.cos(angle - head_angle),
+        y1 - FLOW_ARROWHEAD_LENGTH_PX * math.sin(angle - head_angle),
+    )
+    p3 = (
+        x1 - FLOW_ARROWHEAD_LENGTH_PX * math.cos(angle + head_angle),
+        y1 - FLOW_ARROWHEAD_LENGTH_PX * math.sin(angle + head_angle),
+    )
+    head_points = np.array([_shifted_point(end), _shifted_point(p2), _shifted_point(p3)], dtype=np.int32)
+    cv2.fillConvexPoly(frame, head_points, color, cv2.LINE_AA, PIXEL_SHIFT_BITS)
+
+
+def camera_velocity_from_yaw(smoothed_yaw_rate_deg_s: float) -> tuple:
+    """Ports DistanceEstimator.LeverArm.cameraVelocityFromYaw (Swift) --
+    the camera's own velocity due to the vehicle's yaw rotation about the
+    rear axle (v = omega x leverArm), in the vehicle's body frame (forward,
+    left), meters/second. Takes the SMOOTHED yaw rate, not raw -- see that
+    Swift function's own doc comment for why (raw is too noisy for a
+    per-frame consumer, confirmed against a real drive)."""
+    omega = math.radians(smoothed_yaw_rate_deg_s)
+    return (-omega * FLOW_LEVER_ARM_LEFT_M, omega * FLOW_LEVER_ARM_FORWARD_M)  # (forward, left)
+
+
+def angular_coords(col_norm: float, row_norm: float, aspect: float) -> tuple:
+    """Converts a normalized [0,1] screen position to this project's
+    calibrated-camera angular coordinate space -- the SAME parameterization
+    DistanceEstimator's own de-roll step uses: x=(col-principalCol)*aspect/f,
+    y=(row-principalRow)/f. A flow/displacement of 1.0 in this space is one
+    focal length of angular motion; multiply by f_col*frame_width (x) or
+    f_row*frame_height (y) to get pixels."""
+    f_row = FLOW_FOCAL_LENGTH_ROW_NORMALIZED
+    x = (col_norm - FLOW_PRINCIPAL_COLUMN_NORMALIZED) * aspect / f_row
+    y = (row_norm - FLOW_PRINCIPAL_ROW_NORMALIZED) / f_row
+    return x, y
+
+
+EDGE_TRUNCATION_MARGIN_NORMALIZED = 0.01
+"""Same margin/rationale as WidthDistanceOverride's Swift-side constant --
+kept in sync deliberately, not derived from it, since this is a separate
+Python tool. Used by corrected_distance_meters's width-vs-row
+trustworthiness decision, and also by predicted_flow_angular's own
+truncation check (see that function's doc comment) -- a box this close to
+either side edge has no reliable lateral-position anchor at all (tried and
+abandoned a corner-anchor scheme for this same reason, see
+base_center_normalized's doc comment), so no flow/motion arrow is computed
+for it rather than trust either its own crop-drifting center or a
+scale-drifting corner."""
+
+
+def base_center_normalized(det: dict) -> tuple:
+    """The center of a detection's BASE (bottom-center of its box), in
+    normalized [0,1] screen fractions -- the ground-contact point
+    distanceMeters is itself computed from (bottomY, centerX), not the
+    box's own 2D centroid, which sits partway up the object's height and
+    isn't at the depth distanceMeters actually describes. Used as the
+    single consistent anchor for both the flow arrows and the motion
+    arrows below -- CONFIRMED 2026-08-22, real request: the flow arrows
+    originally anchored at box center, an inconsistency with distanceMeters'
+    own bottom-anchored assumption, corrected here.
+
+    Plain center, deliberately -- NOT corner-anchored for a truncated box,
+    despite that having seemed like the right fix earlier THIS SAME
+    session (see git history for the full, now-abandoned attempt: anchor
+    at whichever corner isn't touching the frame edge, on the theory that
+    a detector localizes an un-cropped edge correctly even when the
+    opposite edge is clipped). REVERTED 2026-08-22 after a second real
+    case proved that theory wrong in general: car #12's box stayed
+    genuinely left-truncated across several frames while its WIDTH kept
+    growing (0.1127 -> 0.1161 -> 0.1193, more of the car becoming visible,
+    not the car moving) -- and a growing box's far corner drifts outward
+    from the true center purely from that scale change, at TWICE the rate
+    plain center drift does, even for a car that hasn't moved sideways at
+    all. Corner-anchoring isn't a refinement of the center-drift problem
+    it was built to fix, it's a DIFFERENT confound (scale-driven, not
+    crop-driven) that's just as real. Neither anchor is trustworthy for a
+    genuinely truncated box -- see predicted_flow_angular's own truncation
+    check, which now declines to compute a flow/motion arrow at all for
+    such a box, rather than pick between two comparably-unreliable anchor
+    strategies (same "don't fabricate a number with no real basis"
+    discipline as corrected_distance_meters' own doubly-truncated case)."""
+    return det["x"] + det["w"] / 2, det["y"] + det["h"]
+
+
+DISTANCE_CAMERA_HEIGHT_METERS = 1.02
+"""Same value as DistanceEstimator.calibrated.cameraHeightMeters (Swift) --
+measured 2026-08-15 for the current SHAPE clamp mount. Kept in sync
+deliberately, not derived from it."""
+
+
+def row_based_distance_meters(
+    bottom_y: float, center_x: float, aspect: float,
+    reference_pitch_deg: float, reference_roll_deg: float,
+) -> Optional[float]:
+    """Ports DistanceEstimator.distanceMeters's ground-plane (row-based)
+    formula exactly -- ground-contact angle phi = alpha + theta, distance =
+    cameraHeightMeters / tan(phi). Used to RECOVER the pre-override distance
+    for a detection where distanceMetersIsWidthOverridden is true and the
+    box is edge-truncated (see corrected_distance_meters): the on-device
+    pipeline mutates Detection.distanceMeters in place when the width
+    override fires, so the original row-based value isn't itself logged --
+    but every input this formula needs (box geometry, reference pitch/roll)
+    IS logged per-entry, so it's cheaply recomputable offline instead of
+    needing a new recording."""
+    theta = math.radians(reference_pitch_deg)
+    psi = math.radians(reference_roll_deg)
+    focal_col = FLOW_FOCAL_LENGTH_ROW_NORMALIZED / aspect
+    x = (center_x - FLOW_PRINCIPAL_COLUMN_NORMALIZED) / focal_col
+    y = (bottom_y - FLOW_PRINCIPAL_ROW_NORMALIZED) / FLOW_FOCAL_LENGTH_ROW_NORMALIZED
+    derolled_y = -x * math.sin(psi) + y * math.cos(psi)
+    alpha = math.atan(derolled_y)
+    phi = alpha + theta
+    if not (0 < phi < math.pi / 2):
+        return None
+    return DISTANCE_CAMERA_HEIGHT_METERS / math.tan(phi)
+
+
+HOOD_CUTOFF_ANGLE_DEGREES = 9.899
+"""Same value as DistanceEstimator.hoodCutoffAngleDegrees (Swift) -- the
+measured angle below which the ego vehicle's own hood physically blocks the
+camera's view (mean of 107 real samples, std 0.771, see that constant's own
+doc comment). A box whose row-based ground-contact angle phi EXCEEDS this
+cannot be a genuine ground-contact reading -- an object that close would
+have its true bottom hidden behind the hood, so phi cannot geometrically
+exceed this angle for a real detection; a box that computes higher is
+reporting some other row (frame edge, dashboard/HUD artifact) as its
+"bottom," not the object's real extent. Kept in sync deliberately, not
+derived from it. This project has a matching (real, still-unbuilt-until-now)
+gap on the on-device side too -- see the project_ego_hood_rejection_gap
+memory: the angle was measured 2026-08-15 but no rejection gate was ever
+implemented there."""
+
+
+def _row_based_phi_degrees(
+    bottom_y: float, center_x: float, aspect: float,
+    reference_pitch_deg: float, reference_roll_deg: float,
+) -> float:
+    """The ground-contact angle phi alone (see row_based_distance_meters,
+    same formula) -- split out so HOOD_CUTOFF_ANGLE_DEGREES can be checked
+    independent of whatever distance value ultimately gets used."""
+    theta = math.radians(reference_pitch_deg)
+    psi = math.radians(reference_roll_deg)
+    focal_col = FLOW_FOCAL_LENGTH_ROW_NORMALIZED / aspect
+    x = (center_x - FLOW_PRINCIPAL_COLUMN_NORMALIZED) / focal_col
+    y = (bottom_y - FLOW_PRINCIPAL_ROW_NORMALIZED) / FLOW_FOCAL_LENGTH_ROW_NORMALIZED
+    derolled_y = -x * math.sin(psi) + y * math.cos(psi)
+    alpha = math.atan(derolled_y)
+    return math.degrees(alpha + theta)
+
+
+def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional[float]:
+    """distanceMeters, corrected for THREE CONFIRMED corruption cases
+    (2026-08-22, all found via this session's flow-arrow visualization
+    surfacing distance errors as visibly wrong motion):
+
+    1. LEFT/RIGHT edge truncation with the width-based override active
+       (distanceMetersIsWidthOverridden) -- the logged value is the
+       ballooning width-based misread this session first surfaced, not a
+       real distance (apparent width shrinks from cropping, not real
+       distance change). Falls back to a freshly recomputed row-based
+       distance -- the same fallback WidthDistanceOverride's own on-device
+       edge-truncation guard now takes for FUTURE recordings, applied here
+       retroactively to already-logged data.
+
+    2. BOTTOM (hood) truncation -- CONFIRMED via a real box whose row-based
+       phi came out to 19.3 degrees, nearly double
+       HOOD_CUTOFF_ANGLE_DEGREES (9.899), a geometrically impossible
+       ground-contact reading (see that constant's own doc comment). This
+       is INDEPENDENT of distanceMetersIsWidthOverridden -- case 1 above
+       only ever looks at bottom-truncated boxes when the override
+       happened to be active, but this failure corrupts the RAW row-based
+       distanceMeters directly, override or not. Falls back to
+       widthDistanceMeters (doesn't depend on bottomY at all).
+
+    3. BOTH at once (a box truncated on the bottom AND a side, e.g. a
+       corner) -- neither fallback is trustworthy (case 2's own
+       width-based fallback is itself corrupted by the SAME left/right
+       truncation case 1 exists to catch), so this returns None rather
+       than pick between two comparably-unreliable numbers -- "don't
+       fabricate a number with no real basis," same discipline as the rest
+       of this file.
+
+    Any other detection (no truncation, or override active but not
+    edge-truncated -- a legitimate "genuinely closer" reading) passes
+    distanceMeters through unchanged."""
+    left = det["x"]
+    right = det["x"] + det["w"]
+    bottom = det["y"] + det["h"]
+    side_truncated = (
+        left <= EDGE_TRUNCATION_MARGIN_NORMALIZED or right >= 1.0 - EDGE_TRUNCATION_MARGIN_NORMALIZED
+    )
+
+    phi_deg = _row_based_phi_degrees(
+        bottom, det["x"] + det["w"] / 2, aspect,
+        entry.get("referencePitchDegrees", 0.0), entry.get("referenceRollDegrees", 0.0),
+    )
+    if phi_deg > HOOD_CUTOFF_ANGLE_DEGREES:
+        if side_truncated:
+            return None
+        return det.get("widthDistanceMeters")
+
+    if not det.get("distanceMetersIsWidthOverridden"):
+        return det.get("distanceMeters")
+    if not side_truncated:
+        return det.get("distanceMeters")
+    recomputed = row_based_distance_meters(
+        bottom_y=bottom,
+        center_x=det["x"] + det["w"] / 2,
+        aspect=aspect,
+        reference_pitch_deg=entry.get("referencePitchDegrees", 0.0),
+        reference_roll_deg=entry.get("referenceRollDegrees", 0.0),
+    )
+    return recomputed if recomputed is not None else det.get("distanceMeters")
+
+
+def predicted_flow_angular(det: dict, entry: dict, aspect: float, z_override: Optional[float] = None) -> Optional[tuple]:
+    """Predicted per-second optic flow (u, v) in normalized ANGULAR
+    coordinates (see angular_coords) at this detection's own BASE-center
+    screen position and depth, for a point STATIC in the world, due to the
+    camera's OWN ego-motion this frame (translation + rotation) alone --
+    the standard Longuet-Higgins/Prazdny calibrated-camera flow
+    decomposition, evaluated with this project's own signals. This is the
+    flow the object's IMMEDIATE SURROUNDINGS (or the object itself, if it
+    happens to be genuinely stationary) would show; a real moving object's
+    OBSERVED screen motion differs from this by exactly its own independent
+    motion -- see compute_motion_arrow_angular for that subtraction, done
+    in this same angular space (not pixels -- a given angular flow doesn't
+    map to a constant pixel displacement across the frame, see the (1+x^2)
+    terms below, so pixel-space subtraction would be a worse approximation
+    for anything not near the principal point).
+
+    Derivation (camera axes X=right, Y=down, Z=forward -- confirmed
+    right-handed): for a static point at camera-relative (X,Y,Z), with
+    camera translational velocity V=(Vx,Vy,Vz) and angular velocity
+    Omega=(wx,wy,wz) in its own frame, d(X,Y,Z)/dt = -V - Omega x (X,Y,Z).
+    Differentiating the normalized-image-coordinate projection (x,y) =
+    (X/Z, Y/Z) through that and simplifying gives the standard form:
+        u = dx/dt = (-Vx + x*Vz)/Z - wy*(1+x^2) + wz*y + wx*x*y
+        v = dy/dt = (-Vy + y*Vz)/Z + wx*(1+y^2) - wy*x*y - wz*x
+    (x, y) use the exact same normalized angular-coordinate parameterization
+    as DistanceEstimator's own de-roll step: x=(col-principalCol)*aspect/f,
+    y=(row-principalRow)/f -- so a flow of 1.0 in this space corresponds to
+    one focal length of angular motion, converted to pixels at the end via
+    the same f_row/f_col relationship used throughout this project.
+
+    Signal mapping, each cross-checked against an ALREADY-VALIDATED
+    convention in this codebase rather than derived fresh and trusted
+    blindly (this project has a real history of pitch/roll sign bugs, see
+    PitchSensor.swift's own file-level note):
+      - Vz (forward) = egoSpeedMps + the yaw-lever-arm's own forward
+        component (camera_velocity_from_yaw); Vx (right) = -that function's
+        left component; Vy (down) = 0 -- no vertical-camera-velocity signal
+        exists in this project yet (suspension bounce, pitch-rate lever-arm
+        lift), a real but currently-unclosed gap, not an oversight.
+        CONFIRMED 2026-08-22 on real footage: this shows up as a small but
+        consistent systematic bias in compute_motion_arrow_angular's output
+        (~0.01, -0.06 angular units/sec, uniform across every tracked
+        object in a real 10s window -- consistency across objects, not
+        varying per-object like real noise would, is what points to Vy
+        rather than a bug in the subtraction itself). Deliberately left
+        uncorrected for now, by request -- see the
+        project_motion_arrow_vertical_bias memory for the two candidate
+        fixes and why neither was applied yet.
+
+        SEPARATELY, Vz's sign is always treated as forward -- egoSpeedMps
+        (EgoSpeedManager.swift) comes straight from CLLocation.speed,
+        Apple's raw GPS ground-speed MAGNITUDE (guarded >= 0 to reject
+        CoreLocation's own "invalid fix" sentinel, not to enforce
+        direction) -- so there is no signal anywhere in this pipeline that
+        can tell this function forward from reverse. CONFIRMED 2026-08-22
+        on a real parking-space backout: predicted flow pointed away from
+        the FOE (the forward-motion expansion pattern) throughout a slow,
+        smooth REVERSE maneuver, when the true pattern should have been
+        contraction toward it. Not a bug in this formula -- it's doing
+        exactly what a positive Vz implies; the implied direction is
+        simply wrong for that maneuver. Left unfixed, by request -- see
+        the project_egospeed_unsigned_reverse_gap memory for why, and the
+        one real fix path considered (inferring direction from whether the
+        scene's own aggregate flow is expanding or contracting, not a
+        quick patch).
+      - wy (yaw): NEGATED smoothedYawRateDegreesPerSecond. Cross-checked
+        against ByteTracker.yawFallbackTransform's own bench-confirmed
+        ("turning left -> background shifts right in frame") convention:
+        with this mapping, u's yaw term (~-wy near x=0) comes out positive
+        for a positive (turning-left) yaw rate, matching exactly.
+      - wx (pitch): NEGATED smoothedPitchRateDegreesPerSecond. Cross-checked
+        against DistanceEstimator.distanceMeters's own validated
+        phi=alpha+theta relationship (a fixed ground point's alpha/y
+        DECREASES as nose-down pitch increases) -- this mapping reproduces
+        that same direction.
+      - wz (roll): NEGATED smoothedRollRateDegreesPerSecond. Cross-checked
+        only against DistanceEstimator.fit()'s STATIC de-roll rotation
+        formula (not a live bench test) -- weaker footing than pitch/yaw
+        above, same "not yet bench-confirmed" caveat rollDegrees itself
+        already carries elsewhere in this project.
+
+    Returns None if any required signal (depth, ego speed, all three
+    smoothed rotation rates) is missing for this entry/detection -- no
+    existing recording has smoothedPitchRateDegreesPerSecond/
+    smoothedRollRateDegreesPerSecond yet (added 2026-08-22, no drive since),
+    so this returns None for every detection until a session recorded after
+    that exists.
+
+    z_override, when given, is used INSTEAD of a fresh
+    corrected_distance_meters(det, entry, aspect) call -- pass a track's own
+    EMA-smoothed depth (ByteTracker.get_track(track_id).flow_z) here rather
+    than a single-frame value. CONFIRMED 2026-08-22: a single frame's
+    corrected_distance_meters can be noisy even for a correctly, smoothly
+    tracked object (truncation-margin boundary flicker, or the row-based
+    formula's own sensitivity to tiny bottom-edge noise), and that noise
+    otherwise feeds straight into this function's 1/Z term, producing a
+    jumpy flow prediction -- and hence a jumpy motion-arrow residual -- for
+    an object that isn't actually moving jumpily at all. Falls back to the
+    normal per-frame computation when no override is given (untracked
+    detections, or callers that don't have a tracker to ask).
+
+    Also returns None outright for a box truncated by the LEFT or RIGHT
+    frame edge (within EDGE_TRUNCATION_MARGIN_NORMALIZED) -- CONFIRMED
+    2026-08-22, real case: no anchor point on such a box is trustworthy
+    for lateral position (see base_center_normalized's doc comment for the
+    full story -- both plain center and a tried-and-abandoned corner
+    anchor drift as the box's visible width changes, which it always does
+    for a truncated box, purely from scale, independent of any real
+    motion). Declining to compute a flow/motion arrow here is what makes
+    base_center_normalized's own anchor choice moot for this case, rather
+    than needing a second, separate check wherever base_center_normalized
+    gets called.
+    """
+    left = det["x"]
+    right = det["x"] + det["w"]
+    if left <= EDGE_TRUNCATION_MARGIN_NORMALIZED or right >= 1.0 - EDGE_TRUNCATION_MARGIN_NORMALIZED:
+        return None
+    z = z_override if z_override is not None else corrected_distance_meters(det, entry, aspect)
+    if z is None or z <= 0:
+        return None
+    ego_speed = entry.get("egoSpeedMps")
+    yaw_rate = entry.get("smoothedYawRateDegreesPerSecond")
+    pitch_rate = entry.get("smoothedPitchRateDegreesPerSecond")
+    roll_rate = entry.get("smoothedRollRateDegreesPerSecond")
+    if ego_speed is None or yaw_rate is None or pitch_rate is None or roll_rate is None:
+        return None
+
+    base_col_norm, base_row_norm = base_center_normalized(det)
+    x, y = angular_coords(base_col_norm, base_row_norm, aspect)
+
+    lever_forward, lever_left = camera_velocity_from_yaw(yaw_rate)
+    tz = ego_speed + lever_forward
+    vx = -lever_left
+    vy = 0.0
+
+    omega_x = -math.radians(pitch_rate)
+    omega_y = -math.radians(yaw_rate)
+    omega_z = -math.radians(roll_rate)
+
+    u = (-vx + x * tz) / z - omega_y * (1 + x * x) + omega_z * y + omega_x * x * y
+    v = (-vy + y * tz) / z + omega_x * (1 + y * y) - omega_y * x * y - omega_z * x
+
+    return u, v
+
+
+def angular_to_pixels(u: float, v: float, frame_width: int, frame_height: int) -> tuple:
+    """Converts an angular (u, v) -- a flow rate, or any other angular
+    displacement -- to pixels, for display only. Inverse of angular_coords'
+    own scaling."""
+    aspect = frame_width / frame_height
+    f_row = FLOW_FOCAL_LENGTH_ROW_NORMALIZED
+    f_col = f_row / aspect
+    return u * f_col * frame_width, v * f_row * frame_height
+
+
+def _draw_angular_rate_arrow(frame, det: dict, angular_rate: Optional[tuple], color) -> None:
+    """Shared draw path for every one-second-equivalent angular-rate arrow
+    this file draws (predicted flow, previous flow, raw observed rate,
+    subtracted motion) -- all anchored at the SAME point, this detection's
+    CURRENT base center (base_center_normalized(det)), even for a
+    quantity like the previous flow that was technically evaluated at the
+    PREVIOUS frame's own position. Deliberate: these are all being
+    compared as rates at the same instant for the viewer's benefit (see
+    predicted_flow_angular/compute_motion_arrow_angular's own doc
+    comments), not plotted as literal trajectories, so anchoring them all
+    together is what makes the vector algebra (observed == avg(previous
+    flow, current flow) + motion -- EXACT, not approximate, a direct
+    algebraic rearrangement of compute_motion_arrow_angular's own
+    subtraction, confirmed 2026-08-22) visually legible in one place --
+    added 2026-08-22, real request, specifically to make this project's
+    own flow-arrow debugging (done by hand, via ad-hoc scripts, all this
+    session) visible directly in the render instead. A no-op when
+    angular_rate is None, same as every other optional overlay here.
+    Coordinates stay FLOAT all the way to draw_arrow (see
+    PIXEL_SHIFT_BITS) -- no int(...)/round(...) here, so an exact identity
+    in the underlying numbers isn't reintroduced as pixel-grid error by
+    the drawing step."""
+    if angular_rate is None:
+        return
+    h, w = frame.shape[:2]
+    dx, dy = angular_to_pixels(angular_rate[0], angular_rate[1], w, h)
+    base_col_norm, base_row_norm = base_center_normalized(det)
+    cx = base_col_norm * w
+    cy = base_row_norm * h
+    draw_arrow(frame, (cx, cy), (cx + dx, cy + dy), color, FLOW_ARROW_THICKNESS)
+
+
+def draw_flow_arrow(frame, det: dict, flow_angular: Optional[tuple]) -> None:
+    """Draws a one-second-equivalent predicted-flow arrow from this
+    detection's base center -- see predicted_flow_angular's doc comment.
+    `flow_angular` is precomputed by main()'s own entry-processing loop
+    (needed again there for the motion-arrow subtraction, so it's computed
+    once and passed in rather than redone here). A no-op (nothing drawn)
+    when None, same as every other optional overlay in this file."""
+    _draw_angular_rate_arrow(frame, det, flow_angular, FLOW_ARROW_COLOR_BGR)
+
+
+def draw_previous_flow_arrow(frame, det: dict, prev_flow_angular: Optional[tuple]) -> None:
+    """Draws the PREVIOUS observation's predicted-flow arrow -- one of the
+    two inputs averaged together and subtracted out inside
+    compute_motion_arrow_angular (the other being this same frame's own
+    flow_angular, drawn in cyan by draw_flow_arrow) -- so a viewer can see
+    both halves of that average, not just its result. A no-op when None
+    (no previous observation of this track yet)."""
+    _draw_angular_rate_arrow(frame, det, prev_flow_angular, PREVIOUS_FLOW_ARROW_COLOR_BGR)
+
+
+def draw_observed_rate_arrow(frame, det: dict, observed_rate_angular: Optional[tuple]) -> None:
+    """Draws the RAW observed base-center displacement rate -- the
+    un-adjusted quantity compute_motion_arrow_angular starts from, before
+    subtracting the averaged predicted flow. Comparing this directly
+    against the averaged cyan+green arrows is what makes the motion
+    arrow's own subtraction legible: a small magenta residual should mean
+    this blue arrow lands close to that average, not that it's small on
+    its own (a stationary object under heavy ego-motion parallax can show
+    a LARGE observed rate here and still net a near-zero motion arrow,
+    correctly). A no-op when None (same gap/validity conditions as the
+    motion arrow itself -- see compute_motion_arrow_angular)."""
+    _draw_angular_rate_arrow(frame, det, observed_rate_angular, OBSERVED_RATE_ARROW_COLOR_BGR)
+
+
+ANCHOR_DOT_COLOR_BGR = (0, 0, 0)  # black
+ANCHOR_DOT_RADIUS_PX = 3
+
+
+def draw_anchor_dot(frame, det: dict) -> None:
+    """Marks base_center_normalized(det) -- the single point every
+    constituent arrow (green/cyan/blue/magenta, see
+    _draw_angular_rate_arrow) is measured from and drawn out of -- with a
+    small filled black dot. Added 2026-08-22, real request, so it's never
+    ambiguous which point on the box the vectors correspond to (this
+    matters specifically because predicted_flow_angular now declines to
+    compute anything at all for an edge-truncated box -- see that
+    function's own doc comment -- so a box WITH a dot is one this file is
+    actually confident measuring, not just guessing at)."""
+    h, w = frame.shape[:2]
+    base_col_norm, base_row_norm = base_center_normalized(det)
+    cv2.circle(
+        frame, _shifted_point((base_col_norm * w, base_row_norm * h)),
+        ANCHOR_DOT_RADIUS_PX << PIXEL_SHIFT_BITS, ANCHOR_DOT_COLOR_BGR, -1, cv2.LINE_AA, PIXEL_SHIFT_BITS,
+    )
+
+
+MOTION_ARROW_MAX_DT_S = 1.0  # beyond this gap between observations, the averaged-flow approximation is too stale to trust
+
+
+def compute_motion_arrow_angular(
+    prev_base: tuple, prev_flow: tuple, prev_time: float,
+    cur_base: tuple, cur_flow: tuple, cur_time: float,
+) -> Optional[tuple]:
+    """The tracked object's own independent motion (predicted ego-flow
+    subtracted out), as a one-second-equivalent DISPLAY rate in normalized
+    angular coordinates -- CONFIRMED 2026-08-22, real proposed algorithm:
+    observed base-center displacement between two consecutive real
+    observations of the SAME track, minus the average of the predicted
+    ego-flow at each observation's own position/depth, integrated over the
+    ACTUAL elapsed time between them (not assumed to be 1 second, or
+    1/fps -- real capture-time gap, same "use real timestamps, not assumed
+    frame intervals" discipline this project already applies everywhere
+    else). The 1-second normalization applied at the very end is ONLY for
+    visual display (matching the flow arrows' own convention) -- it is NOT
+    used, and must never be used, for any actual motion/collision-relevant
+    computation; the real quantity here is the angular displacement over
+    the real dt, before that final division.
+
+    Done in ANGULAR coordinates, not pixels -- a given angular flow doesn't
+    correspond to a constant pixel displacement across the frame (see the
+    (1+x^2)/(1+y^2) terms in predicted_flow_angular), so subtracting in
+    pixel space would be a worse approximation off-center.
+
+    Returns None if the gap between observations is non-positive or
+    exceeds MOTION_ARROW_MAX_DT_S -- beyond that, the object may as well be
+    a different resumed identity, and the averaged-flow approximation
+    (implicitly assuming near-constant ego-motion across the gap) is too
+    stale to trust.
+    """
+    dt = cur_time - prev_time
+    if dt <= 0 or dt > MOTION_ARROW_MAX_DT_S:
+        return None
+    observed_u = cur_base[0] - prev_base[0]
+    observed_v = cur_base[1] - prev_base[1]
+    avg_flow_u = (prev_flow[0] + cur_flow[0]) / 2
+    avg_flow_v = (prev_flow[1] + cur_flow[1]) / 2
+    true_u = observed_u - avg_flow_u * dt
+    true_v = observed_v - avg_flow_v * dt
+    return true_u / dt, true_v / dt  # 1-second-equivalent DISPLAY rate only
+
+
+def draw_motion_arrow(frame, det: dict, motion_angular: Optional[tuple]) -> None:
+    """Draws the object's own independent-motion arrow from its base
+    center -- see compute_motion_arrow_angular's doc comment. A no-op when
+    None (no previous observation of this track yet, or the gap was too
+    large/invalid)."""
+    _draw_angular_rate_arrow(frame, det, motion_angular, MOTION_ARROW_COLOR_BGR)
+
+
+FOE_DOT_COLOR_BGR = (255, 0, 0)  # blue
+FOE_DOT_RADIUS = 8
+
+# Combined FOE-based camera-to-vehicle yaw misalignment estimate -- see
+# tools/camera_yaw_alignment.py. Average of the two current-calibration-
+# regime sessions' cleanest central estimates: 26_08_20 median -0.608deg,
+# 26_08_21 (2-outlier-cleaned) weighted mean -0.605deg -- these two
+# independent sessions agreeing this closely is why this figure is trusted
+# at all (see CameraManager.defaultYawMarkerNormalizedX's own 2026-08-22
+# doc comment for the same figure used there). Positive = FOE right of
+# principal point = camera pointed left of true vehicle-forward.
+CALIBRATED_YAW_OFFSET_DEG = -0.6065
+
+
+def calibrated_foe_pixels(frame_width: int, frame_height: int) -> tuple:
+    """The FIXED, calibrated Focus of Expansion -- the camera's own static
+    mounting misalignment relative to the vehicle (CALIBRATED_YAW_OFFSET_DEG),
+    not any one frame's live ego-motion. Deliberately does NOT move frame to
+    frame -- CONFIRMED 2026-08-22, real device report ("why does the blue
+    dot move around? I'd expect it to be fixed"): an earlier per-frame
+    version (using that frame's own live smoothedYawRateDegreesPerSecond)
+    showed a real ~23px wobble even during confirmed-straight driving, from
+    genuine frame-to-frame yaw-rate noise (steering micro-corrections, road
+    camber) -- correct for what IT was computing (the instantaneous
+    direction of travel), but the wrong thing to compare the flow arrows
+    against as a stable reference. This is the OTHER "FOE" this project
+    computes: a single calibration constant, not a live per-frame reading,
+    same relationship as CameraManager.defaultYawMarkerNormalizedX's own
+    nominal-mount derivation. No vertical calibration offset exists (the
+    FOE tool's own analysis only ever measured/trusted the horizontal
+    offset -- see its own module docstring), so this sits at the
+    calibrated principal ROW, shifted only horizontally."""
+    aspect = frame_width / frame_height
+    f_row = FLOW_FOCAL_LENGTH_ROW_NORMALIZED
+    f_col = f_row / aspect
+    yaw_offset_rad = math.radians(CALIBRATED_YAW_OFFSET_DEG)
+    col_norm = FLOW_PRINCIPAL_COLUMN_NORMALIZED + math.tan(yaw_offset_rad) * f_col
+    row_norm = FLOW_PRINCIPAL_ROW_NORMALIZED
+    return col_norm * frame_width, row_norm * frame_height
+
+
+def draw_foe_dot(frame, entry: dict) -> None:
+    """Draws a filled blue dot at the FIXED, calibrated FOE -- see
+    calibrated_foe_pixels's doc comment. `entry` is unused (kept so this
+    call site doesn't need to change) -- the calibrated FOE is the same
+    every frame, unlike the live per-frame version this replaced. Skipped
+    (not clamped to the edge) if it ever fell off-frame, though in practice
+    it won't -- a sub-1-degree offset lands well inside any real frame."""
+    h, w = frame.shape[:2]
+    x, y = calibrated_foe_pixels(w, h)
+    if 0 <= x < w and 0 <= y < h:
+        cv2.circle(frame, (int(round(x)), int(round(y))), FOE_DOT_RADIUS, FOE_DOT_COLOR_BGR, -1)
+
+
 def draw_hud(frame, entry: dict, thermal: Optional[tuple], frame_index: Optional[int] = None) -> None:
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_DUPLEX
@@ -234,6 +872,23 @@ def main() -> None:
     )
     parser.add_argument("--no-gmc", dest="gmc", action="store_false")
     parser.add_argument(
+        "--flow-arrows", dest="flow_arrows", action="store_true", default=False,
+        help="Draw, per tracked object, every constituent of the motion-arrow computation (see "
+             "compute_motion_arrow_angular's doc comment), all from its base center: a GREEN arrow for the "
+             "PREVIOUS observation's predicted ego-motion flow, a CYAN arrow for THIS frame's predicted "
+             "ego-motion flow (see predicted_flow_angular's doc comment) -- the flow a STATIC point at that "
+             "object's position/depth would show from the camera's own ego-motion alone -- a BLUE arrow for "
+             "the RAW observed base-center displacement rate (unadjusted for ego-motion), and a MAGENTA arrow "
+             "for the object's own independent motion (the blue arrow minus the averaged green+cyan flow); a "
+             "small BLACK dot marks the exact point (base_center_normalized) all four are measured from and "
+             "drawn out of. Also a fixed blue dot at the CALIBRATED Focus of Expansion (see "
+             "calibrated_foe_pixels). Every "
+             "arrow is a one-second-equivalent DISPLAY rate only (the real motion-arrow math uses the actual "
+             "elapsed time between observations, not 1 second). Off by default -- experimental; the arrows "
+             "need smoothedPitchRateDegreesPerSecond/smoothedRollRateDegreesPerSecond (added 2026-08-22, not "
+             "present in any recording predating that), though the FOE dot alone works on older footage too.",
+    )
+    parser.add_argument(
         "--highlight-leading", dest="highlight_leading", action="store_true", default=True,
         help="Tint the classified forward-leading vehicle (see leading_vehicle.py) (default: on)",
     )
@@ -254,6 +909,10 @@ def main() -> None:
         help="compute_symmetry.py output -- needed for --min-symmetry to actually gate anything.",
     )
     parser.add_argument(
+        "--max-seconds", type=float, default=None,
+        help="Stop after this many seconds of source video, for a quick spot-check render instead of the full clip.",
+    )
+    parser.add_argument(
         "--ground-truth", type=Path, default=None,
         help="label_leading_vehicle.py ground truth (e.g. ground_truth_close_range.json) -- when given, "
              "tints the human-labeled followed vehicle in magenta alongside the algorithm's own pick "
@@ -267,6 +926,32 @@ def main() -> None:
 
     start_epoch, thermal_log_path = resolve_start_epoch(args.video, args.debug_log)
     detections = load_detections(args.detections)
+
+    # CONFIRMED 2026-08-22 (real drive, this same session): --detections
+    # defaulting to DEFAULT_LOGS_DIR pulls in EVERY session ever pulled to
+    # that shared directory, not just this video's own. The render loop
+    # below starts next_idx at 0 and unconditionally consumes every entry
+    # whose t <= the current frame's epoch -- so on the very first frame it
+    # burns through every entry from any EARLIER, unrelated session before
+    # ever reaching this video's own data, calling tracker.update() (a real
+    # reid forward pass, if --reid is on) on each one. Cheap enough to miss
+    # with reid off; catastrophic with it on -- one real case took 800K+
+    # wasted entries from a shared 1.3GB logs directory before reaching a
+    # 67-minute video's own ~27K. This doesn't change behavior (the wasted
+    # entries get pruned by the tracker's own max_age and never corrupt this
+    # video's real tracking, they're just slow) -- just surfaces it instead
+    # of silently eating the wall-clock cost. --detections/--debug-log
+    # pointed at this video's own session directory avoids the waste
+    # entirely.
+    n_before = bisect.bisect_left([e["t"] for e in detections], start_epoch)
+    if n_before > 2000:
+        print(
+            f"WARNING: {n_before} of {len(detections)} loaded detections entries are from BEFORE "
+            f"this video even starts -- {args.detections} likely wasn't scoped to this session. "
+            "Pass --detections/--debug-log pointed at this video's own session directory to avoid "
+            "burning through them (slow, especially with --reid on).",
+            file=sys.stderr,
+        )
 
     symmetry_scores = json.loads(args.symmetry_cache.read_text()) if args.symmetry_cache else None
     ground_truth_segments = json.loads(args.ground_truth.read_text()) if args.ground_truth else None
@@ -306,11 +991,22 @@ def main() -> None:
     # lock is only updated when a *new* detection entry is processed below,
     # at the detections.jsonl cadence, not once per rendered video frame.
     current_locked_id = None
+    # trackID -> (base_angular, flow_angular, capture_time) from that
+    # track's MOST RECENT prior observation -- see
+    # compute_motion_arrow_angular's doc comment. Only ever updated when a
+    # full (base + flow) observation exists; a track with missing flow
+    # signals this entry simply doesn't advance its stored state (see the
+    # entry-processing loop below), same "don't fabricate a number with no
+    # real basis" discipline as the rest of this feature.
+    track_flow_state: dict = {}
+    aspect = width / height
 
     i = 0
     while True:
         ok, frame = cap.read()
         if not ok:
+            break
+        if args.max_seconds is not None and cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 > args.max_seconds:
             break
         # Actual embedded PTS for the frame just read (ms, relative to the
         # start of the recording) — not `i / fps`, which would assume a
@@ -320,11 +1016,73 @@ def main() -> None:
 
         while next_idx < len(detections) and detections[next_idx]["t"] <= frame_epoch:
             current_entry = detections[next_idx]
-            current_track_ids = tracker.update(current_entry["detections"], frame=frame)
+            # Real elapsed-time-corrected capture time (see below for why
+            # not current_entry["t"] alone) -- needed by the tracker's own
+            # flow-based matching gate now too, not just the flow-arrows
+            # visualization, so it's computed unconditionally here instead
+            # of only under `if args.flow_arrows`.
+            capture_time = current_entry["t"] - current_entry["elapsedMs"] / 1000.0
+            detection_depths = [
+                corrected_distance_meters(det, current_entry, aspect) for det in current_entry["detections"]
+            ]
+            current_track_ids = tracker.update(
+                current_entry["detections"], frame=frame,
+                capture_time=capture_time,
+                ego_speed_mps=current_entry.get("egoSpeedMps"),
+                yaw_rate_deg_s=current_entry.get("smoothedYawRateDegreesPerSecond"),
+                pitch_rate_deg_s=current_entry.get("smoothedPitchRateDegreesPerSecond"),
+                roll_rate_deg_s=current_entry.get("smoothedRollRateDegreesPerSecond"),
+                aspect=aspect,
+                detection_depths=detection_depths,
+            )
             # classify_leading reads trackID off each det -- draw_box below
             # only takes it as a separate zip'd arg, so stamp it on here too.
             for det, track_id in zip(current_entry["detections"], current_track_ids):
                 det["trackID"] = track_id
+            if args.flow_arrows:
+                # Computed once per detections.jsonl entry (not once per
+                # rendered video frame, matching everything else in this
+                # loop) and stashed on each det -- draw_flow_arrow/
+                # draw_motion_arrow below just read it back, no
+                # recomputation at render time.
+                for det, track_id in zip(current_entry["detections"], current_track_ids):
+                    # Prefer the track's own EMA-smoothed depth over a fresh
+                    # single-frame corrected_distance_meters call -- see
+                    # predicted_flow_angular's own doc comment on
+                    # z_override for why (single-frame depth noise feeding
+                    # a jumpy flow prediction for an object that isn't
+                    # actually moving jumpily).
+                    smoothed_z = None
+                    if track_id is not None:
+                        track = tracker.get_track(track_id)
+                        smoothed_z = track.flow_z if track is not None else None
+                    flow_angular = predicted_flow_angular(det, current_entry, aspect, z_override=smoothed_z)
+                    det["flowAngular"] = flow_angular
+                    det["motionAngular"] = None
+                    det["prevFlowAngular"] = None
+                    det["observedRateAngular"] = None
+                    if track_id is None:
+                        continue
+                    base_angular = angular_coords(*base_center_normalized(det), aspect)
+                    prev = track_flow_state.get(track_id)
+                    if prev is not None and flow_angular is not None:
+                        prev_base, prev_flow, prev_time = prev
+                        det["motionAngular"] = compute_motion_arrow_angular(
+                            prev_base, prev_flow, prev_time, base_angular, flow_angular, capture_time,
+                        )
+                        if det["motionAngular"] is not None:
+                            # Same dt validity gate compute_motion_arrow_angular
+                            # itself just passed -- see draw_previous_flow_arrow/
+                            # draw_observed_rate_arrow's own doc comments for why
+                            # these are worth showing alongside the final result.
+                            dt = capture_time - prev_time
+                            det["prevFlowAngular"] = prev_flow
+                            det["observedRateAngular"] = (
+                                (base_angular[0] - prev_base[0]) / dt,
+                                (base_angular[1] - prev_base[1]) / dt,
+                            )
+                    if flow_angular is not None:
+                        track_flow_state[track_id] = (base_angular, flow_angular, capture_time)
             if symmetry_scores is not None:
                 # Aligned by list index, same order as load_detections -- see
                 # compute_symmetry.py's docstring. NOT trackID-keyed.
@@ -346,6 +1104,15 @@ def main() -> None:
         if current_entry is not None:
             for det, track_id in zip(current_entry["detections"], current_track_ids):
                 draw_box(frame, det, track_id)
+                if args.flow_arrows:
+                    draw_previous_flow_arrow(frame, det, det.get("prevFlowAngular"))
+                    draw_flow_arrow(frame, det, det.get("flowAngular"))
+                    draw_observed_rate_arrow(frame, det, det.get("observedRateAngular"))
+                    draw_motion_arrow(frame, det, det.get("motionAngular"))
+                    if det.get("observedRateAngular") is not None:
+                        draw_anchor_dot(frame, det)
+            if args.flow_arrows:
+                draw_foe_dot(frame, current_entry)
 
             if args.highlight_leading and current_locked_id is not None:
                 # The locked vehicle may not be this exact entry's raw

@@ -86,6 +86,7 @@ from scipy.optimize import linear_sum_assignment
 sys.path.insert(0, str(Path(__file__).parent))
 from benchmark import iou  # noqa: E402
 from driverassist_sync import DEFAULT_LOGS_DIR, load_detections, resolve_start_epoch  # noqa: E402
+from flow_model import angular_coords, inverse_angular_coords, predicted_flow_angular_raw  # noqa: E402
 from gmc import GMC  # noqa: E402
 from package_session import find_session_video  # noqa: E402
 
@@ -105,6 +106,22 @@ DEFAULT_APPEARANCE_THRESHOLD = 0.7  # cosine distance (1 - similarity) below thi
 # The trend hadn't reversed by 0.7, so this may not be the true ceiling, but it's the best validated value.
 DEFAULT_REID_MODEL = "yolo26n-reid.onnx"  # lightest yolo26-family ReID checkpoint; auto-downloaded
 
+# Label pairs whose real-world class boundary this detector can lose
+# entirely from a single viewpoint -- added 2026-08-22, mirrors
+# ByteTracker.swift's own `confusableLabels` (see that file's doc comment
+# for the full rationale): a cyclist viewed head-on collapses to almost no
+# bicycle-discriminative signal, so the detector can genuinely stop emitting
+# "bicycle" boxes for that whole stretch, sometimes surfacing the same
+# physical object as "person" instead. Per-label matching below means a
+# "person" detection can never match a "bicycle" track on its own without
+# this -- deliberately NOT a general "any label may rescue any label"
+# mechanism, just this one evidenced pair, symmetric (either label may
+# rescue the other).
+CONFUSABLE_LABELS = {
+    "bicycle": {"person"},
+    "person": {"bicycle"},
+}
+
 # How far apart (center-to-center, scaled by the larger box's own diagonal)
 # a track/detection pair may be and still have appearance similarity
 # consulted at all. Deliberately much looser than DEFAULT_IOU_THRESHOLD and
@@ -116,6 +133,112 @@ DEFAULT_REID_MODEL = "yolo26n-reid.onnx"  # lightest yolo26-family ReID checkpoi
 # bar (iou_threshold, applied to the fused cost) is unchanged -- this only
 # widens which pairs are considered, not what counts as a real match.
 DEFAULT_APPEARANCE_ELIGIBILITY_SCALE = 3.0
+
+# Flow-based matching gate -- added 2026-08-22, same real-drive diagnosis
+# that found reid alone still misassociates two visually-similar-but-
+# physically-different parked cars in a dense row (see project session
+# notes: a single trackID alternated between real cars at ~4.6m and ~14m
+# for several seconds, WITH reid on). predicted_flow_angular_raw already
+# models where a STATIC point at a track's last known position/depth
+# should appear next, given the vehicle's own real ego-motion -- a far
+# better predictor here than the Kalman filter's naive image-plane
+# constant-velocity model, which has no notion of depth/parallax and is
+# specifically wrong for near-field passing objects (the exact scenario
+# that broke). See _predicted_track_box/Track.update_flow_state for how
+# this also has to keep tracking a GENUINELY moving object correctly (not
+# just stationary ones) -- explicit design requirement from that session.
+
+# How far apart (center-to-center, scaled by the larger box's own diagonal
+# -- same convention as DEFAULT_APPEARANCE_ELIGIBILITY_SCALE) a track's
+# flow-predicted position and a candidate detection may be before the pair
+# is rejected outright, regardless of how good IoU/appearance look.
+# REVISED 2026-08-22 (real drive, same session): started at 4.0, reasoned
+# as "looser than appearance, to tolerate a moving object's first couple of
+# frames" -- but CONFIRMED too loose on real data: a track jumped roughly
+# half the frame width (cx 0.283->0.746, a residual ~2x the box's own
+# diagonal) between two real, differently-positioned parked cars in the
+# same curbside row, and 4.0x comfortably let it through. Depth couldn't
+# catch this either (see DEFAULT_DEPTH_RATIO_GATE) -- cars parked along the
+# same curb sit at similar PERPENDICULAR distance from a passing vehicle
+# regardless of which car it is, so depth alone can't discriminate between
+# them; screen POSITION has to be the discriminating signal here, which
+# means this gate needs to actually be tight. Tightened to 1.5 -- still a
+# reasoned starting point, not yet validated against a wider set of real
+# matches, and may need further tuning down (or dt-aware scaling) if a
+# similar case surfaces again.
+DEFAULT_FLOW_GATE_SCALE = 1.5
+
+# Same cutoff MOTION_ARROW_MAX_DT_S uses in reconstruct_annotated.py, for
+# the same reason: beyond this, the physics-based extrapolation (position +
+# flow_rate * dt) is stepping too far past its own last real observation to
+# be trusted as a rejection criterion.
+FLOW_GATE_MAX_DT_S = 1.0
+
+# EMA weight on a track's EXISTING flow_velocity estimate when a new
+# residual comes in (see Track.update_flow_state) -- looser than
+# update_feat's own 0.9 (appearance should barely move on one new crop;
+# this needs to pick up a real velocity change reasonably fast, not just
+# damp single-frame detector jitter). A reasoned starting point, not yet
+# validated.
+FLOW_VELOCITY_SMOOTHING = 0.5
+
+# CONFIRMED necessary 2026-08-22 (real drive, same session, a THIRD case of
+# the same underlying pattern): a flat FLOW_VELOCITY_SMOOTHING blend on
+# flow_z isn't enough to stop one wild single-frame reading from corrupting
+# flow_depth_rate -- a box's left edge crossed corrected_distance_meters's
+# truncation-margin boundary for what looks like ordinary jitter (box width
+# stayed stable, no progressive crop pattern), flipping it from the raw
+# logged distance (5.97m) to a recomputed one (11.89m); blending that at
+# 0.5 still swung flow_depth_rate to ~22 m/s -- a physically impossible
+# closing rate -- which then fed a hugely wrong (screen-spanning) predicted
+# flow for several subsequent frames while it decayed back down. A single
+# outlier reading should have to repeat before it's believed, not
+# dominate the estimate on the first occurrence.
+FLOW_DEPTH_OUTLIER_RATIO = 1.5
+"""A new depth reading more than this ratio away from the track's current
+smoothed flow_z is treated as a likely outlier (matches
+DEFAULT_DEPTH_RATIO_GATE's own threshold -- same "how much can real depth
+plausibly change in one short step" reasoning) and blended in with
+FLOW_DEPTH_OUTLIER_SMOOTHING instead of FLOW_VELOCITY_SMOOTHING."""
+FLOW_DEPTH_OUTLIER_SMOOTHING = 0.9
+"""Much heavier distrust than FLOW_VELOCITY_SMOOTHING's 0.5 -- a single
+outlier reading should barely move the estimate; a SUSTAINED trend (the
+same new value repeating over several frames) still gets incorporated,
+just gradually, exactly like a real closing/opening trend should be. A
+reasoned starting point, not yet validated against a wider set of real
+matches."""
+
+# Max allowed ratio between a track's last known depth and a candidate
+# detection's own depth before the pair is rejected outright -- a SEPARATE
+# gate from DEFAULT_FLOW_GATE_SCALE's screen-space one. CONFIRMED necessary
+# 2026-08-22: the screen-space gate alone missed a real case (an established
+# 5.1m car track matched onto an unrelated, degenerate 1131m-implied box)
+# because the tolerance is diagonal-*relative*, and a large/close box's own
+# diagonal is already big enough that even a real screen-space jump stays
+# under flow_gate_scale * that diagonal -- exactly the near-field regime
+# this whole feature exists to fix. Depth doesn't have that problem: a
+# genuine single-step depth change should be modest regardless of how big
+# the box looks on screen. A reasoned starting point (loose enough to
+# tolerate a real, fast closing/opening rate over one short dt), not yet
+# validated against a wider set of real matches.
+DEFAULT_DEPTH_RATIO_GATE = 1.5
+
+# CONFIRMED necessary 2026-08-22 (real drive, same session): a track's box
+# was nearly identical (same position/size, i.e. near-perfect IoU) between
+# two consecutive real observations of the SAME physical car -- yet its own
+# recorded depth jumped ~60% purely because the box's right edge oscillated
+# a few thousandths of a normalized unit across corrected_distance_meters's
+# own truncation-margin boundary, flipping which of two very different
+# formulas got used. That self-inflicted depth jump then tripped the depth
+# gate above and killed a perfectly good match. Direct, raw geometric
+# overlap this strong is far more reliable evidence of continuity than a
+# derived signal (predicted screen position, or depth) that can be thrown
+# off by exactly this kind of measurement-boundary noise -- so when IoU is
+# already this high, skip the flow/depth gates entirely rather than let a
+# noisy derived signal override a much more direct one. Doesn't affect
+# ambiguous cases (moderate IoU, where the flow/depth gates are the whole
+# point) -- only ones geometry alone already all but confirms.
+HIGH_IOU_RESCUE_THRESHOLD = 0.5
 
 
 def _box_to_cxcywh(box: dict) -> np.ndarray:
@@ -257,7 +380,10 @@ class KalmanBoxTracker:
 
 
 class Track:
-    __slots__ = ("id", "label", "kf", "hits", "time_since_update", "age", "feat")
+    __slots__ = (
+        "id", "label", "kf", "hits", "time_since_update", "age", "feat",
+        "flow_pos", "flow_z", "flow_t", "flow_velocity", "flow_depth_rate",
+    )
 
     def __init__(self, track_id: int, label: str, box: dict, feat=None):
         self.id = track_id
@@ -269,6 +395,14 @@ class Track:
         self.feat = None
         if feat is not None:
             self.update_feat(feat)
+        # See update_flow_state's own doc comment -- None until the first
+        # real detection is recorded (the spawning one), so the flow gate
+        # has nothing to predict against for a track's very first match.
+        self.flow_pos = None
+        self.flow_z = None
+        self.flow_t = None
+        self.flow_velocity = (0.0, 0.0)
+        self.flow_depth_rate = 0.0
 
     def update_feat(self, feat: np.ndarray, alpha: float = 0.9) -> None:
         """Exponential moving average of the track's appearance embedding
@@ -277,11 +411,153 @@ class Track:
         feat = _normalize(np.asarray(feat, dtype=float))
         self.feat = feat if self.feat is None else _normalize(alpha * self.feat + (1 - alpha) * feat)
 
+    def update_flow_state(
+        self, x: float, y: float, z: float, capture_time: float,
+        ego_speed_mps: float = None, yaw_rate_deg_s: float = None,
+        pitch_rate_deg_s: float = None, roll_rate_deg_s: float = None,
+    ) -> None:
+        """Called after EVERY real detection this track is matched to
+        (including the one that spawns it), recording its new flow-model
+        angular position/depth/time, and -- the part that keeps a
+        genuinely moving object trackable, not just a stationary one --
+        refining flow_velocity, an estimate of the track's OWN independent
+        angular velocity, from the residual between what was actually
+        observed this step and what ego-motion-ONLY flow alone predicted
+        for it. flow_velocity starts at (0, 0) -- "assume stationary" --
+        and only a real prior observation (this method's own previous
+        call) lets it become anything else, so a brand-new track's very
+        next match is still gated under the stationary assumption (an
+        accepted cold-start limitation for a fast-moving object's first
+        couple of frames -- see DEFAULT_FLOW_GATE_SCALE's own doc comment),
+        while an established track's real, consistent motion gets folded
+        into future predictions instead of being fought by them.
+
+        Also refines flow_depth_rate the same way, for _predicted_track_depth
+        (used by the SEPARATE depth-continuity gate in _match). Unlike
+        flow_velocity, this is a RAW rate -- not ego-motion-subtracted --
+        because a static object's depth legitimately changes from ego-motion
+        alone too (e.g. a parked car you're approaching), and the depth
+        gate's job is just "is this consistent with the trend this track has
+        actually shown," not "is this object independently moving." Doesn't
+        need ego-motion signals at all, so it still works on older
+        recordings without smoothed rotation rates.
+
+        flow_z ITSELF is also an EMA over real observations now (added
+        2026-08-22, same real-drive diagnosis), not the bare last-observed
+        value -- CONFIRMED two independent single-frame depth-noise sources
+        on real data: corrected_distance_meters flipping between two
+        formulas when a box edge sits right at its truncation-margin
+        boundary (ordinary detector jitter, not a real distance change --
+        this is what fed the false rejection HIGH_IOU_RESCUE_THRESHOLD now
+        catches at match time), and the plain row-based distance formula's
+        own sensitivity to tiny bottom-edge noise even on a box that isn't
+        truncated at all (a ~24% depth swing from a 0.003-normalized-unit
+        bottom-edge change, on an otherwise smoothly-moving car). Smoothing
+        here damps both at the source, before they ever reach the flow
+        model's own 1/Z term -- which is what reconstruct_annotated.py now
+        reads (via ByteTracker.get_track) instead of recomputing a fresh,
+        single-frame corrected_distance_meters value for the flow/motion
+        arrows themselves."""
+        # Computed once, reused for both flow_depth_rate below and the
+        # final flow_z blend at the end of this method -- see
+        # FLOW_DEPTH_OUTLIER_RATIO's own doc comment.
+        depth_alpha = FLOW_VELOCITY_SMOOTHING
+        if self.flow_z is not None and self.flow_z > 0 and z > 0:
+            depth_ratio = max(self.flow_z / z, z / self.flow_z)
+            if depth_ratio > FLOW_DEPTH_OUTLIER_RATIO:
+                depth_alpha = FLOW_DEPTH_OUTLIER_SMOOTHING
+
+        if self.flow_pos is not None and self.flow_t is not None and self.flow_z is not None:
+            dt = capture_time - self.flow_t
+            if 0 < dt <= FLOW_GATE_MAX_DT_S:
+                observed_depth_rate = (z - self.flow_z) / dt
+                self.flow_depth_rate = (
+                    depth_alpha * self.flow_depth_rate + (1 - depth_alpha) * observed_depth_rate
+                )
+        if (
+            self.flow_pos is not None and self.flow_t is not None and self.flow_z is not None
+            and None not in (ego_speed_mps, yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s)
+        ):
+            dt = capture_time - self.flow_t
+            if 0 < dt <= FLOW_GATE_MAX_DT_S:
+                ego_u, ego_v = predicted_flow_angular_raw(
+                    self.flow_pos[0], self.flow_pos[1], self.flow_z,
+                    ego_speed_mps, yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s,
+                )
+                residual_u = (x - self.flow_pos[0]) / dt - ego_u
+                residual_v = (y - self.flow_pos[1]) / dt - ego_v
+                alpha = FLOW_VELOCITY_SMOOTHING
+                self.flow_velocity = (
+                    alpha * self.flow_velocity[0] + (1 - alpha) * residual_u,
+                    alpha * self.flow_velocity[1] + (1 - alpha) * residual_v,
+                )
+        self.flow_pos = (x, y)
+        self.flow_z = z if self.flow_z is None else depth_alpha * self.flow_z + (1 - depth_alpha) * z
+        self.flow_t = capture_time
+
+
+def _predicted_track_box(
+    track: Track, capture_time: float,
+    ego_speed_mps: float, yaw_rate_deg_s: float, pitch_rate_deg_s: float, roll_rate_deg_s: float,
+    aspect: float,
+) -> "dict | None":
+    """Where this track's box should be at capture_time, from ego-motion-
+    only flow PLUS its own estimated independent velocity (zero until
+    Track.update_flow_state has established one) -- or None if a
+    prediction isn't possible (no prior flow state yet, this frame's
+    ego-motion signals are missing, or dt is out of FLOW_GATE_MAX_DT_S's
+    range). Same box size as the track's last real observation -- flow
+    predicts POSITION, not size."""
+    if track.flow_pos is None or track.flow_z is None or track.flow_t is None:
+        return None
+    if aspect is None or None in (ego_speed_mps, yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s):
+        return None
+    dt = capture_time - track.flow_t
+    if dt <= 0 or dt > FLOW_GATE_MAX_DT_S:
+        return None
+    ego_u, ego_v = predicted_flow_angular_raw(
+        track.flow_pos[0], track.flow_pos[1], track.flow_z,
+        ego_speed_mps, yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s,
+    )
+    total_u = ego_u + track.flow_velocity[0]
+    total_v = ego_v + track.flow_velocity[1]
+    pred_x = track.flow_pos[0] + total_u * dt
+    pred_y = track.flow_pos[1] + total_v * dt
+    col, row = inverse_angular_coords(pred_x, pred_y, aspect)
+    w, h = track.kf.box["w"], track.kf.box["h"]
+    return {"x": col - w / 2, "y": row - h, "w": w, "h": h}
+
+
+def _predicted_track_depth(track: Track, capture_time: float) -> "float | None":
+    """Predicted depth (meters) for this track at capture_time, from its
+    last known depth plus its own estimated (raw, not ego-subtracted --
+    see Track.update_flow_state) depth rate -- mirrors
+    _predicted_track_box's position prediction, so the depth-continuity
+    gate in _match can tolerate an established closing/opening trend
+    instead of only ever comparing against a static last-known value (see
+    DEFAULT_DEPTH_RATIO_GATE's own doc comment for the real case this
+    fixes: a fast-closing object at close range legitimately exceeding a
+    single static ratio). Falls back to the raw last-known depth if dt is
+    out of range (no trend assumed beyond FLOW_GATE_MAX_DT_S), and to None
+    if there's no prior depth for this track at all -- note this doesn't
+    require ego-motion signals, unlike _predicted_track_box, so it's still
+    active even on older recordings without smoothed rotation rates."""
+    if track.flow_z is None:
+        return None
+    if track.flow_t is None or capture_time is None:
+        return track.flow_z
+    dt = capture_time - track.flow_t
+    if dt <= 0 or dt > FLOW_GATE_MAX_DT_S:
+        return track.flow_z
+    return track.flow_z + track.flow_depth_rate * dt
+
 
 def _match(
     track_boxes: list, det_boxes: list, iou_threshold: float,
     track_feats: list = None, det_feats: list = None, appearance_thresh: float = DEFAULT_APPEARANCE_THRESHOLD,
     appearance_eligibility_scale: float = DEFAULT_APPEARANCE_ELIGIBILITY_SCALE,
+    track_predicted_boxes: list = None, flow_gate_scale: float = DEFAULT_FLOW_GATE_SCALE,
+    track_depths: list = None, det_depths: list = None, depth_ratio_gate: float = DEFAULT_DEPTH_RATIO_GATE,
 ) -> tuple:
     """Hungarian assignment minimizing 1-IoU distance, gated at iou_threshold.
     If track_feats/det_feats (parallel lists, entries may be None) are given,
@@ -295,6 +571,26 @@ def _match(
     applied to the fused cost, so a strong appearance match can rescue a pair
     IoU alone would've missed, but a weak one can't invent a match out of
     nothing.
+
+    If track_predicted_boxes (parallel to track_boxes, entries may be None)
+    is given, a pair is REJECTED outright -- regardless of how good IoU or
+    appearance look -- whenever the corresponding track has a flow-model
+    prediction available (see _predicted_track_box) and the candidate
+    detection lands further than flow_gate_scale * diagonal from it. Unlike
+    appearance, this is a pure gate, never a rescue: it can only remove
+    candidate pairs from consideration, never manufacture a match IoU/
+    appearance didn't already support. Added 2026-08-22 after reid alone
+    was confirmed still misassociating visually-similar, closely-packed
+    parked cars -- see DEFAULT_FLOW_GATE_SCALE's own doc comment.
+
+    If track_depths/det_depths (parallel to track_boxes/det_boxes, entries
+    may be None) are given, a SEPARATE hard gate rejects any pair whose
+    depths differ by more than depth_ratio_gate -- see
+    DEFAULT_DEPTH_RATIO_GATE's own doc comment for why this can't just be
+    folded into the screen-space flow gate above (a large/close box's own
+    diagonal makes that gate too loose exactly where depth continuity
+    matters most).
+
     Returns (matches, unmatched_track_idxs, unmatched_det_idxs), all indices
     local to the track_boxes/det_boxes lists passed in."""
     if not track_boxes or not det_boxes:
@@ -316,6 +612,32 @@ def _match(
                 emb_cost[i, j] = 1.0 - float(np.dot(tf, df))
         emb_cost[emb_cost > (1.0 - appearance_thresh)] = 1.0
         cost = np.minimum(cost, emb_cost)
+
+    if track_predicted_boxes is not None and any(p is not None for p in track_predicted_boxes):
+        for i, pred in enumerate(track_predicted_boxes):
+            if pred is None:
+                continue
+            for j, d in enumerate(det_boxes):
+                if iou(track_boxes[i], d) >= HIGH_IOU_RESCUE_THRESHOLD:
+                    continue  # see HIGH_IOU_RESCUE_THRESHOLD's own doc comment
+                max_diag = max(_box_diagonal(pred), _box_diagonal(d))
+                if _center_distance(pred, d) > flow_gate_scale * max_diag:
+                    cost[i, j] = 1.0  # hard reject -- see this function's own doc comment
+
+    if track_depths is not None and det_depths is not None and any(
+        z is not None for z in list(track_depths) + list(det_depths)
+    ):
+        for i, tz in enumerate(track_depths):
+            if tz is None or tz <= 0:
+                continue
+            for j, dz in enumerate(det_depths):
+                if dz is None or dz <= 0:
+                    continue
+                if iou(track_boxes[i], det_boxes[j]) >= HIGH_IOU_RESCUE_THRESHOLD:
+                    continue  # see HIGH_IOU_RESCUE_THRESHOLD's own doc comment
+                ratio = max(tz / dz, dz / tz)
+                if ratio > depth_ratio_gate:
+                    cost[i, j] = 1.0  # hard reject -- see this function's own doc comment
 
     row_idx, col_idx = linear_sum_assignment(cost)
     matches, matched_rows, matched_cols = [], set(), set()
@@ -342,6 +664,8 @@ class ByteTracker:
         appearance_thresh: float = DEFAULT_APPEARANCE_THRESHOLD,
         appearance_eligibility_scale: float = DEFAULT_APPEARANCE_ELIGIBILITY_SCALE,
         use_gmc: bool = False,
+        flow_gate_scale: float = DEFAULT_FLOW_GATE_SCALE,
+        depth_ratio_gate: float = DEFAULT_DEPTH_RATIO_GATE,
     ):
         self.iou_threshold = iou_threshold
         self.max_age = max_age
@@ -352,12 +676,27 @@ class ByteTracker:
         self.appearance_thresh = appearance_thresh
         self.appearance_eligibility_scale = appearance_eligibility_scale
         self.gmc = GMC() if use_gmc else None
+        self.flow_gate_scale = flow_gate_scale
+        self.depth_ratio_gate = depth_ratio_gate
         self.tracks: list = []
         self._next_id = 1
+
+    def get_track(self, track_id: int) -> "Track | None":
+        """Look up a live track by id -- for a caller (e.g.
+        reconstruct_annotated.py) that wants a track's own smoothed state
+        (flow_z, flow_velocity, ...) right after update() returns, without
+        update()'s own return signature needing to grow and break existing
+        callers that only expect the plain track-id list. Safe to call
+        immediately after update(): a track just matched this call has
+        time_since_update == 0, so it can't have been pruned yet."""
+        return next((t for t in self.tracks if t.id == track_id), None)
 
     def update(
         self, detections: list, frame: np.ndarray = None, embeddings: list = None,
         gmc_warp: np.ndarray = None, frame_shape: tuple = None,
+        capture_time: float = None, ego_speed_mps: float = None, yaw_rate_deg_s: float = None,
+        pitch_rate_deg_s: float = None, roll_rate_deg_s: float = None, aspect: float = None,
+        detection_depths: list = None,
     ) -> list:
         """detections: this frame's list of {label, confidence, x, y, w, h}.
         `frame` (a BGR image, e.g. from cv2) is only needed for appearance
@@ -374,6 +713,20 @@ class ByteTracker:
         state, so pass `frame_shape` (h, w) explicitly when reusing a warp
         this way without also having the actual frame (a video's resolution
         is constant for its whole session, so this only needs setting once).
+
+        The flow-based matching gate (see _predicted_track_box/_match) is
+        OPTIONAL and entirely inert unless capture_time, ego_speed_mps,
+        yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s, and aspect are
+        ALL given (matching the same "returns None if any required signal
+        is missing" discipline predicted_flow_angular_raw's caller already
+        follows in reconstruct_annotated.py) -- existing callers that don't
+        pass these keep today's IoU/appearance-only behavior unchanged.
+        `detection_depths` (parallel to `detections`, entries may be None)
+        overrides each detection's own distanceMeters for this purpose --
+        pass corrected_distance_meters's output here to get the benefit of
+        that edge-truncation fix too; omitted, falls back to
+        detections[i].get("distanceMeters") directly.
+
         Returns a list the same length/order as `detections`, each entry the
         assigned track ID (int) or None if it matched nothing and didn't
         spawn a new track (only possible for a low-confidence detection)."""
@@ -396,6 +749,30 @@ class ByteTracker:
                 raw = self.reid_encoder(frame, pixel_boxes)
                 embeddings = [None if e is None else np.asarray(e, dtype=float) for e in raw]
 
+        # Flow-gate bookkeeping -- computed once per update() call, not per
+        # label/match-stage below. track_predictions/track_depths are
+        # parallel to self.tracks; det_angular/det_depths are parallel to
+        # detections.
+        track_predictions = [
+            _predicted_track_box(t, capture_time, ego_speed_mps, yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s, aspect)
+            for t in self.tracks
+        ]
+        track_depths = [_predicted_track_depth(t, capture_time) for t in self.tracks]
+        det_depths = detection_depths if detection_depths is not None else [d.get("distanceMeters") for d in detections]
+        det_angular = [
+            angular_coords(d["x"] + d["w"] / 2, d["y"] + d["h"], aspect) if aspect is not None else None
+            for d in detections
+        ]
+
+        def _record_flow(track: Track, det_idx: int) -> None:
+            if capture_time is None or det_angular[det_idx] is None or det_depths[det_idx] is None:
+                return
+            x, y = det_angular[det_idx]
+            track.update_flow_state(
+                x, y, det_depths[det_idx], capture_time,
+                ego_speed_mps, yaw_rate_deg_s, pitch_rate_deg_s, roll_rate_deg_s,
+            )
+
         track_ids_out = [None] * len(detections)
         high_idxs = [i for i, d in enumerate(detections) if d["confidence"] >= self.high_conf_threshold]
         low_idxs = [
@@ -413,12 +790,17 @@ class ByteTracker:
 
             track_boxes = [self.tracks[i].kf.box for i in track_idxs]
             track_feats = [self.tracks[i].feat for i in track_idxs]
+            track_preds = [track_predictions[i] for i in track_idxs]
+            track_deps = [track_depths[i] for i in track_idxs]
             det_boxes = [detections[i] for i in label_high_idxs]
             det_feats = [embeddings[i] for i in label_high_idxs]
+            det_deps = [det_depths[i] for i in label_high_idxs]
             matches, unmatched_t, unmatched_d = _match(
                 track_boxes, det_boxes, self.iou_threshold,
                 track_feats=track_feats, det_feats=det_feats, appearance_thresh=self.appearance_thresh,
                 appearance_eligibility_scale=self.appearance_eligibility_scale,
+                track_predicted_boxes=track_preds, flow_gate_scale=self.flow_gate_scale,
+                track_depths=track_deps, det_depths=det_deps, depth_ratio_gate=self.depth_ratio_gate,
             )
 
             for t_local, d_local in matches:
@@ -430,6 +812,7 @@ class ByteTracker:
                 track.hits += 1
                 track.time_since_update = 0
                 track_ids_out[det_idx] = track.id
+                _record_flow(track, det_idx)
 
             # Second stage: remaining unmatched tracks of this label vs.
             # this frame's low-confidence detections of this label.
@@ -437,12 +820,17 @@ class ByteTracker:
             label_low_idxs = [i for i in low_idxs if detections[i]["label"] == label]
             track_boxes2 = [self.tracks[i].kf.box for i in remaining_track_idxs]
             track_feats2 = [self.tracks[i].feat for i in remaining_track_idxs]
+            track_preds2 = [track_predictions[i] for i in remaining_track_idxs]
+            track_deps2 = [track_depths[i] for i in remaining_track_idxs]
             det_boxes2 = [detections[i] for i in label_low_idxs]
             det_feats2 = [embeddings[i] for i in label_low_idxs]
+            det_deps2 = [det_depths[i] for i in label_low_idxs]
             matches2, unmatched_t2, _ = _match(
                 track_boxes2, det_boxes2, self.iou_threshold,
                 track_feats=track_feats2, det_feats=det_feats2, appearance_thresh=self.appearance_thresh,
                 appearance_eligibility_scale=self.appearance_eligibility_scale,
+                track_predicted_boxes=track_preds2, flow_gate_scale=self.flow_gate_scale,
+                track_depths=track_deps2, det_depths=det_deps2, depth_ratio_gate=self.depth_ratio_gate,
             )
 
             still_unmatched_local = set(range(len(remaining_track_idxs)))
@@ -455,6 +843,7 @@ class ByteTracker:
                 track.time_since_update = 0
                 track_ids_out[det_idx] = track.id
                 still_unmatched_local.discard(t_local)
+                _record_flow(track, det_idx)
 
             for t_local in still_unmatched_local:
                 track = self.tracks[remaining_track_idxs[t_local]]
@@ -469,6 +858,56 @@ class ByteTracker:
                 self._next_id += 1
                 self.tracks.append(new_track)
                 track_ids_out[det_idx] = new_track.id
+                track_predictions.append(None)  # keeps track_predictions parallel to self.tracks
+                track_depths.append(None)  # keeps track_depths parallel to self.tracks too
+                _record_flow(new_track, det_idx)
+
+        # Confusable-label rescue -- see CONFUSABLE_LABELS's doc comment.
+        # Runs after every label's normal matching above, so it only sees
+        # tracks genuinely unmatched this frame (time_since_update was just
+        # incremented, not reset) and detections no other label's pass
+        # already claimed. On a match, geometry/appearance update as
+        # normal, but track.label is deliberately left untouched -- the
+        # track's own established identity is trusted over one ambiguous
+        # frame's guess. Only high-confidence detections may rescue, same
+        # "less reliable signal" reasoning as new-track spawning above.
+        for from_label, to_labels in CONFUSABLE_LABELS.items():
+            rescue_track_idxs = [
+                i for i, t in enumerate(self.tracks) if t.label == from_label and t.time_since_update > 0
+            ]
+            if not rescue_track_idxs:
+                continue
+            rescue_det_idxs = [
+                i for i, d in enumerate(detections)
+                if track_ids_out[i] is None and d["label"] in to_labels and d["confidence"] >= self.high_conf_threshold
+            ]
+            if not rescue_det_idxs:
+                continue
+
+            track_boxes = [self.tracks[i].kf.box for i in rescue_track_idxs]
+            track_feats = [self.tracks[i].feat for i in rescue_track_idxs]
+            track_preds = [track_predictions[i] for i in rescue_track_idxs]
+            track_deps = [track_depths[i] for i in rescue_track_idxs]
+            det_boxes = [detections[i] for i in rescue_det_idxs]
+            det_feats = [embeddings[i] for i in rescue_det_idxs]
+            det_deps = [det_depths[i] for i in rescue_det_idxs]
+            matches, _, _ = _match(
+                track_boxes, det_boxes, self.iou_threshold,
+                track_feats=track_feats, det_feats=det_feats, appearance_thresh=self.appearance_thresh,
+                appearance_eligibility_scale=self.appearance_eligibility_scale,
+                track_predicted_boxes=track_preds, flow_gate_scale=self.flow_gate_scale,
+                track_depths=track_deps, det_depths=det_deps, depth_ratio_gate=self.depth_ratio_gate,
+            )
+            for t_local, d_local in matches:
+                track = self.tracks[rescue_track_idxs[t_local]]
+                det_idx = rescue_det_idxs[d_local]
+                track.kf.update(detections[det_idx])
+                if embeddings[det_idx] is not None:
+                    track.update_feat(embeddings[det_idx])
+                track.hits += 1
+                track.time_since_update = 0
+                track_ids_out[det_idx] = track.id
+                _record_flow(track, det_idx)
 
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
 

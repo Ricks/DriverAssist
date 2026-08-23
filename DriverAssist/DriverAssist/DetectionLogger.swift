@@ -61,6 +61,13 @@ struct DetectionLogEntry: Codable {
     let elapsedMs: Double
     let lowLightEnabled: Bool
     let autoLowLightEnabled: Bool
+    // Normal-AE testing mode -- bypasses this app's own exposure tuning
+    // (bias AND restrictMaxExposureDuration's 1/60s cap), see
+    // CameraManager.setNormalAE's doc comment. Added 2026-08-22 so a
+    // later analysis can tell which frames were captured under stock AE
+    // vs. this app's own tuning, e.g. to check whether it's a factor in
+    // poor night detection recall.
+    let normalAEEnabled: Bool
     let stabilizationEnabled: Bool
     // Whether ContentView's parameter lock was active for this entry -- lets
     // a session that was supposed to run locked (the standard pre-drive
@@ -129,6 +136,16 @@ struct DetectionLogEntry: Codable {
     // validated/retuned against a real turn in a FUTURE drive without
     // needing to guess from the raw signal alone.
     let smoothedYawRateDegreesPerSecond: Double?
+    // Pitch/roll rate, deg/s -- finite-differenced from pitchDegrees/
+    // rollDegrees rather than projected through rotationRate/attitude the
+    // way yaw is (those two are already gravity-relative, heading-
+    // independent, so differencing them directly is exact -- see
+    // PitchSensor.pitchRateDegreesPerSecond's doc comment). Raw logged
+    // alongside smoothed for the same EMA cross-check reasoning as yaw.
+    let pitchRateDegreesPerSecond: Double?
+    let rollRateDegreesPerSecond: Double?
+    let smoothedPitchRateDegreesPerSecond: Double?
+    let smoothedRollRateDegreesPerSecond: Double?
     // Same gravity-derived, non-drifting property as pitch -- see PitchSensor.swift.
     let rollDegrees: Double?
     // Same idea as pitchDriftDegrees/referencePitchDegrees above, for roll.
@@ -188,6 +205,7 @@ enum DetectionLogger {
         elapsedMs: Double,
         lowLightEnabled: Bool,
         autoLowLightEnabled: Bool,
+        normalAEEnabled: Bool,
         stabilizationEnabled: Bool,
         parametersLocked: Bool,
         trackingLevel: String,
@@ -205,6 +223,10 @@ enum DetectionLogger {
         rotationRateZDegreesPerSecond: Double?,
         yawRateDegreesPerSecond: Double?,
         smoothedYawRateDegreesPerSecond: Double?,
+        pitchRateDegreesPerSecond: Double?,
+        rollRateDegreesPerSecond: Double?,
+        smoothedPitchRateDegreesPerSecond: Double?,
+        smoothedRollRateDegreesPerSecond: Double?,
         rollDegrees: Double?,
         rollDriftDegrees: Double?,
         referenceRollDegrees: Double?,
@@ -226,6 +248,7 @@ enum DetectionLogger {
             elapsedMs: elapsedMs,
             lowLightEnabled: lowLightEnabled,
             autoLowLightEnabled: autoLowLightEnabled,
+            normalAEEnabled: normalAEEnabled,
             stabilizationEnabled: stabilizationEnabled,
             parametersLocked: parametersLocked,
             trackingLevel: trackingLevel,
@@ -245,6 +268,10 @@ enum DetectionLogger {
             rotationRateZDegreesPerSecond: rotationRateZDegreesPerSecond,
             yawRateDegreesPerSecond: yawRateDegreesPerSecond,
             smoothedYawRateDegreesPerSecond: smoothedYawRateDegreesPerSecond,
+            pitchRateDegreesPerSecond: pitchRateDegreesPerSecond,
+            rollRateDegreesPerSecond: rollRateDegreesPerSecond,
+            smoothedPitchRateDegreesPerSecond: smoothedPitchRateDegreesPerSecond,
+            smoothedRollRateDegreesPerSecond: smoothedRollRateDegreesPerSecond,
             rollDegrees: rollDegrees,
             rollDriftDegrees: rollDriftDegrees,
             referenceRollDegrees: referenceRollDegrees,

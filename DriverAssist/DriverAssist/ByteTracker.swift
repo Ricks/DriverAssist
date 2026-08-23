@@ -61,6 +61,28 @@ final class ByteTracker {
     private let gmc: GMC?
     private let embedder: AppearanceEmbedder?
 
+    /// Label pairs whose real-world class boundary this detector can lose
+    /// entirely from a single viewpoint -- added 2026-08-22 in response to a
+    /// real, reported gap: a cyclist viewed head-on collapses to almost no
+    /// bicycle-discriminative signal (no side profile, wheels overlap into a
+    /// sliver), so the detector can genuinely stop emitting "bicycle" boxes
+    /// for that whole stretch, sometimes surfacing the same physical object
+    /// as "person" instead. Per-label matching (see `update` below) means a
+    /// "person" detection can NEVER match a "bicycle" track on its own --
+    /// without this, that track either dies once `maxAge` passes (losing its
+    /// distance/velocity history right as the object gets closest) or the
+    /// object briefly becomes a brand-new "person" track. See the
+    /// confusable-label rescue pass at the end of `update` for how this is
+    /// used -- deliberately NOT a general "any label may rescue any label"
+    /// mechanism (that would risk exactly the kind of false continuation
+    /// `maxAge`'s own tuning history already warned against), just this one
+    /// evidenced pair. Symmetric (either label may rescue the other) since
+    /// there's no reason to think the confusion only runs one direction.
+    private static let confusableLabels: [String: Set<String>] = [
+        "bicycle": ["person"],
+        "person": ["bicycle"],
+    ]
+
     /// Wall-clock time of the previous `update` call -- used only to size the
     /// yaw-rate fallback transform below (needs an actual elapsed-seconds dt,
     /// not an assumed fixed frame interval, since inference cadence isn't
@@ -239,6 +261,43 @@ final class ByteTracker {
                 nextID += 1
                 tracks.append(newTrack)
                 trackIDsOut[detIdx] = newTrack.id
+            }
+        }
+
+        // Confusable-label rescue -- see `confusableLabels`'s doc comment.
+        // Runs after every label's normal matching above, so it only sees
+        // tracks genuinely unmatched this frame (`timeSinceUpdate` was just
+        // incremented, not reset) and detections no other label's pass
+        // already claimed. On a match, geometry/appearance update as
+        // normal, but `track.label` is deliberately left untouched -- the
+        // track's own established identity (built from its real,
+        // confidently-classified hits) is trusted over one ambiguous
+        // frame's guess. Only high-confidence detections may rescue, same
+        // "less reliable signal" reasoning as new-track spawning above.
+        for (fromLabel, toLabels) in Self.confusableLabels {
+            let rescueTrackIdxs = tracks.indices.filter { tracks[$0].label == fromLabel && tracks[$0].timeSinceUpdate > 0 }
+            guard !rescueTrackIdxs.isEmpty else { continue }
+            let rescueDetIdxs = detections.indices.filter {
+                trackIDsOut[$0] == nil
+                    && toLabels.contains(detections[$0].label)
+                    && Double(detections[$0].confidence) >= highConfThreshold
+            }
+            guard !rescueDetIdxs.isEmpty else { continue }
+
+            let trackBoxes = rescueTrackIdxs.map { tracks[$0].kf.box }
+            let trackFeats = rescueTrackIdxs.map { tracks[$0].feat }
+            let detBoxes = rescueDetIdxs.map { TrackedBox(detections[$0].boundingBox) }
+            let detFeats = rescueDetIdxs.map { embeddings[$0] }
+
+            let rescue = match(trackBoxes: trackBoxes, detBoxes: detBoxes, trackFeats: trackFeats, detFeats: detFeats)
+            for (tLocal, dLocal) in rescue.matches {
+                let track = tracks[rescueTrackIdxs[tLocal]]
+                let detIdx = rescueDetIdxs[dLocal]
+                track.kf.update(with: TrackedBox(detections[detIdx].boundingBox))
+                if let feat = embeddings[detIdx] { track.updateFeat(feat) }
+                track.hits += 1
+                track.timeSinceUpdate = 0
+                trackIDsOut[detIdx] = track.id
             }
         }
 
