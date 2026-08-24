@@ -21,10 +21,14 @@
 
 import Foundation
 
-/// Real per-class object width mean/std, computed from actual KITTI
+/// Real per-class object width/height mean/std, computed from actual KITTI
 /// training labels (7,481 images, 28,742 Car / 4,487 Pedestrian instances --
-/// not estimated or guessed). Only classes with a direct, well-matched
-/// width prior are included:
+/// not estimated or guessed; height added 2026-08-23 from the same label
+/// set's own 3D `dimensions` field, alongside the original width --
+/// re-extracting width from that same field reproduced the original
+/// 1.629/0.102 car and 0.660/0.143 person numbers exactly, confirming this
+/// is the same source data, not a second guess). Only classes with a
+/// direct, well-matched prior are included:
 ///   - KITTI "Car" -> YOLO "car".
 ///   - KITTI "Pedestrian" -> YOLO "person".
 /// Deliberately NOT extended to:
@@ -42,11 +46,52 @@ enum ObjectWidthPriors {
     struct Width {
         let meanMeters: Double
         let stdMeters: Double
+        /// Real per-class HEIGHT mean, meters -- added alongside
+        /// `meanMeters`/`stdMeters` specifically so `expectedHeadOnAspect`
+        /// below has a real width/height ratio to compare a box's own
+        /// aspect ratio against (see WidthDistanceOverrideManager's
+        /// obliqueness gate for why: pixel aspect ratio = realWidth/
+        /// realHeight is only true for a genuine head-on/tail-on view, a
+        /// CONFIRMED 2026-08-23 real-drive failure mode, see
+        /// project_width_based_distance_override memory).
+        let heightMeanMeters: Double
+        let heightStdMeters: Double
+        /// How much wider than `expectedHeadOnAspect` a real box may be
+        /// before WidthDistanceOverrideManager's obliqueness gate rejects
+        /// it -- PER-CLASS because a rigid, elongated body (car) departs
+        /// from its head-on aspect ratio far less from ordinary detector
+        /// noise than a walking human does (gait/arm-swing/clothing).
+        /// CONFIRMED 2026-08-23 empirically for "person": replaying every
+        /// already-known-good override activation from the real
+        /// data/26_08_15_Walkaround validation session's 3m window (61
+        /// frames, the same window documented in this file's own history
+        /// as correctly activating 27/29 + 10/14 real frames) against
+        /// candidate tolerances -- 1.4 preserved only 64% of that
+        /// genuinely-good real data, 1.8 preserves 98% (60/61), 1.9+
+        /// preserves all 61 but stops rejecting anything meaningfully.
+        /// 1.8 is the chosen balance. "car" has NO equivalent real
+        /// known-good head-on validation session yet (the 08-15 walkaround
+        /// test used a person) -- 1.4 for car is validated only against
+        /// the CONFIRMED-BAD case (track #37, data/26_08_21_Day_Small,
+        /// observed aspect 1.75-2.85 vs expected 1.067, comfortably
+        /// rejected at any tolerance under ~1.6), not yet checked for a
+        /// false-positive rejection rate the way person's is -- real
+        /// head-on car validation data would let this be tightened or
+        /// loosened with actual evidence instead of a guess.
+        let aspectTolerance: Double
+
+        /// The pixel-space box aspect ratio (width/height) a genuine
+        /// head-on/tail-on view of this class should show, independent of
+        /// distance -- see WidthDistanceOverrideManager's obliqueness gate
+        /// doc comment for the full derivation (both box dimensions share
+        /// the same per-pixel focal length in this camera model, so the
+        /// distance term cancels out of the ratio).
+        var expectedHeadOnAspect: Double { meanMeters / heightMeanMeters }
     }
 
     static let byLabel: [String: Width] = [
-        "car": Width(meanMeters: 1.629, stdMeters: 0.102),
-        "person": Width(meanMeters: 0.660, stdMeters: 0.143),
+        "car": Width(meanMeters: 1.629, stdMeters: 0.102, heightMeanMeters: 1.526, heightStdMeters: 0.137, aspectTolerance: 1.4),
+        "person": Width(meanMeters: 0.660, stdMeters: 0.143, heightMeanMeters: 1.761, heightStdMeters: 0.113, aspectTolerance: 1.8),
     ]
 }
 
@@ -118,6 +163,11 @@ final class WidthDistanceOverrideManager {
     /// candidate this far out is never something the override should be
     /// deciding between, regardless of which formula produced it.
     private static let maxPlausibleDistanceMeters: Double = 150
+    /// Minimum |smoothedYawRateDegreesPerSecond| before the obliqueness
+    /// check in `evaluateGate` even runs -- see that check's own NEW
+    /// 2026-08-23 comment for the two real cases (a confirmed bug and a
+    /// confirmed false positive) this threshold was reasoned from.
+    private static let minYawRateForObliquenessCheckDegS: Double = 1.0
     /// How close to the LEFT/RIGHT frame edge (normalized [0,1] fraction)
     /// a box may sit before it's treated as edge-truncated and rejected --
     /// see the CONFIRMED comment in `evaluateGate`. Not an exact 0.0/1.0
@@ -163,11 +213,15 @@ final class WidthDistanceOverrideManager {
     ///
     /// `cameraHeightMeters`/`aspectRatio` match `DistanceEstimator
     /// .distanceMeters`'s own parameters -- pass the same values used to
-    /// produce this frame's row-based readings.
+    /// produce this frame's row-based readings. `yawRateDegreesPerSecond`
+    /// gates the obliqueness check specifically -- see evaluateGate's own
+    /// doc comment on why a stationary/non-turning ego can't be the cause
+    /// of the viewing-angle distortion that check exists to catch.
     func apply(
         to detections: [Detection],
         cameraHeightMeters: Double,
-        aspectRatio: Double
+        aspectRatio: Double,
+        yawRateDegreesPerSecond: Double?
     ) -> [Detection] {
         var seenTrackIDs = Set<Int>()
 
@@ -180,7 +234,8 @@ final class WidthDistanceOverrideManager {
             let gatePassed = evaluateGate(
                 &detection,
                 cameraHeightMeters: cameraHeightMeters,
-                aspectRatio: aspectRatio
+                aspectRatio: aspectRatio,
+                yawRateDegreesPerSecond: yawRateDegreesPerSecond
             )
 
             if gatePassed {
@@ -227,7 +282,8 @@ final class WidthDistanceOverrideManager {
     private func evaluateGate(
         _ detection: inout Detection,
         cameraHeightMeters: Double,
-        aspectRatio: Double
+        aspectRatio: Double,
+        yawRateDegreesPerSecond: Double?
     ) -> Bool {
         guard
             let rowDistance = detection.distanceMeters,
@@ -265,6 +321,90 @@ final class WidthDistanceOverrideManager {
         let isEdgeTruncated = Double(detection.boundingBox.minX) <= Self.edgeTruncationMarginNormalized
             || Double(detection.boundingBox.maxX) >= 1.0 - Self.edgeTruncationMarginNormalized
         guard !isEdgeTruncated else { return false }
+
+        // NEW 2026-08-23, CONFIRMED via real drive (data/26_08_21_Day_Small,
+        // track #37 in this session's raw log -- rendered as #24 in the
+        // offline flow-arrow video, which reruns its own separate tracker
+        // offline and assigns its own IDs -- ~107-110s): `widthBasedDistanceMeters` assumes the
+        // box's pixel width IS the class's real width (ObjectWidthPriors),
+        // which only holds for a genuine head-on/tail-on view. A parked
+        // car swept across frame by the ego vehicle's own yaw during a
+        // slow turn was viewed at a persistent oblique/quartering angle
+        // instead, and its box picked up foreshortened LENGTH on top of
+        // width -- the override read it as ~2x closer than a real,
+        // independently-recomputed row-based/ground-contact distance,
+        // consistent the entire ~1.5s window, not a one-frame fluke. Fed
+        // into the offline flow-arrow visualization's 1/z term, this
+        // produced a predicted flow ~1.9x too large and a large spurious
+        // "independent motion" residual on an object later confirmed
+        // (via the source video) to never have moved at all.
+        //
+        // Gate: pixel-space box aspect ratio (width/height) equals
+        // realWidth/realHeight ONLY for a head-on/tail-on view, because
+        // both box dimensions share the same per-pixel focal length in
+        // this camera model (DistanceEstimator's column focal length is
+        // derived from the row focal length via `aspectRatio`, which
+        // cancels out of the ratio once both dimensions are converted to
+        // pixels) -- confirmed against track #37's own numbers: observed
+        // pixel aspect ~2.85 vs car's expected head-on ~1.07, a ~2.7x
+        // inflation, matching the ~2x distance understatement closely
+        // enough to be the same effect, not a coincidence. As viewing
+        // angle rotates away from head-on toward broadside, foreshortened
+        // length can only ADD to the visible footprint width (height is
+        // unaffected by a yaw rotation of the object), so pixel aspect
+        // ratio can only grow above the head-on value -- one-directional,
+        // same design as every other gate in this file.
+        //
+        // NEW 2026-08-23, CONFIRMED FALSE POSITIVE via the same real
+        // session (data/26_08_21_Day_Small, track #13 in the raw log,
+        // t~0s): a genuinely PARKED, dead-ahead car (confirmed via the
+        // source frame -- squarely facing the camera) was rejected by this
+        // check anyway (observed pixel aspect 2.36 vs a ~1.49 threshold),
+        // because its box height came out short for a reason that has
+        // NOTHING to do with viewing angle: it sat right at the edge of
+        // the near-field regime (row-based phi 8.97 degrees, just 0.93
+        // degrees under `DistanceEstimator.hoodCutoffAngleDegrees` =
+        // 9.899), close enough that the ego's own hood/dash edge was
+        // already encroaching on its visible bottom without (yet) crossing
+        // the HARD cutoff the hood-truncation case above catches.
+        // Rejecting it substituted a WORSE row-based reading (6.45m) for a
+        // width-based one (3.03m) that was correct -- confirmed against a
+        // real user report that the car was right in front of the
+        // vehicle, not ~6m away.
+        //
+        // The oblique-view mechanism above REQUIRES the camera to be
+        // rotating relative to the object -- a foreshortened, more-square
+        // box only appears as viewing angle sweeps away from head-on. At
+        // this false positive's own timestamp, smoothedYawRateDegreesPer
+        // Second was ~0.003 deg/s and egoSpeedMps was 0 (parked, not
+        // turning) -- nothing could have been rotating the view. The
+        // confirmed-BAD case (track #37 above) only ever showed this
+        // failure mode while yaw rate was ramping through 2.6-6.2 deg/s.
+        // A yaw-rate floor separates the two real cases with wide margin,
+        // so the check below only runs when the ego is actually turning
+        // meaningfully -- PROVISIONAL threshold, reasoned from these two
+        // real cases, not yet validated against a wider set.
+        //
+        // KNOWN REMAINING GAP: this doesn't catch a car viewed at a
+        // genuinely constant oblique angle from a STATIONARY or
+        // straight-driving ego (no yaw at all, but the object itself sits
+        // at an angle to the road) -- untested territory, left for
+        // whenever real data surfaces it, same "don't fix what isn't
+        // confirmed yet" discipline as the rest of this file.
+        if let yawRate = yawRateDegreesPerSecond, abs(yawRate) >= Self.minYawRateForObliquenessCheckDegS {
+            let boxHeightNormalized = Double(detection.boundingBox.height)
+            guard boxHeightNormalized > 0 else { return false }
+            // (width/height in NORMALIZED units) * aspectRatio ==
+            // width/height in actual PIXELS -- normalizing divides width
+            // by frame width and height by frame height, so their ratio is
+            // off by exactly frameWidthPx/frameHeightPx (== aspectRatio)
+            // from the true pixel ratio; multiplying back by aspectRatio
+            // here undoes that.
+            let observedPixelAspect = (boxWidth / boxHeightNormalized) * aspectRatio
+            guard observedPixelAspect <= prior.expectedHeadOnAspect * prior.aspectTolerance else {
+                return false
+            }
+        }
 
         // CONFIRMED 2026-08-16 (real test drive): the trigger below is a pure
         // RATIO comparison (is width closer than row) -- it has no absolute

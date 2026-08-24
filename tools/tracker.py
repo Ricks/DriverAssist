@@ -75,6 +75,7 @@ tilt is corrected this way; forward-motion parallax needs per-object depth
 to compensate properly and isn't attempted.
 """
 import argparse
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -207,6 +208,56 @@ same new value repeating over several frames) still gets incorporated,
 just gradually, exactly like a real closing/opening trend should be. A
 reasoned starting point, not yet validated against a wider set of real
 matches."""
+
+# NEW 2026-08-23: per-class steady-state smoothing for flow_velocity (the
+# object's own ego-motion-subtracted independent motion), replacing the
+# single flat FLOW_VELOCITY_SMOOTHING for THIS signal specifically (that
+# constant is left alone for flow_depth_rate above, a different signal).
+# Grounded in real vehicle/pedestrian inertia, not guessed: a car's true
+# independent velocity is tire-grip-bounded and cannot swing meaningfully
+# within one ~0.13s detection interval, so a heavier blend doesn't cost
+# real responsiveness -- solving alpha=exp(-dt/tau) backwards, the
+# PREVIOUS flat 0.5 implied a ~0.19s memory, which suits a pedestrian
+# (a single step can meaningfully redirect a walking person) far better
+# than a car (which needs closer to a ~0.5s memory to avoid mistaking
+# ordinary per-frame box-fit jitter for a real maneuver). Classes with no
+# entry fall back to FLOW_VELOCITY_SMOOTHING_DEFAULT (today's original
+# 0.5, i.e. unchanged behavior for anything untuned). PROVISIONAL --
+# reasoned from physical inertia, not yet validated against a wide set of
+# real per-class motion traces the way this project's own constants
+# eventually get checked; see project_width_based_distance_override
+# memory's "narrow EMA+gate" decision writeup for the fuller reasoning.
+FLOW_VELOCITY_SMOOTHING_BY_LABEL = {
+    "car": 0.78, "truck": 0.78, "bus": 0.78,
+    "bicycle": 0.6, "motorcycle": 0.6,
+    "person": 0.5,
+}
+FLOW_VELOCITY_SMOOTHING_DEFAULT = FLOW_VELOCITY_SMOOTHING
+
+# NEW 2026-08-23: hard, CLASS-INDEPENDENT physical ceiling on a road user's
+# own acceleration (~1g -- tire-grip/traction limited for a vehicle, and no
+# pedestrian or cyclist realistically exceeds it either), used to catch a
+# GROSS single-frame outlier in flow_velocity's residual regardless of
+# class -- deliberately NOT class-scaled the way the steady-state alpha
+# above is: the everyday-jitter smoothing should differ per class (how
+# fast REAL motion plausibly evolves), but "physically impossible for
+# ANY road user" is one line, not many. EMPIRICALLY CHECKED 2026-08-23
+# against the real, confirmed-stationary track (data/26_08_21_Day_Small,
+# track #37) AFTER the width-override obliqueness fix: its remaining
+# frame-to-frame residual implied ~1.5-4 m/s^2 -- comfortably BELOW this
+# ceiling, confirming the ceiling alone can't (and isn't meant to) clean
+# up ordinary jitter of that scale; it only catches the kind of gross,
+# multi-g jump the PRE-fix version of that same case showed (a residual
+# implying an order of magnitude more). That's why this exists alongside
+# the per-class alpha above, not instead of it -- see the same design
+# writeup referenced above for why a gate alone is insufficient.
+FLOW_VELOCITY_OUTLIER_ACCEL_MPS2 = 9.8
+# Same distrust level as FLOW_DEPTH_OUTLIER_SMOOTHING, same rationale: a
+# single reading that implies impossible physics shouldn't move the
+# estimate much, but a genuinely sustained trend (e.g. a real bad box
+# persisting across a truncation/hysteresis boundary) still gets
+# incorporated, just slowly.
+FLOW_VELOCITY_OUTLIER_SMOOTHING = FLOW_DEPTH_OUTLIER_SMOOTHING
 
 # Max allowed ratio between a track's last known depth and a candidate
 # detection's own depth before the pair is rejected outright -- a SEPARATE
@@ -486,7 +537,27 @@ class Track:
                 )
                 residual_u = (x - self.flow_pos[0]) / dt - ego_u
                 residual_v = (y - self.flow_pos[1]) / dt - ego_v
-                alpha = FLOW_VELOCITY_SMOOTHING
+                alpha = FLOW_VELOCITY_SMOOTHING_BY_LABEL.get(self.label, FLOW_VELOCITY_SMOOTHING_DEFAULT)
+                # Physical-plausibility outlier check, same "one bad
+                # reading shouldn't dominate" pattern as flow_z's own
+                # depth_ratio gate above, but in real m/s^2 rather than a
+                # unitless ratio -- depth has a natural ratio scale
+                # (how much CAN distance change proportionally), velocity
+                # doesn't (a residual near zero has no meaningful ratio to
+                # take), so this converts the disagreement between the new
+                # reading and the current estimate to a linear
+                # acceleration via the track's own depth (angular rate *
+                # distance ~= linear rate, first-order) before comparing
+                # against FLOW_VELOCITY_OUTLIER_ACCEL_MPS2's physical
+                # ceiling -- see that constant's own doc comment for why
+                # this alone isn't sufficient (real jitter can sit under
+                # the ceiling too), only necessary.
+                implied_accel = (
+                    math.hypot(residual_u - self.flow_velocity[0], residual_v - self.flow_velocity[1])
+                    * self.flow_z / dt
+                )
+                if implied_accel > FLOW_VELOCITY_OUTLIER_ACCEL_MPS2:
+                    alpha = FLOW_VELOCITY_OUTLIER_SMOOTHING
                 self.flow_velocity = (
                     alpha * self.flow_velocity[0] + (1 - alpha) * residual_u,
                     alpha * self.flow_velocity[1] + (1 - alpha) * residual_v,

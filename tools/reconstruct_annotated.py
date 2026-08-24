@@ -105,6 +105,35 @@ LABEL_TEXT_FG_BGR = (0, 0, 0)
 LABEL_TEXT_PAD = 3
 
 
+def _blend_translucent_rect(frame, top_left: tuple, bottom_right: tuple, color_bgr, alpha: float) -> None:
+    """Alpha-blends a solid color_bgr fill into frame[top_left:bottom_right]
+    IN PLACE, cropped to just that rectangle (clamped to the frame's own
+    bounds) -- NOT a whole-frame copy+addWeighted.
+
+    CONFIRMED 2026-08-23 via profiling (cProfile over a real 60s/900-frame
+    render): the original approach both draw_label_text and draw_tint used
+    (`overlay = frame.copy()`; `cv2.addWeighted(overlay, alpha, frame, ...,
+    dst=frame)`) copies and blends the ENTIRE 1920x1080 frame to change a
+    caption/tint rectangle that's typically a few thousand pixels -- 31.6%
+    of this file's total render time (23.8% in addWeighted itself, 7.8% in
+    the .copy() feeding it), more than the ReID model's own inference cost.
+    Slicing a VIEW into `frame` first (not a copy -- `region` shares
+    `frame`'s underlying memory) and blending only that crop is the
+    identical visual result at a small fraction of the pixel count, not a
+    behavior change. Silently does nothing for a rectangle that clamps to
+    zero area (fully off-frame), matching cv2.rectangle's own tolerance for
+    off-frame coordinates rather than raising."""
+    h, w = frame.shape[:2]
+    x0, y0 = max(0, min(w, top_left[0])), max(0, min(h, top_left[1]))
+    x1, y1 = max(0, min(w, bottom_right[0])), max(0, min(h, bottom_right[1]))
+    if x1 <= x0 or y1 <= y0:
+        return
+    region = frame[y0:y1, x0:x1]
+    overlay = np.empty_like(region)
+    overlay[:] = color_bgr
+    cv2.addWeighted(overlay, alpha, region, 1 - alpha, 0, dst=region)
+
+
 def draw_label_text(frame, text: str, x: int, y: int, font_scale: float = 0.6, thickness: int = 1) -> None:
     """Draws `text` with its baseline at (x, y) (same origin convention as
     cv2.putText) on a translucent white backing rectangle sized to the text
@@ -114,20 +143,19 @@ def draw_label_text(frame, text: str, x: int, y: int, font_scale: float = 0.6, t
     (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     top_left = (x - LABEL_TEXT_PAD, y - th - LABEL_TEXT_PAD)
     bottom_right = (x + tw + LABEL_TEXT_PAD, y + baseline + LABEL_TEXT_PAD)
-    overlay = frame.copy()
-    cv2.rectangle(overlay, top_left, bottom_right, LABEL_TEXT_BG_BGR, -1)
-    cv2.addWeighted(overlay, LABEL_TEXT_BG_ALPHA, frame, 1 - LABEL_TEXT_BG_ALPHA, 0, dst=frame)
+    _blend_translucent_rect(frame, top_left, bottom_right, LABEL_TEXT_BG_BGR, LABEL_TEXT_BG_ALPHA)
     cv2.putText(frame, text, (x, y), font, font_scale, LABEL_TEXT_FG_BGR, thickness, cv2.LINE_AA)
 
 
-def draw_box(frame, det: dict, track_id=None) -> None:
+def draw_box(frame, det: dict, track_id=None, distance_meters: Optional[float] = None) -> None:
     h, w = frame.shape[:2]
     x, y = int(det["x"] * w), int(det["y"] * h)
     bw, bh = int(det["w"] * w), int(det["h"] * h)
     color = BOX_COLORS_BGR.get(det["label"], DEFAULT_BOX_COLOR_BGR)
     cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
     id_prefix = f"#{track_id} " if track_id is not None else ""
-    label = f"{id_prefix}{det['label']} {int(det['confidence'] * 100)}%"
+    dist_text = f"{distance_meters:.1f} m" if distance_meters is not None else "? m"
+    label = f"{id_prefix}{det['label']} {dist_text}"
     draw_label_text(frame, label, x + 4, y + 18)
 
 
@@ -145,9 +173,7 @@ def draw_tint(frame, det: dict, color_bgr, label: str, label_below: bool = False
     x, y = int(det["x"] * w), int(det["y"] * h)
     bw, bh = int(det["w"] * w), int(det["h"] * h)
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x + bw, y + bh), color_bgr, -1)
-    cv2.addWeighted(overlay, TINT_ALPHA, frame, 1 - TINT_ALPHA, 0, dst=frame)
+    _blend_translucent_rect(frame, (x, y), (x + bw, y + bh), color_bgr, TINT_ALPHA)
     cv2.rectangle(frame, (x, y), (x + bw, y + bh), color_bgr, 3)
 
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.6, 2)
@@ -177,6 +203,21 @@ FLOW_ARROW_COLOR_BGR = (255, 255, 0)  # cyan -- predicted ego-motion flow, this 
 PREVIOUS_FLOW_ARROW_COLOR_BGR = (0, 255, 0)  # green -- predicted ego-motion flow, previous frame
 OBSERVED_RATE_ARROW_COLOR_BGR = (255, 0, 0)  # blue -- raw observed base-center displacement rate, unadjusted
 MOTION_ARROW_COLOR_BGR = (255, 0, 255)  # magenta -- the object's own independent motion (flow subtracted out)
+# Solid red -- NEW 2026-08-23, the tracker's own per-class-EMA + physical-
+# outlier-gated flow_velocity (see tracker.py's Track.update_flow_state),
+# deliberately a SEPARATE arrow from the magenta one above rather than a
+# replacement: the magenta arrow is a single-step, exactly-derivable
+# quantity (observed == avg(previous flow, current flow) + motion, an
+# EXACT algebraic identity confirmed 2026-08-22 -- see
+# _draw_angular_rate_arrow's doc comment) kept intentionally raw so that
+# identity stays checkable frame by frame; smoothing it in place would
+# break that debugging property. This is the one actually worth trusting
+# as "is this object really moving" -- multi-frame, class-aware, gated
+# against physically-impossible single-frame jumps -- so it's drawn
+# fully OPAQUE (see draw_arrow's alpha, default 1.0) while every other
+# rate arrow in this file draws at RAW_FLOW_ARROW_ALPHA instead, letting
+# this one read clearly as the arrow that matters at a glance.
+SMOOTHED_MOTION_ARROW_COLOR_BGR = (0, 0, 255)
 FLOW_ARROW_THICKNESS = 2
 # Fixed pixel size, not proportional to the arrow's own length (cv2
 # .arrowedLine's own tipLength is a fraction of the shaft, so a short arrow
@@ -210,7 +251,7 @@ def _shifted_point(pt: tuple) -> tuple:
     return int(round(pt[0] * _PIXEL_SHIFT_SCALE)), int(round(pt[1] * _PIXEL_SHIFT_SCALE))
 
 
-def draw_arrow(frame, start: tuple, end: tuple, color, thickness: int) -> None:
+def draw_arrow(frame, start: tuple, end: tuple, color, thickness: int, alpha: float = 1.0) -> None:
     """Plain shaft (cv2.line) plus a small SOLID (filled) triangular head --
     cv2.arrowedLine's own built-in head is an open two-line chevron, not a
     filled triangle, which is what was actually wanted here (smaller,
@@ -220,13 +261,32 @@ def draw_arrow(frame, start: tuple, end: tuple, color, thickness: int) -> None:
     function (including the arrowhead geometry) and only converted to
     OpenCV's fixed-point sub-pixel representation at the final draw calls
     (see PIXEL_SHIFT_BITS) -- no coordinate here is ever snapped to a
-    whole pixel before that single, antialiased conversion."""
+    whole pixel before that single, antialiased conversion.
+
+    `alpha` (NEW 2026-08-23): draws onto a scratch copy and alpha-blends it
+    back, same overlay/addWeighted pattern draw_tint already uses -- lets
+    the four raw/instantaneous debug arrows (predicted flow, previous
+    flow, observed rate, raw motion) recede visually behind the one arrow
+    actually worth trusting at a glance (the smoothed, solid motion
+    vector), without changing any of their own math. Left at the default
+    1.0 (fully opaque, and skips the copy/blend cost entirely) for
+    anything that doesn't ask for translucency.
+
+    That copy/blend is now cropped to a small padded box around the whole
+    shape (shaft + arrowhead) rather than the whole frame -- same
+    profiling-confirmed fix as _blend_translucent_rect, and correct for
+    the same reason despite the shape being a thin diagonal line/triangle
+    rather than a filled rectangle: addWeighted's blend is a per-pixel
+    lerp between the drawn copy and the untouched original, so wherever
+    the shape didn't touch a pixel the copy still equals the original and
+    the blend is a no-op there regardless of alpha -- only the pixels the
+    line/arrowhead actually covers change. Cropping just shrinks how many
+    of those no-op pixels get redundantly copied/blended."""
     x0, y0 = start
     x1, y1 = end
     length = math.hypot(x1 - x0, y1 - y0)
     if length < 1e-3:
         return
-    cv2.line(frame, _shifted_point(start), _shifted_point(end), color, thickness, cv2.LINE_AA, PIXEL_SHIFT_BITS)
     angle = math.atan2(y1 - y0, x1 - x0)
     head_angle = math.radians(FLOW_ARROWHEAD_ANGLE_DEG)
     p2 = (
@@ -237,8 +297,31 @@ def draw_arrow(frame, start: tuple, end: tuple, color, thickness: int) -> None:
         x1 - FLOW_ARROWHEAD_LENGTH_PX * math.cos(angle + head_angle),
         y1 - FLOW_ARROWHEAD_LENGTH_PX * math.sin(angle + head_angle),
     )
-    head_points = np.array([_shifted_point(end), _shifted_point(p2), _shifted_point(p3)], dtype=np.int32)
-    cv2.fillConvexPoly(frame, head_points, color, cv2.LINE_AA, PIXEL_SHIFT_BITS)
+
+    def _paint(target, s, e, a, b) -> None:
+        cv2.line(target, _shifted_point(s), _shifted_point(e), color, thickness, cv2.LINE_AA, PIXEL_SHIFT_BITS)
+        head_points = np.array([_shifted_point(e), _shifted_point(a), _shifted_point(b)], dtype=np.int32)
+        cv2.fillConvexPoly(target, head_points, color, cv2.LINE_AA, PIXEL_SHIFT_BITS)
+
+    if alpha >= 1.0:
+        _paint(frame, start, end, p2, p3)
+        return
+
+    h, w = frame.shape[:2]
+    pad = thickness + FLOW_ARROWHEAD_LENGTH_PX + 4
+    xs, ys = (x0, x1, p2[0], p3[0]), (y0, y1, p2[1], p3[1])
+    cx0, cy0 = max(0, int(min(xs) - pad)), max(0, int(min(ys) - pad))
+    cx1, cy1 = min(w, int(max(xs) + pad) + 1), min(h, int(max(ys) + pad) + 1)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return
+    region = frame[cy0:cy1, cx0:cx1]
+    overlay = region.copy()
+    ox, oy = cx0, cy0
+    _paint(
+        overlay, (x0 - ox, y0 - oy), (x1 - ox, y1 - oy),
+        (p2[0] - ox, p2[1] - oy), (p3[0] - ox, p3[1] - oy),
+    )
+    cv2.addWeighted(overlay, alpha, region, 1 - alpha, 0, dst=region)
 
 
 def camera_velocity_from_yaw(smoothed_yaw_rate_deg_s: float) -> tuple:
@@ -378,10 +461,92 @@ def _row_based_phi_degrees(
     return math.degrees(alpha + theta)
 
 
+OBJECT_ASPECT_PRIORS = {
+    # Same values as ObjectWidthPriors.byLabel (WidthDistanceOverride.swift)
+    # -- kept in sync deliberately, not derived from it, since this is a
+    # separate Python tool. width_mean/height_mean are real per-class KITTI
+    # means (see that Swift file's own doc comment for how they were
+    # computed -- not estimated or guessed); aspect_tolerance is that same
+    # file's per-class `aspectTolerance` (car validated only against the
+    # confirmed-bad track #37 case below; person's 1.8 is empirically
+    # tuned against the real data/26_08_15_Walkaround 3m-window validation
+    # session, preserving 98% of its known-good frames).
+    "car": {"width_mean": 1.629, "height_mean": 1.526, "aspect_tolerance": 1.4},
+    "person": {"width_mean": 0.660, "height_mean": 1.761, "aspect_tolerance": 1.8},
+}
+
+MIN_YAW_RATE_FOR_OBLIQUENESS_CHECK_DEG_S = 1.0
+"""Mirrors WidthDistanceOverrideManager.minYawRateForObliquenessCheckDegS
+(WidthDistanceOverride.swift) -- see is_oblique_view's own doc comment for
+the two real cases (a confirmed bug and a confirmed false positive) this
+was reasoned from. Kept in sync deliberately, not derived from it."""
+
+
+def is_oblique_view(det: dict, entry: dict, aspect: float) -> bool:
+    """True when a box's pixel-space aspect ratio (width/height) is wider
+    than a genuine head-on/tail-on view of its class could plausibly
+    produce, AND the ego is actually turning meaningfully -- mirrors
+    WidthDistanceOverrideManager's obliqueness gate (WidthDistanceOverride
+    .swift) exactly, so already-logged sessions recorded before that
+    on-device fix existed can still be corrected retroactively here, same
+    idea as this function's other fallbacks.
+
+    CONFIRMED 2026-08-23 (real drive, data/26_08_21_Day_Small, track #37 in
+    the raw log -- rendered as #24 in this tool's own offline-retracked
+    flow-arrow video, which assigns its own IDs): a parked car swept across
+    frame by the ego vehicle's own yaw during a slow turn was viewed at a
+    persistent oblique angle the entire ~1.5s window, its box picking up
+    foreshortened LENGTH on top of width. Its widthDistanceMeters read
+    ~2x closer than an independently-recomputed row-based distance the
+    whole time (observed pixel aspect ~2.85 vs car's expected head-on
+    ~1.07) -- not caught by either of the two truncation cases below,
+    since this box was neither edge- nor hood-truncated. Feeding that
+    understated depth into predicted_flow_angular's 1/z term produced a
+    predicted flow ~1.9x too large and a large spurious "independent
+    motion" arrow on an object confirmed, from the source video, to never
+    have moved at all -- see the project_width_based_distance_override
+    memory for the full writeup.
+
+    CONFIRMED FALSE POSITIVE, same day: a genuinely PARKED, dead-ahead car
+    (data/26_08_21_Day_Small, track #13, t~0s -- confirmed via the source
+    frame, squarely facing the camera) was rejected by the aspect check
+    anyway (observed pixel aspect 2.36 vs a ~1.49 threshold), substituting
+    a WORSE row-based reading (6.45m) for a correct width-based one
+    (3.03m) -- confirmed against a real user report that the car was right
+    in front of the vehicle, not ~6m away. Its box height came out short
+    for a reason unrelated to viewing angle: it sat right at the edge of
+    the near-field regime (row-based phi 8.97 degrees, just 0.93 degrees
+    under HOOD_CUTOFF_ANGLE_DEGREES), where the ego's own hood/dash edge
+    was already encroaching on its visible bottom without yet crossing the
+    HARD cutoff the hood-truncation case catches. Its
+    smoothedYawRateDegreesPerSecond was ~0.003 deg/s and egoSpeedMps was 0
+    -- parked, not turning -- whereas the confirmed-bad track #37 case only
+    ever showed this failure while yaw rate ramped through 2.6-6.2 deg/s.
+    The oblique-view mechanism above physically REQUIRES the camera to be
+    rotating relative to the object, so gating on yaw rate separates the
+    two real cases with wide margin.
+
+    KNOWN REMAINING GAP: doesn't catch a car at a genuinely constant
+    oblique angle viewed from a STATIONARY or straight-driving ego (no yaw
+    at all) -- untested territory, left for whenever real data surfaces
+    it, same "don't fix what isn't confirmed yet" discipline as the rest
+    of this file."""
+    yaw_rate = entry.get("smoothedYawRateDegreesPerSecond")
+    if yaw_rate is None or abs(yaw_rate) < MIN_YAW_RATE_FOR_OBLIQUENESS_CHECK_DEG_S:
+        return False
+    prior = OBJECT_ASPECT_PRIORS.get(det["label"])
+    if prior is None or det["h"] <= 0:
+        return False
+    observed_pixel_aspect = (det["w"] / det["h"]) * aspect
+    expected_head_on_aspect = prior["width_mean"] / prior["height_mean"]
+    return observed_pixel_aspect > expected_head_on_aspect * prior["aspect_tolerance"]
+
+
 def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional[float]:
-    """distanceMeters, corrected for THREE CONFIRMED corruption cases
-    (2026-08-22, all found via this session's flow-arrow visualization
-    surfacing distance errors as visibly wrong motion):
+    """distanceMeters, corrected for FOUR CONFIRMED corruption cases
+    (cases 1-3 found 2026-08-22, case 4 found 2026-08-23, all via this
+    session's flow-arrow visualization surfacing distance errors as
+    visibly wrong motion):
 
     1. LEFT/RIGHT edge truncation with the width-based override active
        (distanceMetersIsWidthOverridden) -- the logged value is the
@@ -410,8 +575,15 @@ def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional
        fabricate a number with no real basis," same discipline as the rest
        of this file.
 
-    Any other detection (no truncation, or override active but not
-    edge-truncated -- a legitimate "genuinely closer" reading) passes
+    4. Width-based override active on a box that's too OBLIQUE (see
+       is_oblique_view) for widthDistanceMeters's head-on/tail-on
+       assumption to hold, independent of any truncation -- falls back to
+       a freshly recomputed row-based distance, same remedy as case 1
+       (both are "the width-based reading can't be trusted here," just
+       from different causes: cropping vs viewing angle).
+
+    Any other detection (no truncation/obliqueness, or override active but
+    neither -- a legitimate "genuinely closer" reading) passes
     distanceMeters through unchanged."""
     left = det["x"]
     right = det["x"] + det["w"]
@@ -431,7 +603,7 @@ def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional
 
     if not det.get("distanceMetersIsWidthOverridden"):
         return det.get("distanceMeters")
-    if not side_truncated:
+    if not side_truncated and not is_oblique_view(det, entry, aspect):
         return det.get("distanceMeters")
     recomputed = row_based_distance_meters(
         bottom_y=bottom,
@@ -598,7 +770,19 @@ def angular_to_pixels(u: float, v: float, frame_width: int, frame_height: int) -
     return u * f_col * frame_width, v * f_row * frame_height
 
 
-def _draw_angular_rate_arrow(frame, det: dict, angular_rate: Optional[tuple], color) -> None:
+RAW_FLOW_ARROW_ALPHA = 0.45
+"""NEW 2026-08-23: applied to the four RAW/instantaneous debug arrows
+(predicted flow, previous flow, observed rate, raw motion) so the one
+arrow actually worth trusting at a glance -- the smoothed, solid-red
+motion vector, see SMOOTHED_MOTION_ARROW_COLOR_BGR -- reads clearly
+without the four math-verification arrows competing for attention. Purely
+visual; doesn't touch any of their underlying values or the EXACT
+algebraic identity _draw_angular_rate_arrow's own doc comment describes."""
+
+
+def _draw_angular_rate_arrow(
+    frame, det: dict, angular_rate: Optional[tuple], color, alpha: float = 1.0,
+) -> None:
     """Shared draw path for every one-second-equivalent angular-rate arrow
     this file draws (predicted flow, previous flow, raw observed rate,
     subtracted motion) -- all anchored at the SAME point, this detection's
@@ -627,7 +811,7 @@ def _draw_angular_rate_arrow(frame, det: dict, angular_rate: Optional[tuple], co
     base_col_norm, base_row_norm = base_center_normalized(det)
     cx = base_col_norm * w
     cy = base_row_norm * h
-    draw_arrow(frame, (cx, cy), (cx + dx, cy + dy), color, FLOW_ARROW_THICKNESS)
+    draw_arrow(frame, (cx, cy), (cx + dx, cy + dy), color, FLOW_ARROW_THICKNESS, alpha)
 
 
 def draw_flow_arrow(frame, det: dict, flow_angular: Optional[tuple]) -> None:
@@ -637,7 +821,7 @@ def draw_flow_arrow(frame, det: dict, flow_angular: Optional[tuple]) -> None:
     (needed again there for the motion-arrow subtraction, so it's computed
     once and passed in rather than redone here). A no-op (nothing drawn)
     when None, same as every other optional overlay in this file."""
-    _draw_angular_rate_arrow(frame, det, flow_angular, FLOW_ARROW_COLOR_BGR)
+    _draw_angular_rate_arrow(frame, det, flow_angular, FLOW_ARROW_COLOR_BGR, RAW_FLOW_ARROW_ALPHA)
 
 
 def draw_previous_flow_arrow(frame, det: dict, prev_flow_angular: Optional[tuple]) -> None:
@@ -647,7 +831,7 @@ def draw_previous_flow_arrow(frame, det: dict, prev_flow_angular: Optional[tuple
     flow_angular, drawn in cyan by draw_flow_arrow) -- so a viewer can see
     both halves of that average, not just its result. A no-op when None
     (no previous observation of this track yet)."""
-    _draw_angular_rate_arrow(frame, det, prev_flow_angular, PREVIOUS_FLOW_ARROW_COLOR_BGR)
+    _draw_angular_rate_arrow(frame, det, prev_flow_angular, PREVIOUS_FLOW_ARROW_COLOR_BGR, RAW_FLOW_ARROW_ALPHA)
 
 
 def draw_observed_rate_arrow(frame, det: dict, observed_rate_angular: Optional[tuple]) -> None:
@@ -661,7 +845,7 @@ def draw_observed_rate_arrow(frame, det: dict, observed_rate_angular: Optional[t
     a LARGE observed rate here and still net a near-zero motion arrow,
     correctly). A no-op when None (same gap/validity conditions as the
     motion arrow itself -- see compute_motion_arrow_angular)."""
-    _draw_angular_rate_arrow(frame, det, observed_rate_angular, OBSERVED_RATE_ARROW_COLOR_BGR)
+    _draw_angular_rate_arrow(frame, det, observed_rate_angular, OBSERVED_RATE_ARROW_COLOR_BGR, RAW_FLOW_ARROW_ALPHA)
 
 
 ANCHOR_DOT_COLOR_BGR = (0, 0, 0)  # black
@@ -736,7 +920,16 @@ def draw_motion_arrow(frame, det: dict, motion_angular: Optional[tuple]) -> None
     center -- see compute_motion_arrow_angular's doc comment. A no-op when
     None (no previous observation of this track yet, or the gap was too
     large/invalid)."""
-    _draw_angular_rate_arrow(frame, det, motion_angular, MOTION_ARROW_COLOR_BGR)
+    _draw_angular_rate_arrow(frame, det, motion_angular, MOTION_ARROW_COLOR_BGR, RAW_FLOW_ARROW_ALPHA)
+
+
+def draw_smoothed_motion_arrow(frame, det: dict, smoothed_motion_angular: Optional[tuple]) -> None:
+    """Draws the tracker's own smoothed flow_velocity -- see
+    SMOOTHED_MOTION_ARROW_COLOR_BGR's doc comment for why this is a
+    separate arrow from draw_motion_arrow's raw one, not a replacement.
+    A no-op when None (no track, e.g. an unmatched low-confidence
+    detection)."""
+    _draw_angular_rate_arrow(frame, det, smoothed_motion_angular, SMOOTHED_MOTION_ARROW_COLOR_BGR)
 
 
 FOE_DOT_COLOR_BGR = (255, 0, 0)  # blue
@@ -874,19 +1067,47 @@ def main() -> None:
     parser.add_argument(
         "--flow-arrows", dest="flow_arrows", action="store_true", default=False,
         help="Draw, per tracked object, every constituent of the motion-arrow computation (see "
-             "compute_motion_arrow_angular's doc comment), all from its base center: a GREEN arrow for the "
-             "PREVIOUS observation's predicted ego-motion flow, a CYAN arrow for THIS frame's predicted "
+             "compute_motion_arrow_angular's doc comment), all from its base center: a semi-transparent GREEN "
+             "arrow for the "
+             "PREVIOUS observation's predicted ego-motion flow, a semi-transparent CYAN arrow for THIS frame's "
+             "predicted "
              "ego-motion flow (see predicted_flow_angular's doc comment) -- the flow a STATIC point at that "
-             "object's position/depth would show from the camera's own ego-motion alone -- a BLUE arrow for "
-             "the RAW observed base-center displacement rate (unadjusted for ego-motion), and a MAGENTA arrow "
-             "for the object's own independent motion (the blue arrow minus the averaged green+cyan flow); a "
-             "small BLACK dot marks the exact point (base_center_normalized) all four are measured from and "
-             "drawn out of. Also a fixed blue dot at the CALIBRATED Focus of Expansion (see "
+             "object's position/depth would show from the camera's own ego-motion alone -- a semi-transparent "
+             "BLUE arrow for "
+             "the RAW observed base-center displacement rate (unadjusted for ego-motion), and a "
+             "semi-transparent MAGENTA arrow "
+             "for the object's own independent motion (the blue arrow minus the averaged green+cyan flow, an "
+             "EXACT single-step identity, kept deliberately raw/unsmoothed for that reason), plus a solid, "
+             "fully opaque RED "
+             "arrow for the tracker's own per-class-smoothed, physically-outlier-gated version of that same "
+             "quantity (Track.flow_velocity -- the one actually worth trusting as 'is this object really "
+             "moving', drawn opaque and in a distinct color, see SMOOTHED_MOTION_ARROW_COLOR_BGR's doc "
+             "comment, so it reads clearly at a glance against the four translucent debug arrows); a "
+             "small BLACK dot marks the exact point (base_center_normalized) all four raw arrows are measured "
+             "from and drawn out of. Also a fixed blue dot at the CALIBRATED Focus of Expansion (see "
              "calibrated_foe_pixels). Every "
              "arrow is a one-second-equivalent DISPLAY rate only (the real motion-arrow math uses the actual "
              "elapsed time between observations, not 1 second). Off by default -- experimental; the arrows "
              "need smoothedPitchRateDegreesPerSecond/smoothedRollRateDegreesPerSecond (added 2026-08-22, not "
              "present in any recording predating that), though the FOE dot alone works on older footage too.",
+    )
+    parser.add_argument(
+        "--smoothed-only", dest="smoothed_only", action="store_true", default=False,
+        help="With --flow-arrows, draw ONLY the solid-red smoothed motion arrow (tracker.py's "
+             "Track.flow_velocity) plus box/label -- suppresses the four translucent raw debug arrows "
+             "(predicted flow x2, observed rate, raw motion) and the FOE/anchor dots, matching "
+             "tools/flow_debug_viewer.py's own default (non-selected) display. No effect without "
+             "--flow-arrows.",
+    )
+    parser.add_argument(
+        "--flow-debug-json", type=Path, default=None,
+        help="Write all five per-track arrow vectors (see --flow-arrows) plus corrected distance, to this "
+             "path as JSON -- one entry per detections.jsonl entry, video-relative timestamps -- for "
+             "tools/flow_debug_viewer.py's interactive frame-by-frame viewer, instead of/alongside the "
+             "baked-in --flow-arrows render. Implies the same per-entry computation --flow-arrows does "
+             "(so that need not also be passed), but is NOT any cheaper than a full --flow-arrows render -- "
+             "still requires the same full tracker/ReID pass over the whole video regardless of whether "
+             "--output is also written.",
     )
     parser.add_argument(
         "--highlight-leading", dest="highlight_leading", action="store_true", default=True,
@@ -999,6 +1220,7 @@ def main() -> None:
     # entry-processing loop below), same "don't fabricate a number with no
     # real basis" discipline as the rest of this feature.
     track_flow_state: dict = {}
+    flow_debug_frames: list = []
     aspect = width / height
 
     i = 0
@@ -1039,7 +1261,7 @@ def main() -> None:
             # only takes it as a separate zip'd arg, so stamp it on here too.
             for det, track_id in zip(current_entry["detections"], current_track_ids):
                 det["trackID"] = track_id
-            if args.flow_arrows:
+            if args.flow_arrows or args.flow_debug_json:
                 # Computed once per detections.jsonl entry (not once per
                 # rendered video frame, matching everything else in this
                 # loop) and stashed on each det -- draw_flow_arrow/
@@ -1053,6 +1275,7 @@ def main() -> None:
                     # a jumpy flow prediction for an object that isn't
                     # actually moving jumpily).
                     smoothed_z = None
+                    track = None
                     if track_id is not None:
                         track = tracker.get_track(track_id)
                         smoothed_z = track.flow_z if track is not None else None
@@ -1061,6 +1284,13 @@ def main() -> None:
                     det["motionAngular"] = None
                     det["prevFlowAngular"] = None
                     det["observedRateAngular"] = None
+                    # The tracker's own per-class-EMA + physical-outlier-
+                    # gated estimate (see Track.update_flow_state) --
+                    # already updated for this entry by tracker.update()
+                    # above, so this just reads it back, no recomputation.
+                    # A no-op (0.0, 0.0) is Track's own "assumed
+                    # stationary" cold-start default, not missing data.
+                    det["smoothedMotionAngular"] = track.flow_velocity if track is not None else None
                     if track_id is None:
                         continue
                     base_angular = angular_coords(*base_center_normalized(det), aspect)
@@ -1099,19 +1329,65 @@ def main() -> None:
                 current_locked_id = leading_lock.update(
                     raw_leading["trackID"] if raw_leading is not None else None
                 )
+            if args.flow_debug_json:
+                # Video-relative "t" (not the raw epoch current_entry["t"])
+                # so tools/flow_debug_viewer.py's frontend can binary-search
+                # this the exact same way label_leading_vehicle_frontend
+                # .html already does against <video>.currentTime -- no
+                # separate epoch/start_epoch bookkeeping needed client-side.
+                # Placed AFTER the highlight_leading block above (not
+                # before, where it originally sat) so lockedLeadingTrackID
+                # reflects THIS entry's own classification, not the
+                # previous entry's -- an off-by-one that would otherwise
+                # highlight the wrong frame's leading vehicle in the viewer.
+                thermal_entry_for_json = nearest_at_or_before(thermal, thermal_keys, frame_epoch) if thermal else None
+                flow_debug_frames.append({
+                    "t": current_entry["t"] - start_epoch,
+                    # Same fields/leading text as draw_hud's on-screen HUD
+                    # (which itself mirrors the live on-device app's own
+                    # HUD labels -- see draw_hud's own doc comments) --
+                    # the frontend reproduces these verbatim rather than
+                    # inventing its own wording, real request 2026-08-23.
+                    "resolution": current_entry["resolution"],
+                    "model": MODEL_DISPLAY_NAMES.get(current_entry["model"], current_entry["model"]),
+                    "lowLightEnabled": current_entry["lowLightEnabled"],
+                    "autoLowLightEnabled": current_entry["autoLowLightEnabled"],
+                    "stabilizationEnabled": current_entry["stabilizationEnabled"],
+                    "thermal": (
+                        {"state": thermal_entry_for_json[1], "percent": thermal_entry_for_json[2]}
+                        if thermal_entry_for_json is not None else None
+                    ),
+                    "lockedLeadingTrackID": current_locked_id if args.highlight_leading else None,
+                    "detections": [
+                        {
+                            "trackID": track_id, "label": det["label"], "confidence": det["confidence"],
+                            "x": det["x"], "y": det["y"], "w": det["w"], "h": det["h"],
+                            "correctedDistanceMeters": corrected_distance_meters(det, current_entry, aspect),
+                            "widthOverridden": det.get("distanceMetersIsWidthOverridden", False),
+                            "flowAngular": det.get("flowAngular"),
+                            "prevFlowAngular": det.get("prevFlowAngular"),
+                            "observedRateAngular": det.get("observedRateAngular"),
+                            "motionAngular": det.get("motionAngular"),
+                            "smoothedMotionAngular": det.get("smoothedMotionAngular"),
+                        }
+                        for det, track_id in zip(current_entry["detections"], current_track_ids)
+                    ],
+                })
             next_idx += 1
 
         if current_entry is not None:
             for det, track_id in zip(current_entry["detections"], current_track_ids):
-                draw_box(frame, det, track_id)
+                draw_box(frame, det, track_id, corrected_distance_meters(det, current_entry, aspect))
                 if args.flow_arrows:
-                    draw_previous_flow_arrow(frame, det, det.get("prevFlowAngular"))
-                    draw_flow_arrow(frame, det, det.get("flowAngular"))
-                    draw_observed_rate_arrow(frame, det, det.get("observedRateAngular"))
-                    draw_motion_arrow(frame, det, det.get("motionAngular"))
-                    if det.get("observedRateAngular") is not None:
-                        draw_anchor_dot(frame, det)
-            if args.flow_arrows:
+                    if not args.smoothed_only:
+                        draw_previous_flow_arrow(frame, det, det.get("prevFlowAngular"))
+                        draw_flow_arrow(frame, det, det.get("flowAngular"))
+                        draw_observed_rate_arrow(frame, det, det.get("observedRateAngular"))
+                        draw_motion_arrow(frame, det, det.get("motionAngular"))
+                        if det.get("observedRateAngular") is not None:
+                            draw_anchor_dot(frame, det)
+                    draw_smoothed_motion_arrow(frame, det, det.get("smoothedMotionAngular"))
+            if args.flow_arrows and not args.smoothed_only:
                 draw_foe_dot(frame, current_entry)
 
             if args.highlight_leading and current_locked_id is not None:
@@ -1156,6 +1432,19 @@ def main() -> None:
     writer.release()
     print(f"Wrote {i} frames to {output}")
     print(f"Original recording untouched: {args.video}")
+    if args.flow_debug_json:
+        args.flow_debug_json.write_text(json.dumps({
+            # The video's own raw CAPTURE resolution (e.g. "3840x2160" for
+            # 4K, "1920x1080" for 1080p) -- distinct from each frame's own
+            # "resolution" field below, which is the DETECTOR's input
+            # buffer size (e.g. "1152x640"), not the recording's real
+            # resolution. Constant for the whole session, so top-level
+            # rather than repeated per frame.
+            "videoResolution": f"{width}x{height}",
+            "videoFps": fps,
+            "frames": flow_debug_frames,
+        }))
+        print(f"Wrote {len(flow_debug_frames)} entries to {args.flow_debug_json}")
 
 
 if __name__ == "__main__":

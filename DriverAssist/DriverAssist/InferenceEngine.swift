@@ -444,7 +444,8 @@ final class InferenceEngine: ObservableObject {
         let overriddenDetections = widthDistanceOverrideManager.apply(
             to: rangedDetections,
             cameraHeightMeters: DistanceEstimator.calibrated.cameraHeightMeters,
-            aspectRatio: Double(sourceSize.width / sourceSize.height)
+            aspectRatio: Double(sourceSize.width / sourceSize.height),
+            yawRateDegreesPerSecond: pitchSensor.smoothedYawRateDegreesPerSecond
         )
         self.lastError = nil
         self.isBusy = false

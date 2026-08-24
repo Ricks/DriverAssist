@@ -1,0 +1,337 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DriverAssist Cone Pinpoint Tool</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #14161a; color: #e6e6e6;
+    font-family: -apple-system, "SF Mono", Menlo, monospace;
+    display: flex; flex-direction: column; align-items: center; padding: 16px;
+  }
+  #canvasWrap {
+    max-width: 100%; max-height: 70vh; overflow: auto;
+    border: 1px solid #3a3f4a; border-radius: 4px;
+  }
+  #stage { position: relative; }
+  #canvas { display: block; background: #000; cursor: crosshair; }
+  #controls {
+    width: 100%; max-width: 1400px; margin-bottom: 10px;
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  }
+  button, select, input[type=number], input[type=text] {
+    background: #23262d; color: #e6e6e6; border: 1px solid #3a3f4a;
+    border-radius: 4px; padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  input[type=number] { cursor: text; width: 90px; }
+  button:hover { background: #2d323b; }
+  button.primary { background: #1f5a4a; border-color: #3ac08a; }
+  button.primary:hover { background: #256e59; }
+  .hint { color: #667; font-size: 12px; }
+  #saveState { color: #9aa; font-size: 13px; }
+  table { width: 100%; max-width: 1400px; margin-top: 14px; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 4px 10px; border-bottom: 1px solid #2a2d33; }
+  th { color: #9aa; font-weight: normal; }
+  .err-ok { color: #6f6; }
+  .err-warn { color: #fd6; }
+  .err-bad { color: #f66; }
+  .del-btn { background: none; border: none; color: #f66; cursor: pointer; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <span>image:</span>
+  <select id="imageSelect"></select>
+  <span class="hint">|</span>
+  <span>ref pitch (deg)</span>
+  <input type="number" id="refPitch" value="-1.5137" step="0.0001">
+  <span>ref roll (deg)</span>
+  <input type="number" id="refRoll" value="-0.4506" step="0.0001">
+  <span class="hint">| click the base of a cone/reference object, then enter its tape-measured distance (meters) when prompted</span>
+</div>
+<div id="controls">
+  <button id="zoomOut">&minus;</button>
+  <span id="zoomLabel">100%</span>
+  <button id="zoomIn">+</button>
+  <span class="hint">| scroll-wheel over the image to zoom (centered on cursor) | click a marked point to select it (yellow), then use arrow keys to nudge it by 0.5px (hold Shift for 5px) for precise placement</span>
+</div>
+
+<div id="canvasWrap">
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+  </div>
+</div>
+
+<div id="controls" style="margin-top: 10px;">
+  <button id="saveBtn" class="primary">Save all points</button>
+  <span id="saveState"></span>
+</div>
+
+<table>
+  <thead>
+    <tr><th>image</th><th>row</th><th>col</th><th>true (m)</th><th>computed (m)</th><th>error</th><th></th></tr>
+  </thead>
+  <tbody id="pointsBody"></tbody>
+</table>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const canvasWrap = document.getElementById('canvasWrap');
+const imageSelect = document.getElementById('imageSelect');
+const refPitchEl = document.getElementById('refPitch');
+const refRollEl = document.getElementById('refRoll');
+const zoomLabel = document.getElementById('zoomLabel');
+
+let images = [];
+let currentImage = null;
+let img = new Image();
+let points = [];  // [{image, row, col, trueDistanceMeters, computedDistanceMeters}]
+let selectedPoint = null;
+let zoom = 1;  // CSS display scale over the canvas's native pixel buffer -- zooming in is what
+               // actually makes half-a-native-pixel a meaningfully clickable/visible distance;
+               // at 100% a 0.5px nudge can be smaller than a physical screen pixel.
+
+// A point's row/col are always fractions of the NATIVE image (canvas.width/height),
+// independent of zoom -- zoom only changes how many screen pixels one native pixel
+// occupies, never the underlying coordinate system, so nothing else needs to know
+// about it.
+const HALF_PIXEL_STEP = 0.5;
+const COARSE_PIXEL_STEP = 5;
+
+Promise.all([
+  fetch('/api/images').then(r => r.json()),
+  fetch('/api/points').then(r => r.json()),
+]).then(([imgData, ptData]) => {
+  images = imgData.images;
+  points = ptData.points;
+  for (const name of images) {
+    const opt = document.createElement('option');
+    opt.value = name; opt.textContent = name;
+    imageSelect.appendChild(opt);
+  }
+  if (images.length) loadImage(images[0]);
+  renderTable();
+});
+
+imageSelect.addEventListener('change', () => loadImage(imageSelect.value));
+
+function loadImage(name) {
+  currentImage = name;
+  selectedPoint = null;
+  img = new Image();
+  img.onload = () => {
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    applyZoom();
+    draw();
+  };
+  img.src = `/image/${name}`;
+}
+
+function applyZoom() {
+  // CSS size only -- canvas.width/height (the actual pixel buffer / drawing
+  // coordinate system) never changes with zoom, so point row/col fractions
+  // stay meaningful at any zoom level.
+  canvas.style.width = (canvas.width * zoom) + 'px';
+  canvas.style.height = (canvas.height * zoom) + 'px';
+  zoomLabel.textContent = Math.round(zoom * 100) + '%';
+}
+
+function setZoom(newZoom, anchorClientX, anchorClientY) {
+  newZoom = Math.max(0.1, Math.min(16, newZoom));
+  if (anchorClientX !== undefined) {
+    // Keep the point under the cursor fixed on screen while zooming, same
+    // feel as an image editor's scroll-to-zoom.
+    const rect = canvas.getBoundingClientRect();
+    const fracX = (anchorClientX - rect.left) / rect.width;
+    const fracY = (anchorClientY - rect.top) / rect.height;
+    const oldScrollX = canvasWrap.scrollLeft, oldScrollY = canvasWrap.scrollTop;
+    const wrapRect = canvasWrap.getBoundingClientRect();
+    const cursorInWrapX = anchorClientX - wrapRect.left, cursorInWrapY = anchorClientY - wrapRect.top;
+    zoom = newZoom;
+    applyZoom();
+    canvasWrap.scrollLeft = fracX * canvas.width * zoom - cursorInWrapX;
+    canvasWrap.scrollTop = fracY * canvas.height * zoom - cursorInWrapY;
+  } else {
+    zoom = newZoom;
+    applyZoom();
+  }
+}
+
+document.getElementById('zoomIn').addEventListener('click', () => setZoom(zoom * 1.5));
+document.getElementById('zoomOut').addEventListener('click', () => setZoom(zoom / 1.5));
+canvasWrap.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  setZoom(zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15), e.clientX, e.clientY);
+}, { passive: false });
+
+// Small filled circle + thin crosshair, all in FLOAT canvas coordinates
+// (never rounded to an integer pixel) -- canvas's own rasterizer
+// antialiases any non-integer-aligned path automatically, so this is what
+// makes a 0.5px nudge visibly move the mark at high zoom instead of
+// snapping between the same couple of integer pixels.
+function drawCrosshair(x, y, color, isSelected) {
+  const armLen = isSelected ? 11 : 8;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = isSelected ? 1.5 : 1;
+  ctx.beginPath();
+  ctx.moveTo(x - armLen, y); ctx.lineTo(x + armLen, y);
+  ctx.moveTo(x, y - armLen); ctx.lineTo(x, y + armLen);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x, y, 1.5, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function draw() {
+  ctx.imageSmoothingEnabled = true;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0);
+  for (const p of points) {
+    if (p.image !== currentImage) continue;
+    const x = p.col * canvas.width, y = p.row * canvas.height;
+    const isSelected = p === selectedPoint;
+    drawCrosshair(x, y, isSelected ? '#ffee00' : '#00ff00', isSelected);
+    ctx.fillStyle = isSelected ? '#ffee00' : '#00ff00';
+    ctx.font = '16px monospace';
+    ctx.fillText(`${p.trueDistanceMeters}m`, x + 14, y - 12);
+  }
+}
+
+function recomputeDistance(point) {
+  fetch('/api/compute_distance', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      row: point.row, col: point.col, aspect: canvas.width / canvas.height,
+      referencePitchDegrees: parseFloat(refPitchEl.value),
+      referenceRollDegrees: parseFloat(refRollEl.value),
+    }),
+  }).then(r => r.json()).then(d => {
+    point.computedDistanceMeters = d.distanceMeters;
+    renderTable();
+  });
+}
+
+// Hit-test radius in SCREEN pixels (not native image pixels), so it stays a
+// constant, comfortable click target regardless of zoom level.
+const SELECT_RADIUS_SCREEN_PX = 10;
+
+canvas.addEventListener('click', (e) => {
+  if (!currentImage) return;
+  const rect = canvas.getBoundingClientRect();
+  const col = (e.clientX - rect.left) / rect.width;
+  const row = (e.clientY - rect.top) / rect.height;
+  const clickX = (e.clientX - rect.left), clickY = (e.clientY - rect.top);
+
+  // Clicking near an existing point on THIS image selects it (for keyboard
+  // nudging) instead of creating a new one on top of it.
+  let nearest = null, nearestDist = Infinity;
+  for (const p of points) {
+    if (p.image !== currentImage) continue;
+    const px = p.col * rect.width, py = p.row * rect.height;
+    const d = Math.hypot(px - clickX, py - clickY);
+    if (d < nearestDist) { nearestDist = d; nearest = p; }
+  }
+  if (nearest && nearestDist <= SELECT_RADIUS_SCREEN_PX) {
+    selectedPoint = nearest;
+    draw();
+    return;
+  }
+
+  const trueDistanceStr = window.prompt('Tape-measured distance to this point, in meters:');
+  if (trueDistanceStr === null || trueDistanceStr.trim() === '') return;
+  const trueDistanceMeters = parseFloat(trueDistanceStr);
+  if (!Number.isFinite(trueDistanceMeters)) { alert('Not a number.'); return; }
+
+  const point = { image: currentImage, row, col, trueDistanceMeters, computedDistanceMeters: null };
+  points.push(point);
+  selectedPoint = point;
+  draw();
+  renderTable();
+  recomputeDistance(point);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!selectedPoint) return;
+  if (document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+  const step = (e.shiftKey ? COARSE_PIXEL_STEP : HALF_PIXEL_STEP);
+  let dCol = 0, dRow = 0;
+  if (e.key === 'ArrowLeft') dCol = -step;
+  else if (e.key === 'ArrowRight') dCol = step;
+  else if (e.key === 'ArrowUp') dRow = -step;
+  else if (e.key === 'ArrowDown') dRow = step;
+  else return;
+  e.preventDefault();
+  selectedPoint.col += dCol / canvas.width;
+  selectedPoint.row += dRow / canvas.height;
+  draw();
+  renderTable();
+  recomputeDistance(selectedPoint);
+});
+
+function errorClass(pct) {
+  const a = Math.abs(pct);
+  if (a <= 5) return 'err-ok';
+  if (a <= 15) return 'err-warn';
+  return 'err-bad';
+}
+
+function renderTable() {
+  const body = document.getElementById('pointsBody');
+  body.innerHTML = '';
+  for (const p of points) {
+    const tr = document.createElement('tr');
+    let computedText = '...', errText = '', errCls = '';
+    if (p.computedDistanceMeters !== null && p.computedDistanceMeters !== undefined) {
+      computedText = p.computedDistanceMeters === null ? 'null' : p.computedDistanceMeters.toFixed(3);
+      if (p.computedDistanceMeters !== null) {
+        const pct = 100 * (p.computedDistanceMeters - p.trueDistanceMeters) / p.trueDistanceMeters;
+        errText = `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+        errCls = errorClass(pct);
+      }
+    }
+    if (p === selectedPoint) tr.style.background = '#2a2a10';
+    tr.innerHTML = `
+      <td>${p.image}</td>
+      <td>${(p.row * canvas.height).toFixed(1)}px</td>
+      <td>${(p.col * canvas.width).toFixed(1)}px</td>
+      <td>${p.trueDistanceMeters}</td>
+      <td>${computedText}</td>
+      <td class="${errCls}">${errText}</td>
+      <td><button class="del-btn" title="delete">&times;</button></td>
+    `;
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('.del-btn')) return;
+      currentImage = p.image;
+      imageSelect.value = p.image;
+      loadImage(p.image);
+      // loadImage clears selection/reloads the canvas -- re-select once the
+      // image finishes loading.
+      img.addEventListener('load', () => { selectedPoint = p; draw(); }, { once: true });
+    });
+    tr.querySelector('.del-btn').addEventListener('click', () => {
+      points = points.filter(pp => pp !== p);
+      if (selectedPoint === p) selectedPoint = null;
+      draw(); renderTable();
+    });
+    body.appendChild(tr);
+  }
+}
+
+document.getElementById('saveBtn').addEventListener('click', () => {
+  document.getElementById('saveState').textContent = 'saving...';
+  fetch('/api/points', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ points }),
+  }).then(r => r.json()).then(d => {
+    document.getElementById('saveState').textContent = `saved ${d.count} points to ${d.path}`;
+  });
+});
+</script>
+</body>
+</html>
