@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>DriverAssist Ground Truth Labeling</title>
+<title>DriverAssist Super Tool</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -11,9 +11,7 @@
     font-family: -apple-system, "SF Mono", Menlo, monospace;
     display: flex; flex-direction: column; align-items: center; padding: 16px;
   }
-  #stage {
-    position: relative; max-width: 100%;
-  }
+  #stage { position: relative; max-width: 100%; }
   #video { display: block; max-width: 100%; background: #000; }
   #overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
   #modes {
@@ -42,16 +40,28 @@
     background: #23262d; position: relative; border-radius: 4px; cursor: pointer;
     border: 1px solid #3a3f4a;
   }
+  #timelineFill {
+    position: absolute; top: 0; bottom: 0; left: 0; width: 0;
+    background: #3a3f7a; border-radius: 4px 0 0 4px; pointer-events: none;
+  }
   .seg {
     position: absolute; top: 3px; bottom: 3px; background: #cc44cc;
     border-radius: 2px; opacity: 0.85; min-width: 2px;
   }
   .seg:hover { opacity: 1; outline: 1px solid #fff; }
+  .seg.noted { box-shadow: inset 0 0 0 1px #ffe066; }
   .playhead {
     position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none;
   }
   #saveState { transition: color 0.3s; }
   .hint { color: #667; font-size: 12px; }
+  #detail {
+    width: 100%; max-width: 1400px; margin-top: 10px; padding: 10px 12px;
+    background: #1b1e24; border: 1px solid #3a3f4a; border-radius: 6px;
+    font-size: 13px; line-height: 1.6; display: none; white-space: pre;
+  }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
 </style>
 </head>
 <body>
@@ -81,7 +91,8 @@
   </select>
   <span class="hint">step size (s)</span>
   <input type="number" id="stepSize" value="0.067" step="0.001" min="0.001" style="width:70px">
-  <span class="hint" id="modeHint">| click a box to follow it &middot; click the highlighted box to trim start/end here &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu</span>
+  <button id="unitsToggle" style="display:none">yds</button>
+  <span class="hint" id="modeHint"></span>
 </div>
 
 <div id="status">
@@ -90,10 +101,13 @@
   <span id="activeLine">active: <b id="activeLabel">none</b></span>
   <span>segments: <b id="segCount">0</b></span>
   <span id="saveState">saved</span>
+  <span class="legend" id="legend"></span>
 </div>
 <div id="hint"></div>
 
-<div id="timeline"></div>
+<div id="timeline"><div id="timelineFill"></div></div>
+
+<pre id="detail"></pre>
 
 <script>
 const video = document.getElementById('video');
@@ -102,6 +116,7 @@ const ctx = overlay.getContext('2d');
 const timeline = document.getElementById('timeline');
 const modesEl = document.getElementById('modes');
 const hintEl = document.getElementById('hint');
+const detailEl = document.getElementById('detail');
 
 const LABEL_COLORS = {
   person: '#ffff00', bicycle: '#00ffff', motorcycle: '#00ffff',
@@ -115,6 +130,15 @@ const HOOD_TRUNCATION_COLOR = '#ff9900';  // hood_truncation highlight
 const OTHER_TRUNCATION_COLOR = '#3399ff'; // other_truncation highlight
 
 // --- Mode registry ---------------------------------------------------
+// 'flow_debug': read-only. Draws the five per-track flow-arrow vectors
+// reconstruct_annotated.py's --flow-arrows computes (predicted flow,
+// previous flow, raw observed rate, raw motion, tracker-smoothed motion)
+// plus the HUD/leading-vehicle tint, reading a precomputed --flow-debug-
+// json (falls back to plain boxes -- no vectors/HUD/distance -- when the
+// server was started without one; see super_tool.py's own doc comment).
+// Click a box to select it and switch into "full overlay" mode; click
+// again / empty space / Esc to clear. NOT paired with segment/timeline
+// labeling -- it's a diagnostic view, not a ground-truth mode.
 // 'single': one clicked box = the labeled thing for this time segment
 // (followed_vehicle's original behavior; false_positive/hood_truncation/
 // other_truncation reuse it unchanged -- all four are just "this one
@@ -127,33 +151,76 @@ const OTHER_TRUNCATION_COLOR = '#3399ff'; // other_truncation highlight
 // same shape as the Swift ComboAssociationStrategy design this data
 // eventually validates.
 const MODES = {
+  flow_debug: { kind: 'flow_debug', label: 'Flow Debug',
+    hint: 'click a box for full overlay + details &middot; click again / empty space / Esc to clear' },
   followed_vehicle: { kind: 'single', label: 'Followed Vehicle', highlightColor: HIGHLIGHT_COLOR,
-    hint: 'click a box to follow it &middot; click the highlighted box to trim start/end here' },
+    hint: 'click a box to follow it &middot; click the highlighted box to trim start/end or add a note' },
   false_positive: { kind: 'single', label: 'False Positive', highlightColor: BAD_COLOR,
-    hint: 'click any box to flag it as a spurious detection &middot; click the highlighted box to trim start/end here' },
+    hint: 'click any box to flag it as a spurious detection &middot; click the highlighted box to trim start/end or add a note' },
   hood_truncation: { kind: 'single', label: 'Hood Truncation', highlightColor: HOOD_TRUNCATION_COLOR,
-    hint: 'click a box the instant OUR hood/dashboard starts clipping its bottom edge &middot; click the highlighted box to trim start/end here' },
+    hint: 'click a box the instant OUR hood/dashboard starts clipping its bottom edge &middot; click the highlighted box to trim start/end or add a note' },
   other_truncation: { kind: 'single', label: 'Other Truncation', highlightColor: OTHER_TRUNCATION_COLOR,
-    hint: 'click a box the instant anything else (another object, frame edge) starts clipping it &middot; click the highlighted box to trim start/end here' },
+    hint: 'click a box the instant anything else (another object, frame edge) starts clipping it &middot; click the highlighted box to trim start/end or add a note' },
   cyclist: { kind: 'combo', label: 'Cyclist', vehicleLabel: 'bicycle', riderLabel: 'person', maxRiders: 1,
-    hint: 'click a bicycle to start/select a pairing, then click its rider &middot; click a rider again to unpair' },
+    hint: 'click a bicycle to start/select a pairing, then click its rider &middot; click a rider again to unpair &middot; click the selected vehicle box again to trim/add a note' },
   motorcyclist: { kind: 'combo', label: 'Motorcyclist', vehicleLabel: 'motorcycle', riderLabel: 'person', maxRiders: 2,
-    hint: 'click a motorcycle to start/select a pairing, then click up to 2 riders (driver + passenger)' },
+    hint: 'click a motorcycle to start/select a pairing, then click up to 2 riders (driver + passenger) &middot; click the selected vehicle box again to trim/add a note' },
   skateboarder: { kind: 'combo', label: 'Skateboarder', vehicleLabel: 'skateboard', riderLabel: 'person', maxRiders: 1,
-    hint: 'click a skateboard to start/select a pairing, then click its rider' },
+    hint: 'click a skateboard to start/select a pairing, then click its rider &middot; click the selected vehicle box again to trim/add a note' },
   equestrian: { kind: 'combo', label: 'Equestrian', vehicleLabel: 'horse', riderLabel: 'person', maxRiders: 1,
-    hint: 'click a horse to start/select a pairing, then click its rider' },
+    hint: 'click a horse to start/select a pairing, then click its rider &middot; click the selected vehicle box again to trim/add a note' },
 };
-const MODE_ORDER = ['followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
-let activeMode = 'followed_vehicle';
+const MODE_ORDER = ['flow_debug', 'followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
+const GROUND_TRUTH_MODES = MODE_ORDER.filter(m => m !== 'flow_debug');
+let activeMode = 'flow_debug';
 
-let frames = [];              // [{t, detections:[{trackID,label,confidence,x,y,w,h}]}]
-let store = {};                // mode -> ground-truth array (see MODES kind for shape)
-for (const m of MODE_ORDER) store[m] = [];
-let duration = 0;
-let saveTimer = null;
-let reverseTimer = null;
-let hintTimer = null;
+// --- flow_debug-only vector/legend setup ------------------------------
+// Same convention/order as reconstruct_annotated.py's --flow-arrows: cyan
+// (this frame's predicted ego-motion flow), green (previous frame's), blue
+// (raw observed rate), magenta (raw single-step motion), red (the
+// tracker's smoothed, physically-gated motion -- solid/opaque, the one
+// arrow shown by default; see tracker.py's Track.update_flow_state).
+const VECTORS = [
+  { key: 'flowAngular',           color: '#00ffff', label: 'predicted flow (this frame)' },
+  { key: 'prevFlowAngular',       color: '#00ff00', label: 'predicted flow (previous frame)' },
+  { key: 'observedRateAngular',   color: '#0000ff', label: 'observed rate (raw)' },
+  { key: 'motionAngular',         color: '#ff00ff', label: 'motion (raw, single-step)' },
+];
+const SMOOTHED = { key: 'smoothedMotionAngular', color: '#ff0000', label: 'motion (smoothed, trust this)' };
+const LEADING_TINT_COLOR = '#ffa500';
+
+for (const v of [...VECTORS, SMOOTHED, { color: LEADING_TINT_COLOR, label: 'ALGORITHM = classify_leading/LeadingVehicleLock pick' }]) {
+  const s = document.createElement('span');
+  s.innerHTML = `<span class="swatch" style="background:${v.color}"></span>${v.label}`;
+  document.getElementById('legend').appendChild(s);
+}
+
+// Same calibrated-camera constant as flow_model.py -- pure geometry
+// (converting an already-computed angular rate to on-screen pixels), not a
+// physics reimplementation; the actual flow/motion MATH all happened
+// server-side in reconstruct_annotated.py and is just being read back.
+const FOCAL_LENGTH_ROW_NORMALIZED = 1.322673;
+function angularToPixels(u, v, frameW, frameH) {
+  const aspect = frameW / frameH;
+  const fRow = FOCAL_LENGTH_ROW_NORMALIZED;
+  const fCol = fRow / aspect;
+  return [u * fCol * frameW, v * fRow * frameH];
+}
+function baseCenterNormalized(d) {
+  return [d.x + d.w / 2, d.y + d.h];
+}
+const METERS_TO_YARDS = 1.0936133;
+const MPS_TO_MPH = 2.2369363;
+let useMetricDistance = false;
+let selectedTrackID = null;
+
+// How far past the last (or before the first) real detection entry
+// video.currentTime may drift before frameAt's "nearest" lookup is treated
+// as STALE rather than current -- see flow_debug_viewer's original doc
+// comment (2026-08-23 real report: playing past a JSON generated for only
+// part of a longer recording left frameAt silently returning the last
+// frame's boxes forever afterward, looking "stuck" with no explanation).
+const STALE_DATA_THRESHOLD_S = 1.0;
 
 // --- Mode selector UI ---------------------------------------------------
 for (const m of MODE_ORDER) {
@@ -169,20 +236,43 @@ function switchMode(m) {
   for (const b of modesEl.querySelectorAll('.modeBtn')) {
     b.classList.toggle('active', b.dataset.mode === m);
   }
-  document.getElementById('modeHint').innerHTML = '| ' + MODES[m].hint + ' &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu';
+  const cfg = MODES[m];
+  document.getElementById('modeHint').innerHTML = '| ' + cfg.hint + ' &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu/clear';
+  const isFlowDebug = cfg.kind === 'flow_debug';
+  document.getElementById('unitsToggle').style.display = isFlowDebug ? '' : 'none';
+  document.getElementById('legend').style.display = isFlowDebug ? '' : 'none';
+  document.getElementById('activeLine').style.display = isFlowDebug ? 'none' : '';
+  document.querySelector('#status span:nth-child(4)').style.display = isFlowDebug ? 'none' : ''; // "segments:"
+  document.getElementById('saveState').style.display = isFlowDebug ? 'none' : '';
+  if (isFlowDebug) selectedTrackID = null;
   draw();
   renderTimeline();
 }
-switchMode(activeMode);
+
+let frames = [];              // [{t, detections:[{trackID,label,confidence,x,y,w,h,...optional flow/distance fields}]}]
+let videoResolution = null;
+let videoFps = null;
+let hasFlowData = false;
+let store = {};                // mode -> ground-truth array (see MODES kind for shape)
+for (const m of GROUND_TRUTH_MODES) store[m] = [];
+let duration = 0;
+let saveTimer = null;
+let reverseTimer = null;
+let hintTimer = null;
 
 video.src = '/video';
 
 Promise.all([
-  fetch('/api/detections').then(r => r.json()),
-  ...MODE_ORDER.map(m => fetch(`/api/ground_truth/${m}`).then(r => r.json())),
-]).then(([detData, ...gts]) => {
-  frames = detData.frames;
-  MODE_ORDER.forEach((m, i) => { store[m] = gts[i]; });
+  fetch('/api/frames').then(r => r.json()),
+  ...GROUND_TRUTH_MODES.map(m => fetch(`/api/ground_truth/${m}`).then(r => r.json())),
+]).then(([frameData, ...gts]) => {
+  frames = frameData.frames;
+  videoResolution = frameData.videoResolution;
+  videoFps = frameData.videoFps;
+  hasFlowData = frameData.hasFlowData;
+  GROUND_TRUTH_MODES.forEach((m, i) => { store[m] = gts[i]; });
+  if (!hasFlowData) flashHint('No --flow-debug-json loaded for this session -- Flow Debug mode shows plain boxes only.');
+  switchMode(activeMode);
   updateStatus();
   renderTimeline();
 });
@@ -240,14 +330,188 @@ function activeComboAt(mode, t) {
   return best;
 }
 
+function drawArrow(x0, y0, x1, y1, color) {
+  const len = Math.hypot(x1 - x0, y1 - y0);
+  if (len < 1) return;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  const angle = Math.atan2(y1 - y0, x1 - x0);
+  const headLen = 12, headAngle = 0.55;
+  const p2x = x1 - headLen * Math.cos(angle - headAngle), p2y = y1 - headLen * Math.sin(angle - headAngle);
+  const p3x = x1 - headLen * Math.cos(angle + headAngle), p3y = y1 - headLen * Math.sin(angle + headAngle);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(p2x, p2y); ctx.lineTo(p3x, p3y); ctx.closePath(); ctx.fill();
+}
+
+function drawVector(d, w, h, key, color) {
+  const rate = d[key];
+  if (!rate) return null;
+  const [bx, by] = baseCenterNormalized(d);
+  const [dx, dy] = angularToPixels(rate[0], rate[1], w, h);
+  const tipX = bx * w + dx, tipY = by * h + dy;
+  drawArrow(bx * w, by * h, tipX, tipY, color);
+  return [tipX, tipY];
+}
+
+// Real-world speed magnitude at this detection's own depth -- see
+// flow_debug_viewer's original doc comment: does NOT include the object's
+// closing/opening (depth-rate) component, so this UNDERSTATES true speed
+// for anything moving mostly toward/away from the camera.
+function smoothedSpeedMph(d) {
+  const rate = d.smoothedMotionAngular;
+  if (!rate || d.correctedDistanceMeters == null) return null;
+  const speedMps = Math.hypot(rate[0], rate[1]) * d.correctedDistanceMeters;
+  return speedMps * MPS_TO_MPH;
+}
+
+function distanceText(d) {
+  if (d.correctedDistanceMeters === null || d.correctedDistanceMeters === undefined) {
+    return useMetricDistance ? '? m' : '? yds';
+  }
+  return useMetricDistance
+    ? `${d.correctedDistanceMeters.toFixed(1)} m`
+    : `${(d.correctedDistanceMeters * METERS_TO_YARDS).toFixed(1)} yds`;
+}
+
+// Black-on-white caption on a translucent backing, same as
+// draw_label_text in reconstruct_annotated.py.
+function drawCaption(text, x, y) {
+  ctx.font = '13px monospace';
+  const tw = ctx.measureText(text).width;
+  const pad = 3;
+  ctx.globalAlpha = 0.5;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(x - pad, y - 13 - pad, tw + pad * 2, 13 + pad + 4);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#000000';
+  ctx.fillText(text, x, y);
+}
+
+function drawLeadingTint(d, w, h) {
+  const x = d.x * w, y = d.y * h, bw = d.w * w, bh = d.h * h;
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = LEADING_TINT_COLOR;
+  ctx.fillRect(x, y, bw, bh);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = LEADING_TINT_COLOR;
+  ctx.lineWidth = 3;
+  ctx.strokeRect(x, y, bw, bh);
+  drawCaption('ALGORITHM', x + 4, y + bh + 18);
+}
+
+// Same fields/leading text as draw_hud's on-screen HUD in
+// reconstruct_annotated.py, itself mirroring the live on-device app's own
+// HUD labels. Only meaningful when a --flow-debug-json was loaded (its
+// per-frame entries carry thermal/resolution/model/etc.) -- the live
+// geometry-tracker fallback frames have none of these fields, so this
+// simply draws nothing extra in that mode.
+function drawHud(f, w, h) {
+  ctx.font = '16px monospace';
+  if (f.thermal) {
+    const stateText = f.thermal.state === 'nominal' ? 'OK' : f.thermal.state.toUpperCase();
+    let color = '#bfbfbf';
+    if (f.thermal.state === 'fair') color = '#ffd700';
+    else if (f.thermal.state === 'serious' || f.thermal.state === 'critical') color = '#ff0000';
+    ctx.fillStyle = color;
+    ctx.fillText(`thermal: ${stateText} ${f.thermal.percent}%`, 12, 26);
+  }
+  if (f.resolution) {
+    ctx.fillStyle = '#bfbfbf';
+    if (videoResolution) ctx.fillText(`video: ${videoResolution}`, 12, h - 56);
+    ctx.fillText(`res: ${f.resolution}`, 12, h - 34);
+    ctx.fillText(`model: ${f.model}`, 12, h - 12);
+
+    const lowState = f.lowLightEnabled ? 'on' : 'off';
+    const lowText = f.autoLowLightEnabled ? `low-light: auto (${lowState})` : `low-light: ${lowState}`;
+    ctx.fillText(lowText, w - ctx.measureText(lowText).width - 12, h - 12);
+
+    const stabText = `stabilization: ${f.stabilizationEnabled ? 'on' : 'off'}`;
+    ctx.fillText(stabText, w - ctx.measureText(stabText).width - 12, 26);
+  }
+
+  if (videoFps) {
+    const frameIndex = Math.round(video.currentTime * videoFps);
+    const text = `frame ${frameIndex}`;
+    const tw = ctx.measureText(text).width;
+    drawCaption(text, w - tw - 12 - 3, 26 + 40);
+  }
+}
+
+function updateDetail(d) {
+  if (!d) { detailEl.style.display = 'none'; return; }
+  const fmt = (v) => v ? `(${v[0].toFixed(4)}, ${v[1].toFixed(4)})` : 'null';
+  detailEl.style.display = 'block';
+  detailEl.textContent =
+    `#${d.trackID} ${d.label}  conf=${(d.confidence * 100).toFixed(1)}%\n` +
+    `correctedDistanceMeters = ${d.correctedDistanceMeters == null ? 'null' : d.correctedDistanceMeters.toFixed(2)}` +
+    `   widthOverridden = ${d.widthOverridden}\n` +
+    `box = x=${d.x.toFixed(4)} y=${d.y.toFixed(4)} w=${d.w.toFixed(4)} h=${d.h.toFixed(4)}  aspect(w/h)=${(d.w / d.h).toFixed(3)}\n` +
+    `flowAngular (cyan)          = ${fmt(d.flowAngular)}\n` +
+    `prevFlowAngular (green)     = ${fmt(d.prevFlowAngular)}\n` +
+    `observedRateAngular (blue)  = ${fmt(d.observedRateAngular)}\n` +
+    `motionAngular (magenta, raw)     = ${fmt(d.motionAngular)}\n` +
+    `smoothedMotionAngular (red, trust) = ${fmt(d.smoothedMotionAngular)}`;
+}
+
+function drawFlowDebug(f, w, h) {
+  const dataGap = video.currentTime - f.t;
+  if (Math.abs(dataGap) > STALE_DATA_THRESHOLD_S) {
+    const msg = 'No data';
+    ctx.font = 'bold 18px monospace';
+    const tw = ctx.measureText(msg).width;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(w / 2 - tw / 2 - 10, h / 2 - 20, tw + 20, 34);
+    ctx.fillStyle = '#ff4444';
+    ctx.fillText(msg, w / 2 - tw / 2, h / 2 + 4);
+    updateDetail(null);
+    return;
+  }
+
+  let selectedDet = null;
+  for (const d of f.detections) {
+    const isSelected = d.trackID !== null && d.trackID === selectedTrackID;
+    const isLeading = f.lockedLeadingTrackID != null && d.trackID === f.lockedLeadingTrackID;
+    if (isSelected) selectedDet = d;
+    // "#id label dist" caption when distance data is available (a
+    // --flow-debug-json was loaded); plain "#id label conf%" caption in
+    // the live-tracking-fallback case, matching label_leading_vehicle's
+    // original box caption for that data shape.
+    const caption = hasFlowData
+      ? `#${d.trackID} ${d.label} ${distanceText(d)}`
+      : `#${d.trackID} ${d.label} ${Math.round(d.confidence * 100)}%`;
+    const x = d.x * w, y = d.y * h;
+    ctx.strokeStyle = isSelected ? '#ffffff' : (LABEL_COLORS[d.label] || '#888888');
+    ctx.lineWidth = isSelected ? 3 : 1.5;
+    ctx.strokeRect(x, y, d.w * w, d.h * h);
+    drawCaption(caption, x + 4, y + 18);
+    if (isLeading) drawLeadingTint(d, w, h);
+    if (isSelected && hasFlowData) {
+      for (const v of VECTORS) drawVector(d, w, h, v.key, v.color);
+    }
+    if (hasFlowData) {
+      const tip = drawVector(d, w, h, SMOOTHED.key, SMOOTHED.color);
+      if (tip) {
+        const mph = smoothedSpeedMph(d);
+        if (mph !== null) drawCaption(`${mph.toFixed(1)} mph`, tip[0] + 6, tip[1] + 4);
+      }
+    }
+  }
+  if (hasFlowData) drawHud(f, w, h);
+  updateDetail(selectedDet);
+}
+
 function draw() {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   const f = frameAt(video.currentTime);
   const cfg = MODES[activeMode];
-  if (!f) { updateStatus(f); return; }
+  if (!f) { updateStatus(f); renderPlayhead(); return; }
   const w = overlay.width, h = overlay.height;
 
-  if (cfg.kind === 'single') {
+  if (cfg.kind === 'flow_debug') {
+    drawFlowDebug(f, w, h);
+    updateStatus(f);
+  } else if (cfg.kind === 'single') {
     const active = activeSingleAt(activeMode, video.currentTime);
     for (const d of f.detections) {
       const isActive = active && d.trackID === active.trackID;
@@ -303,6 +567,7 @@ function updateStatus(f, active) {
   document.getElementById('curTime').textContent = video.currentTime.toFixed(2);
   document.getElementById('detCount').textContent = f ? f.detections.length : 0;
   const cfg = MODES[activeMode];
+  if (cfg.kind === 'flow_debug') return;
   let label = 'none';
   if (active) {
     if (cfg.kind === 'single') {
@@ -311,6 +576,7 @@ function updateStatus(f, active) {
       const riders = active.riderTrackIDs.length ? active.riderTrackIDs.map(id => '#' + id).join(', ') : 'none yet';
       label = `vehicle #${active.vehicleTrackID} — riders: ${riders}`;
     }
+    if (active.note) label += ` (note: ${active.note})`;
   }
   document.getElementById('activeLabel').textContent = label;
   document.getElementById('segCount').textContent = store[activeMode].length;
@@ -322,7 +588,7 @@ function flashHint(msg) {
   hintTimer = setTimeout(() => { hintEl.textContent = ''; }, 1800);
 }
 
-// --- Click to add / trim / delete / pair ---
+// --- Click to add / trim / delete / pair / select ---
 function hitTestBox(e) {
   const rect = overlay.getBoundingClientRect();
   // Pixel space, not normalized -- a fixed padding/tolerance in normalized
@@ -338,11 +604,11 @@ function hitTestBox(e) {
   // one of several well-separated vehicles, can swallow almost the entire
   // smaller box's own footprint when both boxes are this close together,
   // making the rider effectively unclickable except in a sliver a couple
-  // pixels tall. Single-select modes keep the original tuning unchanged.
+  // pixels tall. Single-select/flow-debug modes keep the original tuning.
   const PAD_PX = MODES[activeMode].kind === 'combo' ? 4 : 10;
   const FALLBACK_PX = 25;
   const f = frameAt(video.currentTime);
-  if (!f) return { box: null, rect };
+  if (!f || Math.abs(video.currentTime - f.t) > STALE_DATA_THRESHOLD_S) return { box: null, rect };
 
   // Prefer smallest-area box (padded) containing the click; fall back to
   // nearest center within a pixel-space tolerance.
@@ -367,6 +633,24 @@ function hitTestBox(e) {
 }
 
 overlay.addEventListener('click', (e) => {
+  const cfg = MODES[activeMode];
+
+  if (cfg.kind === 'flow_debug') {
+    const { box: best } = hitTestBox(e);
+    if (!best || best.trackID === null) {
+      selectedTrackID = null;
+    } else if (best.trackID === selectedTrackID) {
+      selectedTrackID = null;
+    } else {
+      selectedTrackID = best.trackID;
+      // Selecting is for frame-by-frame inspection, not for watching
+      // playback continue -- pause so the next natural action is stepping.
+      video.pause(); setPlayPauseLabel();
+    }
+    draw();
+    return;
+  }
+
   // Dismiss any stale trim menu, but don't swallow the click -- it should
   // still act on whatever box is under the cursor in the same click. (The
   // menu's own buttons live outside #overlay in the DOM, so clicks on them
@@ -379,7 +663,6 @@ overlay.addEventListener('click', (e) => {
   const { box: best } = hitTestBox(e);
   if (!best) return;
   const t = video.currentTime;
-  const cfg = MODES[activeMode];
 
   if (cfg.kind === 'single') {
     const arr = store[activeMode];
@@ -465,6 +748,18 @@ function showTrimMenu(clientX, clientY, arr, item, t) {
     }
     scheduleSave(); draw(); renderTimeline();
   }));
+  trimMenuEl.appendChild(mkBtn(item.note ? 'edit note' : '+ note', () => {
+    // window.prompt, not an inline input -- this is a rare, deliberate
+    // action (unlike trim, which happens constantly while stepping
+    // through footage) so a blocking dialog is the right tradeoff for the
+    // one extra line of code it saves. Empty/whitespace-only text clears
+    // the note (stored as null, not ''), so a noted segment can go back
+    // to un-noted rather than being stuck with a stray empty string.
+    const text = window.prompt('Note for this label:', item.note || '');
+    if (text === null) return; // cancelled -- leave the existing note untouched
+    item.note = text.trim() || null;
+    scheduleSave(); draw(); renderTimeline();
+  }));
 
   document.body.appendChild(trimMenuEl);
 }
@@ -485,36 +780,52 @@ function scheduleSave() {
   }, 400);
 }
 
-// --- Timeline strip ---
+// --- Timeline strip (click-to-seek, drag-to-scrub, and segment markers
+// for labeling modes) ---
 function renderTimeline() {
   timeline.querySelectorAll('.seg').forEach(el => el.remove());
   if (!duration) return;
   const cfg = MODES[activeMode];
+  if (cfg.kind === 'flow_debug') return; // read-only mode, no segments to show
   for (const a of store[activeMode]) {
     const end = a.end_t === null ? duration : a.end_t;
     const el = document.createElement('div');
-    el.className = 'seg';
+    el.className = 'seg' + (a.note ? ' noted' : '');
     el.style.left = (a.start_t / duration * 100) + '%';
     el.style.width = Math.max(0.15, (end - a.start_t) / duration * 100) + '%';
     const tag = cfg.kind === 'single'
       ? `#${a.trackID}`
       : `vehicle #${a.vehicleTrackID} riders:${a.riderTrackIDs.map(id => '#' + id).join(',') || 'none'}`;
-    el.title = `${tag}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}`;
+    el.title = `${tag}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}` +
+      (a.note ? `\nnote: ${a.note}` : '');
     timeline.appendChild(el);
   }
 }
+const timelineFill = document.getElementById('timelineFill');
 let playhead = null;
 function renderPlayhead() {
   if (!duration) return;
   if (!playhead) { playhead = document.createElement('div'); playhead.className = 'playhead'; timeline.appendChild(playhead); }
-  playhead.style.left = (video.currentTime / duration * 100) + '%';
+  const pct = (video.currentTime / duration * 100) + '%';
+  playhead.style.left = pct;
+  timelineFill.style.width = pct;
 }
-timeline.addEventListener('click', (e) => {
-  if (!duration) return;
+function seekFromEvent(e) {
   const rect = timeline.getBoundingClientRect();
-  const frac = (e.clientX - rect.left) / rect.width;
+  const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
   seekTo(frac * duration);
+}
+let scrubbing = false;
+timeline.addEventListener('mousedown', (e) => {
+  if (!duration) return;
+  scrubbing = true;
+  video.pause(); stopReverse(); setPlayPauseLabel();
+  seekFromEvent(e);
 });
+window.addEventListener('mousemove', (e) => {
+  if (scrubbing) seekFromEvent(e);
+});
+window.addEventListener('mouseup', () => { scrubbing = false; });
 
 // --- Playback / stepping ---
 function seekTo(t) {
@@ -523,20 +834,41 @@ function seekTo(t) {
 video.addEventListener('timeupdate', draw);
 video.addEventListener('seeked', draw);
 
-document.getElementById('stepSize').addEventListener('change', () => {});
 function stepSize() { return parseFloat(document.getElementById('stepSize').value) || 0.067; }
 
-document.getElementById('stepFwd').addEventListener('click', () => {
+// A seek is asynchronous -- the browser has to demux/decode to the target
+// frame, which for a single ~0.067s (one video frame) step can take longer
+// than the click/key-repeat interval a human (or a held-down arrow key)
+// actually produces. CONFIRMED 2026-08-24: firing seekTo() again before the
+// previous seek's 'seeked' event lands causes the decoder to skip straight
+// to the LATEST requested target, silently dropping every frame in
+// between -- "single-stepping moves by many frames," even though each
+// individual seekTo() call itself was requesting exactly one frame's worth
+// of movement. Guarding stepFwd/stepBack so a step is ignored while the
+// previous one is still resolving forces one visible frame per click/key
+// press, at the cost of not queuing up rapid repeats -- the right tradeoff
+// for a tool whose whole point is inspecting individual frames.
+let stepPending = false;
+video.addEventListener('seeked', () => { stepPending = false; });
+function stepBy(delta) {
+  if (stepPending) return;
+  stepPending = true;
   video.pause(); stopReverse(); setPlayPauseLabel();
-  seekTo(video.currentTime + stepSize());
-});
-document.getElementById('stepBack').addEventListener('click', () => {
-  video.pause(); stopReverse(); setPlayPauseLabel();
-  seekTo(video.currentTime - stepSize());
-});
+  seekTo(video.currentTime + delta);
+}
+
+document.getElementById('stepFwd').addEventListener('click', () => stepBy(stepSize()));
+document.getElementById('stepBack').addEventListener('click', () => stepBy(-stepSize()));
 
 document.getElementById('speed').addEventListener('change', (e) => {
   video.playbackRate = parseFloat(e.target.value);
+});
+
+const unitsToggleBtn = document.getElementById('unitsToggle');
+unitsToggleBtn.addEventListener('click', () => {
+  useMetricDistance = !useMetricDistance;
+  unitsToggleBtn.textContent = useMetricDistance ? 'm' : 'yds';
+  draw();
 });
 
 const playPauseBtn = document.getElementById('playPause');
@@ -572,8 +904,12 @@ function stopReverse() {
 }
 
 document.addEventListener('keydown', (e) => {
-  if (e.code === 'Escape') { hideTrimMenu(); return; }
   if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Escape') {
+    if (MODES[activeMode].kind === 'flow_debug') { selectedTrackID = null; draw(); }
+    else hideTrimMenu();
+    return;
+  }
   if (e.code === 'Space') { e.preventDefault(); playPauseBtn.click(); }
   else if (e.code === 'ArrowRight') { e.preventDefault(); document.getElementById('stepFwd').click(); }
   else if (e.code === 'ArrowLeft') { e.preventDefault(); document.getElementById('stepBack').click(); }

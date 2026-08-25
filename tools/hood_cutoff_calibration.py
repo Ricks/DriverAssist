@@ -21,7 +21,7 @@ Two commands:
                   clipped by construction, no ambiguity.
                 - `ground_truth_hood_truncation.json` in the session
                   directory, if present -- the labeling tool's own segments
-                  (see label_leading_vehicle.py's hood_truncation mode),
+                  (see super_tool.py's hood_truncation mode),
                   each {start_t, end_t, trackID} interval treated the same
                   way (every frame in the segment is "currently truncated"
                   by that label's own definition, not just its start).

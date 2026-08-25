@@ -2,11 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "flow-debug-viewer-walkaround",
+      "name": "super-tool-walkaround",
       "runtimeExecutable": "python3",
       "runtimeArgs": [
-        "/Users/rickclark/DriverAssist/tools/flow_debug_viewer.py",
+        "/Users/rickclark/DriverAssist/tools/super_tool.py",
         "/Users/rickclark/DriverAssist/data/26_08_15_Walkaround/recording-20260815-142808.MOV",
+        "--flow-debug-json",
         "/Users/rickclark/DriverAssist/data/26_08_15_Walkaround/flow_debug.json",
         "--port",
         "5053"
@@ -14,16 +15,45 @@
       "port": 5053
     },
     {
-      "name": "flow-debug-viewer-day-distance",
+      "name": "super-tool-day-distance",
       "runtimeExecutable": "python3",
       "runtimeArgs": [
-        "/Users/rickclark/DriverAssist/tools/flow_debug_viewer.py",
+        "/Users/rickclark/DriverAssist/tools/super_tool.py",
         "/Users/rickclark/DriverAssist/data/26_08_24_Day_Distance/recording-20260824-130125.MOV",
+        "--flow-debug-json",
         "/Users/rickclark/DriverAssist/data/26_08_24_Day_Distance/flow_debug.json",
         "--port",
         "5054"
       ],
       "port": 5054
+    },
+    {
+      "name": "super-tool-day-small",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/Users/rickclark/DriverAssist/tools/super_tool.py",
+        "/Users/rickclark/DriverAssist/data/26_08_21_Day_Small/recording-20260821-125413.MOV",
+        "--flow-debug-json",
+        "/Users/rickclark/DriverAssist/data/26_08_21_Day_Small/recording-20260821-125413-flow-debug.json",
+        "--port",
+        "5055"
+      ],
+      "port": 5055
+    },
+    {
+      "name": "super-tool-day-cones",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/Users/rickclark/DriverAssist/tools/super_tool.py",
+        "/Users/rickclark/DriverAssist/data/26_08_25_Day_Cones/recording-20260825-112608.MOV",
+        "--detections",
+        "/Users/rickclark/DriverAssist/logs/detections.jsonl",
+        "--debug-log",
+        "/Users/rickclark/DriverAssist/logs/overlay-debug.log",
+        "--port",
+        "5056"
+      ],
+      "port": 5056
     }
   ]
 }

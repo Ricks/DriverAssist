@@ -416,3 +416,13 @@ Total received: 8202 B
 sent 184176018216 bytes  received 8202 bytes  291015268 bytes/sec
 total size is 184153490519  speedup is 1.00
 [2026-08-24 10:46:37] Sync complete.
+[2026-08-25 03:00:05] Starting sync: /Users/rickclark/DriverAssist/data/ -> /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/
+Transfer starting: 413 files
+rsync(64418): error: /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/: open: Operation not permitted
+rsync(64418): error: rsync_receiver
+rsync(64417): error: unexpected end of file
+rsync(64417): error: io_read_nonblocking
+rsync(64417): error: io_read_blocking
+rsync(64417): error: io_read_flush
+rsync(64417): error: rsync_sender
+rsync(64417): warning: child 64418 exited with status 1

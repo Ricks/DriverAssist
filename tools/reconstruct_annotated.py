@@ -57,7 +57,7 @@ from leading_vehicle import (
     VelocityEstimator,
     classify_leading,
 )
-from tracker import DEFAULT_REID_MODEL, ByteTracker, build_reid_encoder
+from tracker import Track
 from tune_leading_vehicle import ground_truth_at
 
 # BGR (OpenCV convention) approximations of the on-device box colors — these
@@ -76,7 +76,7 @@ HUD_DEFAULT_COLOR_BGR = (191, 191, 191)  # ~white @ 75% opacity, matches on-devi
 HUD_YELLOW_BGR = (0, 215, 255)
 HUD_RED_BGR = (0, 0, 255)
 
-# Magenta -- matches label_leading_vehicle_frontend.html's own highlight
+# Magenta -- matches super_tool_frontend.html's own highlight
 # color for a human-labeled followed vehicle, so this reads the same way in
 # both tools. Reserved for ground truth specifically (see --ground-truth)
 # now that there's a second, distinct tint for the algorithm's own pick --
@@ -581,6 +581,21 @@ OBJECT_ASPECT_PRIORS = {
     # session, preserving 98% of its known-good frames).
     "car": {"width_mean": 1.629, "height_mean": 1.526, "aspect_tolerance": 1.4},
     "person": {"width_mean": 0.660, "height_mean": 1.761, "aspect_tolerance": 1.8},
+    # ADDED 2026-08-24, same real KITTI pull as ObjectWidthPriors.byLabel's
+    # own doc comment (nateraw/kitti, same 7,481-image/51,865-object set --
+    # see project_kitti_width_stats memory): KITTI has NO "Bus" class at all
+    # (full list: Car/Pedestrian/Van/Cyclist/Truck/Misc/Tram/Person_sitting/
+    # DontCare). "truck" uses KITTI's real Truck stats directly (n=1,094,
+    # width=2.585+/-0.217m, height=3.252+/-0.449m); "bus" reuses the SAME
+    # stats as the closest available real-world proxy (both large, boxy
+    # vehicles, much closer to a truck's profile than a car's or person's).
+    # aspect_tolerance is UNVALIDATED for both -- reused car's 1.4 as a
+    # starting point, pending real head-on/oblique drive data the way
+    # car/person eventually got. Built to fix a real 2039m row-based
+    # blowup on a "bus" detection (phi=0.03 deg, near-horizon noise) that
+    # had zero width-based fallback available before this.
+    "truck": {"width_mean": 2.585, "height_mean": 3.252, "aspect_tolerance": 1.4},
+    "bus": {"width_mean": 2.585, "height_mean": 3.252, "aspect_tolerance": 1.4},
 }
 
 MIN_YAW_RATE_FOR_OBLIQUENESS_CHECK_DEG_S = 1.0
@@ -1196,18 +1211,6 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=None, help="Defaults to <video>-annotated.mp4")
     parser.add_argument(
-        "--reid", dest="reid", action="store_true", default=True,
-        help="Use appearance/ReID matching in the tracker, in addition to motion/IoU (default: on)",
-    )
-    parser.add_argument("--no-reid", dest="reid", action="store_false", help="Geometry-only tracking")
-    parser.add_argument("--reid-model", default=DEFAULT_REID_MODEL)
-    parser.add_argument("--reid-device", default="mps")
-    parser.add_argument(
-        "--gmc", dest="gmc", action="store_true", default=False,
-        help="Compensate track predictions for estimated camera motion (see gmc.py). Off by default -- experimental.",
-    )
-    parser.add_argument("--no-gmc", dest="gmc", action="store_false")
-    parser.add_argument(
         "--flow-arrows", dest="flow_arrows", action="store_true", default=False,
         help="Draw, per tracked object, every constituent of the motion-arrow computation (see "
              "compute_motion_arrow_angular's doc comment), all from its base center: a semi-transparent GREEN "
@@ -1239,18 +1242,18 @@ def main() -> None:
         help="With --flow-arrows, draw ONLY the solid-red smoothed motion arrow (tracker.py's "
              "Track.flow_velocity) plus box/label -- suppresses the four translucent raw debug arrows "
              "(predicted flow x2, observed rate, raw motion) and the FOE/anchor dots, matching "
-             "tools/flow_debug_viewer.py's own default (non-selected) display. No effect without "
+             "tools/super_tool.py's own default (non-selected) display. No effect without "
              "--flow-arrows.",
     )
     parser.add_argument(
         "--flow-debug-json", type=Path, default=None,
         help="Write all five per-track arrow vectors (see --flow-arrows) plus corrected distance, to this "
              "path as JSON -- one entry per detections.jsonl entry, video-relative timestamps -- for "
-             "tools/flow_debug_viewer.py's interactive frame-by-frame viewer, instead of/alongside the "
+             "tools/super_tool.py's interactive frame-by-frame viewer, instead of/alongside the "
              "baked-in --flow-arrows render. Implies the same per-entry computation --flow-arrows does "
              "(so that need not also be passed), but is NOT any cheaper than a full --flow-arrows render -- "
-             "still requires the same full tracker/ReID pass over the whole video regardless of whether "
-             "--output is also written.",
+             "still requires the same full frame-by-frame decode over the whole video regardless of "
+             "whether --output is also written.",
     )
     parser.add_argument(
         "--highlight-leading", dest="highlight_leading", action="store_true", default=True,
@@ -1278,7 +1281,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--ground-truth", type=Path, default=None,
-        help="label_leading_vehicle.py ground truth (e.g. ground_truth_close_range.json) -- when given, "
+        help="super_tool.py ground truth (e.g. ground_truth_close_range.json) -- when given, "
              "tints the human-labeled followed vehicle in magenta alongside the algorithm's own pick "
              "(orange), for side-by-side visual review.",
     )
@@ -1297,31 +1300,25 @@ def main() -> None:
     # below starts next_idx at 0 and unconditionally consumes every entry
     # whose t <= the current frame's epoch -- so on the very first frame it
     # burns through every entry from any EARLIER, unrelated session before
-    # ever reaching this video's own data, calling tracker.update() (a real
-    # reid forward pass, if --reid is on) on each one. Cheap enough to miss
-    # with reid off; catastrophic with it on -- one real case took 800K+
-    # wasted entries from a shared 1.3GB logs directory before reaching a
-    # 67-minute video's own ~27K. This doesn't change behavior (the wasted
-    # entries get pruned by the tracker's own max_age and never corrupt this
-    # video's real tracking, they're just slow) -- just surfaces it instead
-    # of silently eating the wall-clock cost. --detections/--debug-log
-    # pointed at this video's own session directory avoids the waste
-    # entirely.
+    # ever reaching this video's own data. Wasted work either way (a real
+    # case took 800K+ wasted entries from a shared 1.3GB logs directory
+    # before reaching a 67-minute video's own ~27K) -- just surfaces it
+    # instead of silently eating the wall-clock cost. --detections/
+    # --debug-log pointed at this video's own session directory avoids the
+    # waste entirely.
     n_before = bisect.bisect_left([e["t"] for e in detections], start_epoch)
     if n_before > 2000:
         print(
             f"WARNING: {n_before} of {len(detections)} loaded detections entries are from BEFORE "
             f"this video even starts -- {args.detections} likely wasn't scoped to this session. "
             "Pass --detections/--debug-log pointed at this video's own session directory to avoid "
-            "burning through them (slow, especially with --reid on).",
+            "burning through them needlessly.",
             file=sys.stderr,
         )
 
     symmetry_scores = json.loads(args.symmetry_cache.read_text()) if args.symmetry_cache else None
     ground_truth_segments = json.loads(args.ground_truth.read_text()) if args.ground_truth else None
 
-    reid_encoder = build_reid_encoder(args.reid_model, device=args.reid_device) if args.reid else None
-    tracker = ByteTracker(reid_encoder=reid_encoder, use_gmc=args.gmc)
     leading_lock = LeadingVehicleLock(args.leading_confirm_frames, args.leading_grace_frames)
     leading_velocity = VelocityEstimator()
 
@@ -1363,6 +1360,18 @@ def main() -> None:
     # entry-processing loop below), same "don't fabricate a number with no
     # real basis" discipline as the rest of this feature.
     track_flow_state: dict = {}
+    # trackID -> Track, mirroring the on-device app's OWN track identity
+    # instead of this tool's former from-scratch ByteTracker re-run -- see
+    # the 2026-08-24/25 chat discussion for why: this tool's whole purpose
+    # is showing what the device WOULD show running today's software, not
+    # what an independent, better-informed offline re-analysis concludes.
+    # Only holds Track.flow_pos/flow_z/flow_t/flow_velocity/flow_depth_rate
+    # state (via Track.update_flow_state, the real EMA-smoothing/outlier-
+    # gating logic "latest software" is supposed to reflect) -- no
+    # matching/Kalman/ReID machinery is needed here at all, since there's
+    # no re-identification left to do: the device already told us which
+    # detections are the same object (each det's own logged "trackID").
+    device_tracks: dict = {}
     flow_debug_frames: list = []
     aspect = width / height
 
@@ -1390,20 +1399,29 @@ def main() -> None:
             detection_depths = [
                 corrected_distance_meters(det, current_entry, aspect) for det in current_entry["detections"]
             ]
-            current_track_ids = tracker.update(
-                current_entry["detections"], frame=frame,
-                capture_time=capture_time,
-                ego_speed_mps=current_entry.get("egoSpeedMps"),
-                yaw_rate_deg_s=current_entry.get("smoothedYawRateDegreesPerSecond"),
-                pitch_rate_deg_s=current_entry.get("smoothedPitchRateDegreesPerSecond"),
-                roll_rate_deg_s=current_entry.get("smoothedRollRateDegreesPerSecond"),
-                aspect=aspect,
-                detection_depths=detection_depths,
-            )
-            # classify_leading reads trackID off each det -- draw_box below
-            # only takes it as a separate zip'd arg, so stamp it on here too.
-            for det, track_id in zip(current_entry["detections"], current_track_ids):
+            # On-device track identity, not a from-scratch re-tracking pass
+            # -- see device_tracks' own doc comment above for why. Only
+            # Track.update_flow_state's EMA-smoothing/outlier-gating state
+            # needs maintaining per track; there's no matching/Kalman/ReID
+            # left to do since the device already told us which detections
+            # are the same object.
+            current_track_ids = [det.get("trackID") for det in current_entry["detections"]]
+            for det, track_id, depth in zip(current_entry["detections"], current_track_ids, detection_depths):
                 det["trackID"] = track_id
+                if track_id is None or depth is None:
+                    continue
+                track = device_tracks.get(track_id)
+                if track is None:
+                    track = Track(track_id, det["label"], det)
+                    device_tracks[track_id] = track
+                x, y = angular_coords(*base_center_normalized(det), aspect)
+                track.update_flow_state(
+                    x, y, depth, capture_time,
+                    current_entry.get("egoSpeedMps"),
+                    current_entry.get("smoothedYawRateDegreesPerSecond"),
+                    current_entry.get("smoothedPitchRateDegreesPerSecond"),
+                    current_entry.get("smoothedRollRateDegreesPerSecond"),
+                )
             if args.flow_arrows or args.flow_debug_json:
                 # Computed once per detections.jsonl entry (not once per
                 # rendered video frame, matching everything else in this
@@ -1420,17 +1438,17 @@ def main() -> None:
                     smoothed_z = None
                     track = None
                     if track_id is not None:
-                        track = tracker.get_track(track_id)
+                        track = device_tracks.get(track_id)
                         smoothed_z = track.flow_z if track is not None else None
                     flow_angular = predicted_flow_angular(det, current_entry, aspect, z_override=smoothed_z)
                     det["flowAngular"] = flow_angular
                     det["motionAngular"] = None
                     det["prevFlowAngular"] = None
                     det["observedRateAngular"] = None
-                    # The tracker's own per-class-EMA + physical-outlier-
+                    # The Track's own per-class-EMA + physical-outlier-
                     # gated estimate (see Track.update_flow_state) --
-                    # already updated for this entry by tracker.update()
-                    # above, so this just reads it back, no recomputation.
+                    # already updated for this entry above, so this just
+                    # reads it back, no recomputation.
                     # A no-op (0.0, 0.0) is Track's own "assumed
                     # stationary" cold-start default, not missing data.
                     det["smoothedMotionAngular"] = track.flow_velocity if track is not None else None
@@ -1474,8 +1492,8 @@ def main() -> None:
                 )
             if args.flow_debug_json:
                 # Video-relative "t" (not the raw epoch current_entry["t"])
-                # so tools/flow_debug_viewer.py's frontend can binary-search
-                # this the exact same way label_leading_vehicle_frontend
+                # so tools/super_tool.py's frontend can binary-search
+                # this the exact same way super_tool_frontend
                 # .html already does against <video>.currentTime -- no
                 # separate epoch/start_epoch bookkeeping needed client-side.
                 # Placed AFTER the highlight_leading block above (not

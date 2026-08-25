@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pares down label_leading_vehicle.py ground truth to only the sub-ranges of
+Pares down super_tool.py ground truth to only the sub-ranges of
 each labeled segment where the followed vehicle's box is at least
 `--min-width` wide -- i.e. only the "close enough that a following-too-
 closely warning would matter" portion of each segment, not the full

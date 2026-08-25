@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Tunes leading_vehicle.py's classifier parameters against human-labeled
-ground truth (see label_leading_vehicle.py), instead of the one-parameter-
+ground truth (see super_tool.py), instead of the one-parameter-
 at-a-time spot-checking used to get the gates to their current defaults.
 
 Overfitting guard: we currently have ground truth for exactly one video.
@@ -114,7 +114,7 @@ def precompute_frames(entries: list, start_epoch: float, symmetry_scores: list =
     runs once, mirroring track_benchmark.py's cache-what's-expensive split.
     Frame times are converted to video-relative seconds (t - start_epoch),
     matching ground_truth.json's start_t/end_t convention (see
-    label_leading_vehicle.py, which stamps the same conversion) -- comparing
+    super_tool.py, which stamps the same conversion) -- comparing
     against raw epoch timestamps would never match anything.
 
     `symmetry_scores`, if given, is compute_symmetry.py's cache -- one list
@@ -238,7 +238,7 @@ def main() -> None:
     if not detections_path.exists():
         sys.exit(f"{detections_path} doesn't exist.")
     if not gt_path.exists():
-        sys.exit(f"{gt_path} doesn't exist -- label this session with label_leading_vehicle.py first.")
+        sys.exit(f"{gt_path} doesn't exist -- label this session with super_tool.py first.")
 
     video = args.video or find_session_video(args.session_dir)
     debug_log = args.debug_log or (args.session_dir / "overlay-debug.log")

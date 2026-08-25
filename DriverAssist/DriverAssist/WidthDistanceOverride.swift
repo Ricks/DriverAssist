@@ -92,6 +92,31 @@ enum ObjectWidthPriors {
     static let byLabel: [String: Width] = [
         "car": Width(meanMeters: 1.629, stdMeters: 0.102, heightMeanMeters: 1.526, heightStdMeters: 0.137, aspectTolerance: 1.4),
         "person": Width(meanMeters: 0.660, stdMeters: 0.143, heightMeanMeters: 1.761, heightStdMeters: 0.113, aspectTolerance: 1.8),
+        // ADDED 2026-08-24, after a real near-horizon "bus" detection read
+        // 2039m (phi=0.03 deg, a box bottom sitting 30px below the
+        // calibrated horizon) with zero fallback available -- "bus" and
+        // "truck" had NO width prior at all until now, so a class with no
+        // KITTI-derived sanity anchor gets none of this override's
+        // protection: a tiny sub-pixel box-placement error near the horizon
+        // is enough to blow row-based distance up to nearly 2km with
+        // nothing to catch it. CONFIRMED via a fresh pull of the real KITTI
+        // training label set (nateraw/kitti, same 7,481-image/51,865-object
+        // set "car"/"person" came from -- see project_kitti_width_stats
+        // memory): KITTI has NO "Bus" class at all (its full class list is
+        // Car/Pedestrian/Van/Cyclist/Truck/Misc/Tram/Person_sitting/
+        // DontCare) -- "truck" below uses KITTI's real Truck stats (n=1,094,
+        // width=2.585+/-0.217m, height=3.252+/-0.449m) directly; "bus"
+        // reuses the SAME Truck stats as the closest available real-world
+        // proxy (both are large, boxy vehicles, much closer in profile to a
+        // truck than to a car or person) since no better real measurement
+        // exists. aspectTolerance is UNVALIDATED for both -- no real
+        // head-on-vs-oblique drive data for either class yet, unlike car/
+        // person above -- reused car's 1.4 as the closest available
+        // starting point (large rigid vehicles should foreshorten similarly
+        // to a car, not like a walking person's gait/limb noise), pending
+        // real validation data the way car/person eventually got.
+        "truck": Width(meanMeters: 2.585, stdMeters: 0.217, heightMeanMeters: 3.252, heightStdMeters: 0.449, aspectTolerance: 1.4),
+        "bus": Width(meanMeters: 2.585, stdMeters: 0.217, heightMeanMeters: 3.252, heightStdMeters: 0.449, aspectTolerance: 1.4),
     ]
 }
 

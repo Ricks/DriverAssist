@@ -29,32 +29,81 @@
       "trueDistanceMeters": 14
     },
     {
+      "col": 0.4477694746376813,
+      "computedDistanceMeters": 14.354777303323278,
       "image": "far_cones_47-05.png",
       "row": 0.61159420228427,
-      "col": 0.4477694746376813,
-      "trueDistanceMeters": 14,
-      "computedDistanceMeters": 14.354777303323278
+      "trueDistanceMeters": 14
     },
     {
+      "col": 0.4935914855072464,
+      "computedDistanceMeters": 16.180780751237375,
       "image": "far_cones_47-05.png",
       "row": 0.6003019317528688,
-      "col": 0.4935914855072464,
-      "trueDistanceMeters": 16,
-      "computedDistanceMeters": 16.180780751237375
+      "trueDistanceMeters": 16
     },
     {
+      "col": 0.546388134057971,
+      "computedDistanceMeters": 17.558629090218233,
       "image": "far_cones_47-05.png",
       "row": 0.592995168467844,
-      "col": 0.546388134057971,
-      "trueDistanceMeters": 18,
-      "computedDistanceMeters": 17.558629090218233
+      "trueDistanceMeters": 18
     },
     {
+      "col": 0.5163609601449276,
+      "computedDistanceMeters": 20.108903353334885,
       "image": "far_cones_47-05.png",
       "row": 0.5836352650862009,
-      "col": 0.5163609601449276,
+      "trueDistanceMeters": 20
+    },
+    {
+      "image": "cones_20m_pass1_75-53.png",
+      "row": 0.5189814814814826,
+      "col": 0.060937500000000006,
       "trueDistanceMeters": 20,
-      "computedDistanceMeters": 20.108903353334885
+      "computedDistanceMeters": 33.0543382215247
+    },
+    {
+      "image": "cones_20m_pass1_75-53.png",
+      "row": 0.5372018161967042,
+      "col": 0.41595308645492673,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 23.725505621704524
+    },
+    {
+      "image": "cones_20m_pass1_75-53.png",
+      "row": 0.5594657368126322,
+      "col": 0.6760997726876398,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 18.810459253814034
+    },
+    {
+      "image": "cones_20m_pass1_75-53.png",
+      "row": 0.5954096514658916,
+      "col": 0.9818797355148284,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 15.828325767624683
+    },
+    {
+      "image": "cones_20m_pass2_79-10.png",
+      "row": 0.5288198347373821,
+      "col": 0.23959737782598003,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 26.78580305206746
+    },
+    {
+      "image": "cones_20m_pass2_79-10.png",
+      "row": 0.5469220568474974,
+      "col": 0.5453280352689958,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 21.191736169874893
+    },
+    {
+      "image": "cones_20m_pass2_79-10.png",
+      "row": 0.5751434701506604,
+      "col": 0.8190286954098518,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 17.070744828198457
     }
   ]
 }
