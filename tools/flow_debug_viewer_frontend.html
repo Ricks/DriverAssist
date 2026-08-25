@@ -79,6 +79,7 @@
   </select>
   <span class="hint">step size (s)</span>
   <input type="number" id="stepSize" value="0.067" step="0.001" min="0.001" style="width:70px">
+  <button id="unitsToggle">yds</button>
   <span class="hint" id="modeHint">| click a box for full overlay + details &middot; click again / empty space / Esc to clear &middot; keys: &larr;/&rarr; step, space play/pause</span>
 </div>
 
@@ -239,9 +240,17 @@ function smoothedSpeedMph(d) {
 // pick -- BGR (0,165,255) is this same orange.
 const LEADING_TINT_COLOR = '#ffa500';
 
+// Distance display unit -- toggled via #unitsToggle, velocity stays mph
+// either way (no metric equivalent requested for that).
+let useMetricDistance = false;
+
 function distanceText(d) {
-  return (d.correctedDistanceMeters === null || d.correctedDistanceMeters === undefined)
-    ? '? yds' : `${(d.correctedDistanceMeters * METERS_TO_YARDS).toFixed(1)} yds`;
+  if (d.correctedDistanceMeters === null || d.correctedDistanceMeters === undefined) {
+    return useMetricDistance ? '? m' : '? yds';
+  }
+  return useMetricDistance
+    ? `${d.correctedDistanceMeters.toFixed(1)} m`
+    : `${(d.correctedDistanceMeters * METERS_TO_YARDS).toFixed(1)} yds`;
 }
 
 // Black-on-white caption on a translucent backing, same as
@@ -482,17 +491,39 @@ video.addEventListener('seeked', draw);
 
 function stepSize() { return parseFloat(document.getElementById('stepSize').value) || 0.067; }
 
-document.getElementById('stepFwd').addEventListener('click', () => {
+// A seek is asynchronous -- the browser has to demux/decode to the target
+// frame, which for a single ~0.067s (one video frame) step can take longer
+// than the click/key-repeat interval a human (or a held-down arrow key)
+// actually produces. CONFIRMED 2026-08-24: firing seekTo() again before the
+// previous seek's 'seeked' event lands causes the decoder to skip straight
+// to the LATEST requested target, silently dropping every frame in
+// between -- "single-stepping moves by many frames," even though each
+// individual seekTo() call itself was requesting exactly one frame's worth
+// of movement. Guarding stepFwd/stepBack so a step is ignored while the
+// previous one is still resolving forces one visible frame per click/key
+// press, at the cost of not queuing up rapid repeats -- the right tradeoff
+// for a tool whose whole point is inspecting individual frames.
+let stepPending = false;
+video.addEventListener('seeked', () => { stepPending = false; });
+function stepBy(delta) {
+  if (stepPending) return;
+  stepPending = true;
   video.pause(); stopReverse(); setPlayPauseLabel();
-  seekTo(video.currentTime + stepSize());
-});
-document.getElementById('stepBack').addEventListener('click', () => {
-  video.pause(); stopReverse(); setPlayPauseLabel();
-  seekTo(video.currentTime - stepSize());
-});
+  seekTo(video.currentTime + delta);
+}
+
+document.getElementById('stepFwd').addEventListener('click', () => stepBy(stepSize()));
+document.getElementById('stepBack').addEventListener('click', () => stepBy(-stepSize()));
 
 document.getElementById('speed').addEventListener('change', (e) => {
   video.playbackRate = parseFloat(e.target.value);
+});
+
+const unitsToggleBtn = document.getElementById('unitsToggle');
+unitsToggleBtn.addEventListener('click', () => {
+  useMetricDistance = !useMetricDistance;
+  unitsToggleBtn.textContent = useMetricDistance ? 'm' : 'yds';
+  draw();
 });
 
 const playPauseBtn = document.getElementById('playPause');

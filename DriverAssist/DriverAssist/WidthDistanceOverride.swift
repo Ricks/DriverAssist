@@ -211,15 +211,19 @@ final class WidthDistanceOverrideManager {
     /// else in this pipeline -- see DetectionLogEntry.Box's
     /// widthDistanceMeters/distanceMetersIsWidthOverridden fields).
     ///
-    /// `cameraHeightMeters`/`aspectRatio` match `DistanceEstimator
-    /// .distanceMeters`'s own parameters -- pass the same values used to
-    /// produce this frame's row-based readings. `yawRateDegreesPerSecond`
-    /// gates the obliqueness check specifically -- see evaluateGate's own
-    /// doc comment on why a stationary/non-turning ego can't be the cause
-    /// of the viewing-angle distortion that check exists to catch.
+    /// `aspectRatio` matches `DistanceEstimator.distanceMeters`'s own
+    /// parameter -- pass the same value used to produce this frame's
+    /// row-based readings. `yawRateDegreesPerSecond` gates the obliqueness
+    /// check specifically -- see evaluateGate's own doc comment on why a
+    /// stationary/non-turning ego can't be the cause of the viewing-angle
+    /// distortion that check exists to catch. Relies on each detection's
+    /// `groundContactAngleDegrees` already being attached (by the same
+    /// InferenceEngine.attachDistances call that attaches `distanceMeters`)
+    /// for the near-hood-cutoff check -- no longer takes cameraHeightMeters
+    /// itself, since that angle can no longer be backed out of
+    /// `distanceMeters` alone (see that field's own doc comment).
     func apply(
         to detections: [Detection],
-        cameraHeightMeters: Double,
         aspectRatio: Double,
         yawRateDegreesPerSecond: Double?
     ) -> [Detection] {
@@ -233,7 +237,6 @@ final class WidthDistanceOverrideManager {
             var state = states[trackID] ?? OverrideState()
             let gatePassed = evaluateGate(
                 &detection,
-                cameraHeightMeters: cameraHeightMeters,
                 aspectRatio: aspectRatio,
                 yawRateDegreesPerSecond: yawRateDegreesPerSecond
             )
@@ -281,7 +284,6 @@ final class WidthDistanceOverrideManager {
     /// override, this only judges the single frame.
     private func evaluateGate(
         _ detection: inout Detection,
-        cameraHeightMeters: Double,
         aspectRatio: Double,
         yawRateDegreesPerSecond: Double?
     ) -> Bool {
@@ -420,7 +422,7 @@ final class WidthDistanceOverrideManager {
             return false
         }
 
-        let phiDegrees = atan(cameraHeightMeters / rowDistance) * 180 / .pi
+        guard let phiDegrees = detection.groundContactAngleDegrees else { return false }
         let isNearCutoff = phiDegrees <= DistanceEstimator.hoodCutoffAngleDegrees + nearCutoffMarginDegrees
         let confidenceFloor = isNearCutoff ? nearCutoffConfidenceFloor : normalConfidenceFloor
         guard detection.confidence >= confidenceFloor else { return false }

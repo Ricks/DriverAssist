@@ -1,10 +1,12 @@
 #!/bin/bash
 # Pulls DriverAssist's debug/detection logs off the device into ~/DriverAssist/logs/.
 #
-# Archived logs (overlay-debug-<epoch>.log, detections-<epoch>.jsonl) are immutable
-# once rotated (see DebugFileLogger.reset()/DetectionLogger.reset()), so they're only
-# pulled if not already present locally. The "current" logs (overlay-debug.log,
-# detections.jsonl) are still being written to by a running app, so they're always
+# Archived logs (overlay-debug-<epoch>.log, detections-<epoch>.jsonl,
+# lens_calibration-<epoch>.json) are immutable once rotated (see
+# DebugFileLogger.reset()/DetectionLogger.reset()/LensCalibrationLogger.reset()),
+# so they're only pulled if not already present locally. The "current" logs
+# (overlay-debug.log, detections.jsonl, lens_calibration.json) are still being
+# written to (or could still be replaced) by a running app, so they're always
 # re-pulled to pick up the latest content.
 #
 # Run this any time — after a drive, or whenever — there's no harm in re-running it.
@@ -32,7 +34,7 @@ remote_files=$(xcrun devicectl device info files \
     --device "$DEVICE_ID" \
     --domain-type appDataContainer \
     --domain-identifier "$BUNDLE_ID" 2>/dev/null \
-    | grep -E "overlay-debug.*\.log|detections.*\.jsonl" \
+    | grep -E "overlay-debug.*\.log|detections.*\.jsonl|lens_calibration.*\.json" \
     | awk '{print $1}' \
     | sed 's|^Documents/||')
 
@@ -45,7 +47,7 @@ pulled=0
 skipped=0
 for name in $remote_files; do
     case "$name" in
-        overlay-debug.log|detections.jsonl)
+        overlay-debug.log|detections.jsonl|lens_calibration.json)
             # Current/active log — always re-pull for latest content.
             pull "$name"
             echo "  pulled (current): $name"

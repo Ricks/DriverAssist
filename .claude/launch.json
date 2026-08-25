@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "flow-debug-viewer-walkaround",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/Users/rickclark/DriverAssist/tools/flow_debug_viewer.py",
+        "/Users/rickclark/DriverAssist/data/26_08_15_Walkaround/recording-20260815-142808.MOV",
+        "/Users/rickclark/DriverAssist/data/26_08_15_Walkaround/flow_debug.json",
+        "--port",
+        "5053"
+      ],
+      "port": 5053
+    },
+    {
+      "name": "flow-debug-viewer-day-distance",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/Users/rickclark/DriverAssist/tools/flow_debug_viewer.py",
+        "/Users/rickclark/DriverAssist/data/26_08_24_Day_Distance/recording-20260824-130125.MOV",
+        "/Users/rickclark/DriverAssist/data/26_08_24_Day_Distance/flow_debug.json",
+        "--port",
+        "5054"
+      ],
+      "port": 5054
+    }
+  ]
+}

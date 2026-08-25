@@ -100,6 +100,20 @@ private enum SessionPhase {
 
 @MainActor
 struct InferenceView: View {
+    // TEMPORARY, 2026-08-24 -- one-shot lens-calibration-data capture mode.
+    // SUCCEEDED that same day: a real AVCameraCalibrationData capture came
+    // back clean via .builtInTripleCamera/.builtInDualWideCamera (see
+    // LensCalibrationData.factoryMeasured, now hardcoded from that result)
+    // -- reverted to false since the data's already captured and baked in.
+    // AVCameraCalibrationData is a fixed per-device hardware property, so
+    // this mode (and IsolatedLensCalibrationCapture, still in LensCalibration
+    // .swift) would only need to run again if this phone's camera hardware
+    // itself ever changes (repair, replacement) -- see that type's own doc
+    // comment for the full capture recipe (GDC disabled, 2+ constituent
+    // devices required in settings, before-startRunning ordering) before
+    // trying it again from scratch on different hardware.
+    private let isOneTimeLensCalibrationCaptureMode = false
+
     @ObservedObject var modelManager: ModelManager
     @StateObject private var inferenceEngine: InferenceEngine
     @StateObject private var cameraManager = CameraManager()
@@ -251,6 +265,26 @@ struct InferenceView: View {
     /// give `yawNudgeMessage` a left/right/up/down hint instead of a bare
     /// "can't find it."
     @State private var yawNudgeDetectedPosition: (x: CGFloat, y: CGFloat)?
+
+    /// Consecutive-poll hysteresis for `isYawNudgeWarningActive` -- same
+    /// confirm/grace discipline as WidthDistanceOverrideManager/
+    /// LeadingVehicleLock elsewhere in this codebase. Added 2026-08-24
+    /// after a real report: tapping OK produced the confirmation dialog
+    /// despite the rectangle looking green a moment before/after.
+    /// `checkYawNudgeNeeded` is a raw SINGLE-FRAME blob detection with no
+    /// smoothing of its own -- `pollYawNudgeStatus` used to flip
+    /// `isYawNudgeWarningActive` on that one frame's result immediately,
+    /// so one noisy frame (lighting flicker, a stray reflection briefly
+    /// beating the marker's circularity threshold) was enough to arm the
+    /// confirmation gate for that whole ~0.5s poll cycle even though the
+    /// mount was never actually out of tolerance. Requiring a couple of
+    /// consecutive polls to agree before actually changing state filters
+    /// that out, at the cost of a REAL nudge taking up to
+    /// `yawNudgeConfirmPolls` extra poll cycles (~1s) to register --
+    /// negligible next to how long a physical nudge takes anyway.
+    @State private var yawNudgeConsecutiveNeedsNudge = 0
+    @State private var yawNudgeConsecutiveInBand = 0
+    private static let yawNudgeConfirmPolls = 2
 
     /// Gates the level screen's "OK" button when isAttitudeOK or
     /// yaw-nudge-active is true -- see tapOK().
@@ -1110,6 +1144,12 @@ struct InferenceView: View {
         .onAppear {
             DebugFileLogger.reset()
             DetectionLogger.reset()
+            LensCalibrationLogger.reset()
+            guard !isOneTimeLensCalibrationCaptureMode else {
+                DebugFileLogger.log("[InferenceView] isOneTimeLensCalibrationCaptureMode -- skipping normal camera start, running probe only")
+                IsolatedLensCalibrationCapture.runDiagnostic()
+                return
+            }
             // Starts the preview-only session immediately on launch -- used
             // to wait for "Yes" on the now-removed calibrate-prompt screen,
             // but the app now goes straight to the level screen, so the
@@ -1137,7 +1177,15 @@ struct InferenceView: View {
                     normalAEEnabled: cameraManager?.isNormalAEEnabled ?? false,
                     stabilizationEnabled: cameraManager?.isStabilizationEnabled ?? false,
                     parametersLocked: isLocked.wrappedValue,
-                    yawReferenceNormalizedX: cameraManager?.yawReferenceNormalizedX ?? CameraManager.defaultYawMarkerNormalizedX
+                    yawReferenceNormalizedX: cameraManager?.yawReferenceNormalizedX ?? CameraManager.defaultYawMarkerNormalizedX,
+                    // Real capture, not live per-session data -- see
+                    // LensCalibrationData.factoryMeasured's own doc comment.
+                    // AVCameraCalibrationData delivery isn't supported
+                    // through this app's live .builtInWideAngleCamera
+                    // pipeline at all (confirmed via real device testing),
+                    // so there's no live value to fall back to here even in
+                    // principle -- this hardcoded capture IS the value.
+                    lensCalibration: LensCalibrationData.factoryMeasured
                 )
             }
             // PitchSensor/EgoSpeedManager run for the app's whole lifetime, not
@@ -1853,6 +1901,8 @@ struct InferenceView: View {
         isYawCalibrationSessionActive = false
         isYawNudgeWarningActive = true
         yawNudgeDetectedPosition = nil
+        yawNudgeConsecutiveNeedsNudge = 0
+        yawNudgeConsecutiveInBand = 0
         cameraManager.beginYawCalibrationSession {
             Task { @MainActor in
                 isYawCalibrationSessionActive = true
@@ -1878,11 +1928,19 @@ struct InferenceView: View {
             Task { @MainActor in
                 guard isYawCalibrationSessionActive, !isCalibratingWiperMarker, !isShowingManualFocus else { return }
                 if let detected, Self.isWithinYawRectangle(x: detected.x, y: detected.y, geoSize: previewSize) {
-                    withAnimation { isYawNudgeWarningActive = false }
-                    yawNudgeDetectedPosition = nil
+                    yawNudgeConsecutiveInBand += 1
+                    yawNudgeConsecutiveNeedsNudge = 0
+                    if yawNudgeConsecutiveInBand >= Self.yawNudgeConfirmPolls {
+                        withAnimation { isYawNudgeWarningActive = false }
+                        yawNudgeDetectedPosition = nil
+                    }
                 } else {
-                    withAnimation { isYawNudgeWarningActive = true }
+                    yawNudgeConsecutiveNeedsNudge += 1
+                    yawNudgeConsecutiveInBand = 0
                     yawNudgeDetectedPosition = detected
+                    if yawNudgeConsecutiveNeedsNudge >= Self.yawNudgeConfirmPolls {
+                        withAnimation { isYawNudgeWarningActive = true }
+                    }
                 }
                 try? await Task.sleep(for: .seconds(0.5))
                 pollYawNudgeStatus()

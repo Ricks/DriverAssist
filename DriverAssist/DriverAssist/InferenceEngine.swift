@@ -320,7 +320,8 @@ final class InferenceEngine: ObservableObject {
         normalAEEnabled: Bool,
         stabilizationEnabled: Bool,
         parametersLocked: Bool,
-        yawReferenceNormalizedX: CGFloat
+        yawReferenceNormalizedX: CGFloat,
+        lensCalibration: LensCalibrationData?
     ) {
         sourceSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         DebugFileLogger.log("process() called, sourceSize set to \(sourceSize)")
@@ -385,7 +386,8 @@ final class InferenceEngine: ObservableObject {
                         normalAEEnabled: normalAEEnabled,
                         stabilizationEnabled: stabilizationEnabled,
                         parametersLocked: parametersLocked,
-                        yawReferenceNormalizedX: yawReferenceNormalizedX
+                        yawReferenceNormalizedX: yawReferenceNormalizedX,
+                        lensCalibration: lensCalibration
                     )
                 }
             } catch {
@@ -423,7 +425,8 @@ final class InferenceEngine: ObservableObject {
         normalAEEnabled: Bool,
         stabilizationEnabled: Bool,
         parametersLocked: Bool,
-        yawReferenceNormalizedX: CGFloat
+        yawReferenceNormalizedX: CGFloat,
+        lensCalibration: LensCalibrationData?
     ) {
         let trackingStart = CFAbsoluteTimeGetCurrent()
         let result = trackingManager.track(
@@ -436,14 +439,14 @@ final class InferenceEngine: ObservableObject {
         let rangedDetections = Self.attachDistances(
             to: result.detections,
             sourceSize: sourceSize,
-            pitchSensor: pitchSensor
+            pitchSensor: pitchSensor,
+            lensCalibration: lensCalibration
         )
         // Runs BEFORE DetectionLogger.log below, so the override's effect
         // (widthDistanceMeters/distanceMetersIsWidthOverridden) is itself
         // logged -- see WidthDistanceOverrideManager.apply's doc comment.
         let overriddenDetections = widthDistanceOverrideManager.apply(
             to: rangedDetections,
-            cameraHeightMeters: DistanceEstimator.calibrated.cameraHeightMeters,
             aspectRatio: Double(sourceSize.width / sourceSize.height),
             yawRateDegreesPerSecond: pitchSensor.smoothedYawRateDegreesPerSecond
         )
@@ -522,7 +525,8 @@ final class InferenceEngine: ObservableObject {
     private static func attachDistances(
         to detections: [Detection],
         sourceSize: CGSize,
-        pitchSensor: PitchSensor
+        pitchSensor: PitchSensor,
+        lensCalibration: LensCalibrationData?
     ) -> [Detection] {
         guard let referencePitch = pitchSensor.referencePitchDegrees,
               sourceSize.width > 0, sourceSize.height > 0 else {
@@ -532,9 +536,32 @@ final class InferenceEngine: ObservableObject {
         let aspectRatio = Double(sourceSize.width / sourceSize.height)
         return detections.map { detection in
             var detection = detection
+            // Correct for real lens distortion BEFORE the ground-plane math
+            // below, which assumes an ideal pinhole camera -- see
+            // LensCalibration.swift for why this exists (a real tethered
+            // walkaround test showed up to ~25% understated distance for
+            // off-center detections even after fixing two other confirmed
+            // bugs in the row-based formula itself). Falls back to the raw,
+            // uncorrected point when no calibration data is available yet
+            // (or ever, on a device/configuration that doesn't support
+            // delivering it) -- same nil-over-placeholder reasoning as the
+            // reference pitch/roll guard above, just silent rather than
+            // skipping the whole detection, since a raw pinhole reading is
+            // still better than none.
+            let rawPoint = CGPoint(x: detection.boundingBox.midX, y: detection.boundingBox.maxY)
+            let correctedPoint = lensCalibration?.correctedNormalizedPoint(rawPoint) ?? rawPoint
+            let bottomY = Double(correctedPoint.y)
+            let centerX = Double(correctedPoint.x)
             detection.distanceMeters = DistanceEstimator.calibrated.distanceMeters(
-                bottomY: Double(detection.boundingBox.maxY),
-                centerX: Double(detection.boundingBox.midX),
+                bottomY: bottomY,
+                centerX: centerX,
+                referencePitchDegreesBelowHorizontal: referencePitch,
+                referenceRollDegrees: referenceRoll,
+                aspectRatio: aspectRatio
+            )
+            detection.groundContactAngleDegrees = DistanceEstimator.calibrated.groundContactAngleDegrees(
+                bottomY: bottomY,
+                centerX: centerX,
                 referencePitchDegreesBelowHorizontal: referencePitch,
                 referenceRollDegrees: referenceRoll,
                 aspectRatio: aspectRatio

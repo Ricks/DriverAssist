@@ -148,6 +148,19 @@ final class CameraManager: NSObject, ObservableObject {
     /// ContentView.beginYawCalibrationFlow's doc comment).
     @Published private(set) var isYawVerifiedThisSession = false
 
+    /// This device's real, factory-measured lens intrinsics/distortion
+    /// (see LensCalibration.swift) -- captured once per fresh `configure()`
+    /// (not the quick-restart path, which reuses the already-running
+    /// session), nil until that one-shot capture completes or nil forever
+    /// if `isCameraCalibrationDataDeliverySupported` is false on this
+    /// device/configuration. InferenceEngine.attachDistances uses this to
+    /// correct a detection's raw pixel position before DistanceEstimator's
+    /// ideal-pinhole ground-plane math runs on it, when available -- falls
+    /// back to the uncorrected point otherwise, same nil-over-placeholder
+    /// discipline as everything else this project calibrates.
+    @Published private(set) var lensCalibration: LensCalibrationData?
+    private let lensCalibrationCapture = LensCalibrationCapture()
+
     /// Where a *reasonably mounted* phone's camera should roughly point --
     /// the yaw band's fixed center (see ContentView's YawBand), and the
     /// starting value for yawReferenceNormalizedX before any real
@@ -2105,6 +2118,51 @@ final class CameraManager: NSObject, ObservableObject {
 
         session.commitConfiguration()
         session.startRunning()
+
+        // DISABLED 2026-08-24 -- CONFIRMED via a real device log
+        // (DebugFileLogger, since a devicectl-installed build has no live
+        // console attached to catch a plain print()): this device's
+        // AVCapturePhotoOutput.isCameraCalibrationDataDeliverySupported
+        // returns false for the current session configuration
+        // (.builtInWideAngleCamera, .hd1920x1080 preset, AVCaptureVideoData
+        // Output-driven pipeline). That answer won't change run to run on
+        // the same hardware/configuration, so calling this every session
+        // was paying a real cost (the brief video-feed hiccup from adding/
+        // removing the temporary photo output) for zero benefit. Left in
+        // LensCalibration.swift, uncalled, in case a future device or
+        // camera format configuration ever does support it -- see that
+        // file's own doc comment for the full context (a real tethered
+        // walkaround test showing ~25% understated off-center distance is
+        // what this was built to fix; the checkerboard calibration path
+        // -- tools/calibrate_lens_distortion.py -- is the live fallback).
+        //
+        // lensCalibrationCapture.capture(on: session) { [weak self] data in
+        //     guard let self, let data else { return }
+        //     LensCalibrationLogger.log(data)
+        //     DispatchQueue.main.async { self.lensCalibration = data }
+        // }
+
+        // DISABLED 2026-08-24 -- CONFIRMED CRASH via real device log: this
+        // isolated second session DID get isCameraCalibrationDataDelivery
+        // Supported == true for .builtInTripleCamera (the GDC-disable +
+        // virtual-constituent-delivery fix, from forums.developer.apple.com
+        // /forums/thread/741815, genuinely works) -- but the live session
+        // logged its own AVFoundationErrorDomain runtime error
+        // (code=-11800) the moment this second session started, and the
+        // actual capturePhoto() call crashed the process outright right
+        // after logging "capturing" (no further log line ever appears).
+        // Running two AVCaptureSessions concurrently against the same
+        // physical camera hardware is not safe on this device -- exactly
+        // the risk flagged when this approach was chosen over swapping the
+        // live pipeline's own device. Confirmed via 3 repeated crash-
+        // relaunch-crash cycles in the pulled logs. Left in
+        // LensCalibration.swift, uncalled -- the fix itself (GDC disable +
+        // virtual constituent delivery) is proven correct and worth
+        // reusing if this is ever attempted again, but ONLY against the
+        // live session's own device, never a second concurrent session.
+        //
+        // IsolatedLensCalibrationCapture.runDiagnostic()
+
         if startRecording { startNewRecording() }
     }
 

@@ -42,4 +42,14 @@ struct Detection: Identifiable, Equatable {
     /// false if it's still the original row-based `DistanceEstimator`
     /// reading.
     var distanceMetersIsWidthOverridden: Bool = false
+    /// Ground-contact angle phi (degrees) from DistanceEstimator
+    /// .groundContactAngleDegrees -- the vertical-only angle `distanceMeters`
+    /// itself used to derive before it was generalized to full 3D radial
+    /// distance (see that method's doc comment). Kept as its own field
+    /// because WidthDistanceOverride's near-hood-cutoff check needs this
+    /// specific angle, not the one implied by dividing `cameraHeightMeters`
+    /// by the (now lateral-inclusive) `distanceMeters` -- that division
+    /// would silently understate phi for any off-center detection. nil
+    /// under the same conditions `distanceMeters` is nil.
+    var groundContactAngleDegrees: Double? = nil
 }

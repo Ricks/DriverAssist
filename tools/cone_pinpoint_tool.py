@@ -25,10 +25,17 @@ row_based_distance_meters reconstruct_annotated.py itself uses) so you see
 the calibration residual immediately as you mark points, instead of only
 finding out after a separate offline fit run.
 
+Points default to /calibration/ at the repo root (NOT under /data/, even
+though the source images/video live there) -- 2026-08-24, real request:
+/data/ is blanket-gitignored as large regenerable recording output, and
+this small hand-marked ground truth doesn't fit that description, so it
+gets its own always-tracked directory instead of a narrow gitignore
+exception carved out of /data/'s rule.
+
 Usage:
     python3 cone_pinpoint_tool.py <image1> [<image2> ...] [--output points.json] [--port 5052]
 
-Defaults --output to <first image's directory>/cone_calibration_points.json
+Defaults --output to <repo root>/calibration/cone_calibration_points.json
 and pre-loads any points already saved there (so re-running the tool to add
 more points, or fix a mismarked one, doesn't lose earlier work).
 """
@@ -75,6 +82,7 @@ def build_app(images: list, output_path: Path) -> Flask:
     def save_points():
         nonlocal points
         points = request.get_json()["points"]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps({"points": points}, indent=2))
         return jsonify({"ok": True, "path": str(output_path), "count": len(points)})
 
@@ -99,14 +107,21 @@ def build_app(images: list, output_path: Path) -> Flask:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("images", type=Path, nargs="+", help="Still frame(s) to mark points on")
-    parser.add_argument("--output", type=Path, default=None, help="Points JSON path (default: <first image's dir>/cone_calibration_points.json)")
+    parser.add_argument(
+        "--output", type=Path, default=None,
+        help="Points JSON path (default: <repo root>/calibration/cone_calibration_points.json -- "
+             "a dedicated top-level directory, deliberately NOT inside /data/, so this small "
+             "hand-marked ground truth is tracked by git normally instead of needing a gitignore "
+             "exception carved out of /data/'s blanket 'large regenerable recording output' rule)",
+    )
     parser.add_argument("--port", type=int, default=5052)
     args = parser.parse_args()
 
     for img in args.images:
         if not img.exists():
             sys.exit(f"{img} doesn't exist.")
-    output_path = args.output or (args.images[0].parent / "cone_calibration_points.json")
+    output_path = args.output or (Path(__file__).parent.parent / "calibration" / "cone_calibration_points.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     app = build_app(args.images, output_path)
     print(f"\nOpen http://localhost:{args.port} in a browser.")

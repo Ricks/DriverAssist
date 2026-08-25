@@ -401,31 +401,129 @@ measured 2026-08-15 for the current SHAPE clamp mount. Kept in sync
 deliberately, not derived from it."""
 
 
+# Same real AVCameraCalibrationData capture as LensCalibrationData
+# .factoryMeasured (Swift, LensCalibration.swift) -- 2026-08-24, this exact
+# physical device, via IsolatedLensCalibrationCapture (GDC disabled, 2+
+# constituent devices requested, virtual-constituent-delivery enabled before
+# startRunning -- see that Swift type's own doc comment for the full
+# recipe). Kept in sync deliberately, not derived from it. Cross-checked
+# there against the independent cone-calibration fit to within 4.4%. Raw
+# capture backed up at calibration/lens_calibration_20260824.json.
+_LENS_CALIB_FX = 3005.462158203125
+_LENS_CALIB_FY = 3005.462158203125
+_LENS_CALIB_CX = 2103.8779296875
+_LENS_CALIB_CY = 1188.294921875
+_LENS_CALIB_REFERENCE_WIDTH = 4224.0
+_LENS_CALIB_REFERENCE_HEIGHT = 2376.0
+_LENS_CALIB_DISTORTION_CENTER_X = 2103.962646484375
+_LENS_CALIB_DISTORTION_CENTER_Y = 1188.3253173828125
+_LENS_CALIB_DISTORTION_LOOKUP_TABLE = [
+    0, 9.703804e-05, 0.0003860671, 0.000860824, 0.0015108482, 0.002321466, 0.0032738035,
+    0.004344853, 0.005507639, 0.0067315097, 0.007982596, 0.00922447, 0.010419019,
+    0.011527535, 0.012512018, 0.013336645, 0.01396934, 0.014383375, 0.014558875,
+    0.014484134, 0.014156586, 0.013583343, 0.012781186, 0.011775943, 0.010601236,
+    0.009296611, 0.00790514, 0.006470612, 0.0050345063, 0.0036329643, 0.0022940412,
+    0.0010355223, -0.00013637631, -0.0012271275, -0.0022525825, -0.0032360968,
+    -0.004204166, -0.005180965, -0.006182665, -0.0072130556, -0.008262857, -0.009316202,
+]
+
+
+def _corrected_normalized_point(bottom_y: float, center_x: float) -> tuple:
+    """Ports LensCalibrationData.correctedNormalizedPoint (Swift) exactly --
+    corrects a normalized [0,1], top-left-origin point from the real,
+    distorted camera image to where it would appear in an ideal pinhole
+    image, using Apple's own documented lookup-table algorithm (radial-
+    distance-indexed magnification, linearly interpolated). Applied to EVERY
+    row_based_distance_meters/_row_based_phi_degrees call so the same
+    correction reaches both the distance formula and the hood-cutoff angle
+    check, mirroring InferenceEngine.attachDistances applying it once,
+    upstream of both Swift consumers, before today's fix existed on the
+    device this recording predates. See that struct's own doc comment for
+    the coordinate-space assumption this relies on (same field of view/crop
+    as the calibration capture, just a different pixel count -- true here,
+    since both are the same 16:9 aspect ratio)."""
+    px = center_x * _LENS_CALIB_REFERENCE_WIDTH
+    py = bottom_y * _LENS_CALIB_REFERENCE_HEIGHT
+    ocx, ocy = _LENS_CALIB_DISTORTION_CENTER_X, _LENS_CALIB_DISTORTION_CENTER_Y
+    w, h = _LENS_CALIB_REFERENCE_WIDTH, _LENS_CALIB_REFERENCE_HEIGHT
+    r_max = math.hypot(max(ocx, w - ocx), max(ocy, h - ocy))
+    vx, vy = px - ocx, py - ocy
+    r_point = math.hypot(vx, vy)
+    table = _LENS_CALIB_DISTORTION_LOOKUP_TABLE
+    last_index = len(table) - 1
+    if r_point == 0 or r_max == 0 or last_index < 0:
+        return bottom_y, center_x
+    scaled_r = min(last_index, (r_point / r_max) * last_index)
+    lower_index = int(scaled_r)
+    t = scaled_r - lower_index
+    lower_value = table[lower_index]
+    upper_value = table[min(lower_index + 1, last_index)]
+    magnification = lower_value + t * (upper_value - lower_value)
+    new_vx = vx + magnification * vx
+    new_vy = vy + magnification * vy
+    corrected_px = ocx + new_vx
+    corrected_py = ocy + new_vy
+    return corrected_py / h, corrected_px / w
+
+
 def row_based_distance_meters(
     bottom_y: float, center_x: float, aspect: float,
     reference_pitch_deg: float, reference_roll_deg: float,
 ) -> Optional[float]:
     """Ports DistanceEstimator.distanceMeters's ground-plane (row-based)
-    formula exactly -- ground-contact angle phi = alpha + theta, distance =
-    cameraHeightMeters / tan(phi). Used to RECOVER the pre-override distance
-    for a detection where distanceMetersIsWidthOverridden is true and the
-    box is edge-truncated (see corrected_distance_meters): the on-device
-    pipeline mutates Detection.distanceMeters in place when the width
-    override fires, so the original row-based value isn't itself logged --
-    but every input this formula needs (box geometry, reference pitch/roll)
-    IS logged per-entry, so it's cheaply recomputable offline instead of
-    needing a new recording."""
+    formula exactly. Used to RECOVER the pre-override distance for a
+    detection where distanceMetersIsWidthOverridden is true and the box is
+    edge-truncated (see corrected_distance_meters): the on-device pipeline
+    mutates Detection.distanceMeters in place when the width override
+    fires, so the original row-based value isn't itself logged -- but every
+    input this formula needs (box geometry, reference pitch/roll) IS logged
+    per-entry, so it's cheaply recomputable offline instead of needing a
+    new recording.
+
+    GENERALIZED TO FULL 3D -- FIXED 2026-08-23, matching the same-day Swift
+    fix (see DistanceEstimator.distanceMeters's own doc comment for the full
+    derivation/verification). Until this date this returned
+    `cameraHeightMeters / tan(alpha + theta)` -- exactly correct only for a
+    point on the frame's vertical centerline, since it discarded the
+    lateral ("derolled_x") component of the ray entirely; for anything
+    off-center it silently returned the ray's forward DEPTH, not the true
+    ground distance, understating distance more the further off-axis the
+    detection sat. CONFIRMED via real 26_08_15_Walkaround data: a person
+    walking a constant-radius tether arc read as shrinking purely from
+    walking off to the side. Fix: invert the full pitch+roll rotation to
+    recover the ray in world coordinates, solve for where it crosses the
+    ground plane, and return the full lateral+forward hypotenuse there.
+    `_row_based_phi_degrees` below is UNCHANGED and still uses the old
+    vertical-only angle -- HOOD_CUTOFF_ANGLE_DEGREES was calibrated against
+    that specific angle, not the radial distance this function now
+    returns.
+
+    LENS DISTORTION CORRECTED -- ADDED 2026-08-24, applied to (bottom_y,
+    center_x) before anything else below: see _corrected_normalized_point's
+    own doc comment. This recording predates the real AVCameraCalibration
+    Data capture, but lens distortion is a fixed hardware property of the
+    physical lens, not a per-recording one, so applying it retroactively
+    here is exactly as valid as it would have been live."""
+    bottom_y, center_x = _corrected_normalized_point(bottom_y, center_x)
     theta = math.radians(reference_pitch_deg)
     psi = math.radians(reference_roll_deg)
     focal_col = FLOW_FOCAL_LENGTH_ROW_NORMALIZED / aspect
     x = (center_x - FLOW_PRINCIPAL_COLUMN_NORMALIZED) / focal_col
     y = (bottom_y - FLOW_PRINCIPAL_ROW_NORMALIZED) / FLOW_FOCAL_LENGTH_ROW_NORMALIZED
     derolled_y = -x * math.sin(psi) + y * math.cos(psi)
-    alpha = math.atan(derolled_y)
-    phi = alpha + theta
-    if not (0 < phi < math.pi / 2):
+    derolled_x = x * math.cos(psi) + y * math.sin(psi)
+
+    ray_down = math.cos(theta) * derolled_y + math.sin(theta)
+    if ray_down <= 0:
         return None
-    return DISTANCE_CAMERA_HEIGHT_METERS / math.tan(phi)
+    ray_forward = math.cos(theta) - math.sin(theta) * derolled_y
+
+    range_at_ground = DISTANCE_CAMERA_HEIGHT_METERS / ray_down
+    lateral_m = range_at_ground * derolled_x
+    forward_m = range_at_ground * ray_forward
+    if forward_m <= 0:
+        return None
+    return math.hypot(lateral_m, forward_m)
 
 
 HOOD_CUTOFF_ANGLE_DEGREES = 9.899
@@ -448,9 +546,19 @@ def _row_based_phi_degrees(
     bottom_y: float, center_x: float, aspect: float,
     reference_pitch_deg: float, reference_roll_deg: float,
 ) -> float:
-    """The ground-contact angle phi alone (see row_based_distance_meters,
-    same formula) -- split out so HOOD_CUTOFF_ANGLE_DEGREES can be checked
-    independent of whatever distance value ultimately gets used."""
+    """The ground-contact angle phi alone -- split out so
+    HOOD_CUTOFF_ANGLE_DEGREES can be checked independent of whatever
+    distance value ultimately gets used. Deliberately UNCHANGED by
+    row_based_distance_meters' 2026-08-23 full-3D fix (see that function's
+    doc comment): HOOD_CUTOFF_ANGLE_DEGREES was calibrated by converting
+    real boxes' bottom rows to this exact vertical-only angle, so this
+    still needs to compute the same thing, not the angle implied by the
+    now-lateral-inclusive distance.
+
+    LENS DISTORTION CORRECTED -- ADDED 2026-08-24, same as row_based_
+    distance_meters, so the hood-cutoff check sees the same corrected point
+    the distance formula does."""
+    bottom_y, center_x = _corrected_normalized_point(bottom_y, center_x)
     theta = math.radians(reference_pitch_deg)
     psi = math.radians(reference_roll_deg)
     focal_col = FLOW_FOCAL_LENGTH_ROW_NORMALIZED / aspect
@@ -543,10 +651,11 @@ def is_oblique_view(det: dict, entry: dict, aspect: float) -> bool:
 
 
 def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional[float]:
-    """distanceMeters, corrected for FOUR CONFIRMED corruption cases
-    (cases 1-3 found 2026-08-22, case 4 found 2026-08-23, all via this
-    session's flow-arrow visualization surfacing distance errors as
-    visibly wrong motion):
+    """distanceMeters, corrected for FIVE CONFIRMED corruption cases
+    (cases 1-3 found 2026-08-22, case 4 found 2026-08-23, case 5 found
+    2026-08-24, all via this session's flow-arrow visualization or a real
+    tethered walkaround test surfacing distance errors as visibly wrong
+    motion or wrong numbers):
 
     1. LEFT/RIGHT edge truncation with the width-based override active
        (distanceMetersIsWidthOverridden) -- the logged value is the
@@ -582,9 +691,19 @@ def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional
        (both are "the width-based reading can't be trusted here," just
        from different causes: cropping vs viewing angle).
 
-    Any other detection (no truncation/obliqueness, or override active but
-    neither -- a legitimate "genuinely closer" reading) passes
-    distanceMeters through unchanged."""
+    5. Not width-overridden at all -- the common case. The logged value here
+       is whatever row_based_distance_meters computed ON THE DEVICE at
+       record time, which for any recording predating that formula's
+       2026-08-24 fix is the OLD forward-depth-only reading for any
+       off-center detection. Always recomputed fresh instead of trusted, so
+       this function reflects CURRENT understanding of the formula on
+       historical logs, not whatever was true when they were recorded.
+
+    A width-overridden reading with neither truncation nor obliqueness (a
+    legitimate "genuinely closer" width-based reading, unaffected by any of
+    the row-based formula's history -- widthBasedDistanceMeters is a
+    different computation entirely) passes distanceMeters through
+    unchanged."""
     left = det["x"]
     right = det["x"] + det["w"]
     bottom = det["y"] + det["h"]
@@ -602,7 +721,31 @@ def corrected_distance_meters(det: dict, entry: dict, aspect: float) -> Optional
         return det.get("widthDistanceMeters")
 
     if not det.get("distanceMetersIsWidthOverridden"):
-        return det.get("distanceMeters")
+        # CASE 5, found 2026-08-24: the logged value here is whatever
+        # row_based_distance_meters produced ON THE DEVICE, at record time --
+        # for any recording made before that formula's 2026-08-24 lateral-
+        # angle fix (every recording this project has so far), that's the
+        # OLD, buggy forward-depth-only reading for any off-center detection,
+        # not the corrected radial distance. CONFIRMED via a real tethered
+        # walkaround test: recomputing fresh here (as this branch now does)
+        # recovers the fixed formula's ~20m reading where the stale logged
+        # value read as low as ~15.4m at the frame edge -- a gap that first
+        # looked like leftover lens distortion until direct comparison
+        # showed `corrected_distance_meters` was returning the untouched
+        # pre-fix logged value on every single frame, not a freshly
+        # recomputed one. Recomputing fresh is exactly what row_based_
+        # distance_meters exists for (see its own doc comment: "cheaply
+        # recomputable offline instead of needing a new recording") --
+        # falls back to the logged value only if recomputation itself
+        # can't produce one (invalid geometry), same as cases 1/4 below.
+        recomputed = row_based_distance_meters(
+            bottom_y=bottom,
+            center_x=det["x"] + det["w"] / 2,
+            aspect=aspect,
+            reference_pitch_deg=entry.get("referencePitchDegrees", 0.0),
+            reference_roll_deg=entry.get("referenceRollDegrees", 0.0),
+        )
+        return recomputed if recomputed is not None else det.get("distanceMeters")
     if not side_truncated and not is_oblique_view(det, entry, aspect):
         return det.get("distanceMeters")
     recomputed = row_based_distance_meters(

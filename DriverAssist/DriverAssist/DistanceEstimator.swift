@@ -247,11 +247,42 @@ struct DistanceEstimator {
     ///     normalized against -- NOT a fixed constant, varies with
     ///     `ModelManager`'s resolution mode. Pass whichever was actually
     ///     active when this detection was produced.
-    /// - Returns: nil if the resulting ground-plane angle isn't a valid point
-    ///   in front of and below the camera (at/above the horizon, or beyond
-    ///   the straight-down degenerate case) -- geometrically not a finite
-    ///   forward distance, so treat as "can't estimate" rather than clamping
-    ///   to some default.
+    /// - Returns: nil if the resulting ray doesn't cross the ground plane in
+    ///   front of and below the camera (points at/above the horizon) --
+    ///   geometrically not a finite forward distance, so treat as "can't
+    ///   estimate" rather than clamping to some default.
+    ///
+    /// *** GENERALIZED TO FULL 3D -- FIXED 2026-08-23. Until this date, this
+    /// *** method computed `alpha = atan(derolledY)` and `phi = alpha +
+    /// *** theta`, then returned `cameraHeightMeters / tan(phi)` -- a formula
+    /// *** that silently discards `derolledX` (the point's lateral angle
+    /// *** once roll is undone) entirely. That's exactly correct for a point
+    /// *** on the frame's vertical centerline (derolledX == 0), where it
+    /// *** reduces to the right-triangle relationship in this file's header
+    /// *** comment -- but for anything off-center, it was returning the
+    /// *** ray's forward DEPTH component, not the true straight-line ground
+    /// *** distance to the object, understating distance more the further
+    /// *** off-axis the detection sat.
+    /// ***
+    /// *** CONFIRMED via real 2026-08-15 walkaround-test data: a person
+    /// *** walking a constant-radius tether arc read as shrinking from
+    /// *** ~16m to ~10m purely from walking off to the side, not from any
+    /// *** real change in distance. CONFIRMED independently via an exact
+    /// *** synthetic 3D projection check: a known ground point 20m away but
+    /// *** 19m off-axis returned 6.24m under the old formula (its true
+    /// *** forward depth), recovering exactly 20.000000m under the fix
+    /// *** below across every lateral offset and roll angle tried.
+    /// ***
+    /// *** Fix: instead of reading off an angle that implicitly assumes
+    /// *** zero lateral offset, invert the full pitch+roll rotation to
+    /// *** recover the camera ray in WORLD coordinates, solve for where that
+    /// *** ray crosses the ground plane (using cameraHeightMeters as the
+    /// *** known vertical drop), and return the full lateral+forward
+    /// *** hypotenuse at that ground point -- not just its forward
+    /// *** component. See `groundContactAngleDegrees` below for the old
+    /// *** vertical-only angle, kept as its own method: WidthDistanceOverride
+    /// *** needs that specific angle (calibrated into
+    /// *** `hoodCutoffAngleDegrees`), not the one this method now returns.
     func distanceMeters(
         bottomY: Double,
         centerX: Double,
@@ -267,14 +298,65 @@ struct DistanceEstimator {
         let y = (bottomY - principalRowNormalized) / focalLengthNormalized
 
         // De-roll: rotate the (col, row) offset by -psi to undo the camera's
-        // own roll before reading off the vertical angle -- see the roll
-        // sign-convention warning at the top of this file.
+        // own roll -- see the roll sign-convention warning at the top of
+        // this file. derolledY is the vertical angle once roll is undone
+        // (same quantity `groundContactAngleDegrees` uses); derolledX is the
+        // lateral counterpart this method now keeps instead of discarding.
         let derolledY = -x * sin(psi) + y * cos(psi)
+        let derolledX = x * cos(psi) + y * sin(psi)
 
+        // Un-pitch into world coordinates: rayDown/rayForward are the
+        // downward/forward components (world frame) of the ray through this
+        // pixel, after rotating by pitch theta about the camera's lateral
+        // axis. The ray must point downward (rayDown > 0) to ever cross the
+        // ground plane below the camera.
+        let rayDown = cos(theta) * derolledY + sin(theta)
+        guard rayDown > 0 else { return nil }
+        let rayForward = cos(theta) - sin(theta) * derolledY
+
+        // Scale the ray so its downward component covers cameraHeightMeters
+        // -- that's where it crosses the ground -- then read off both
+        // horizontal components at that same scale.
+        let rangeAtGround = cameraHeightMeters / rayDown
+        let lateralMeters = rangeAtGround * derolledX
+        let forwardMeters = rangeAtGround * rayForward
+        guard forwardMeters > 0 else { return nil }
+        return (lateralMeters * lateralMeters + forwardMeters * forwardMeters).squareRoot()
+    }
+
+    /// The ground-contact angle phi alone (degrees) -- what `distanceMeters`
+    /// itself computed and inverted before the 2026-08-23 fix above, kept as
+    /// its own method because it's still the correct quantity for a
+    /// different purpose: `hoodCutoffAngleDegrees` was measured (see that
+    /// constant's own doc comment) by converting real boxes' bottom rows to
+    /// this exact vertical-only angle, so comparing against it needs this
+    /// same formula, not the angle implied by the new (lateral-inclusive)
+    /// `distanceMeters`. Using `atan(cameraHeightMeters / distanceMeters)`
+    /// after the fix above would silently understate phi for any off-center
+    /// detection, since distanceMeters now grows with lateral offset while
+    /// the true hood-encroachment angle doesn't.
+    ///
+    /// - Returns: nil under the same at/above-horizon condition
+    ///   `distanceMeters` returns nil for.
+    func groundContactAngleDegrees(
+        bottomY: Double,
+        centerX: Double,
+        referencePitchDegreesBelowHorizontal: Double,
+        referenceRollDegrees: Double,
+        aspectRatio: Double
+    ) -> Double? {
+        let theta = referencePitchDegreesBelowHorizontal * .pi / 180
+        let psi = referenceRollDegrees * .pi / 180
+
+        let focalLengthColumnNormalized = focalLengthNormalized / aspectRatio
+        let x = (centerX - Self.assumedPrincipalColumnNormalized) / focalLengthColumnNormalized
+        let y = (bottomY - principalRowNormalized) / focalLengthNormalized
+
+        let derolledY = -x * sin(psi) + y * cos(psi)
         let alpha = atan(derolledY)
         let phi = alpha + theta
         guard phi > 0, phi < .pi / 2 else { return nil }
-        return cameraHeightMeters / tan(phi)
+        return phi * 180 / .pi
     }
 
     func distanceFeet(

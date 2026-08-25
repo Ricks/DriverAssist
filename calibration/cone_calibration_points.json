@@ -1,0 +1,60 @@
+{
+  "points": [
+    {
+      "col": 0.486555606485669,
+      "computedDistanceMeters": 7.987840301041136,
+      "image": "near_cones_34-10.png",
+      "row": 0.6864149054677505,
+      "trueDistanceMeters": 8
+    },
+    {
+      "col": 0.5139039855072465,
+      "computedDistanceMeters": 9.945717989894787,
+      "image": "near_cones_34-10.png",
+      "row": 0.6525563604013953,
+      "trueDistanceMeters": 10
+    },
+    {
+      "col": 0.4453351449275362,
+      "computedDistanceMeters": 12.292034472031922,
+      "image": "near_cones_34-10.png",
+      "row": 0.6274758451034886,
+      "trueDistanceMeters": 12
+    },
+    {
+      "col": 0.5652173913043478,
+      "computedDistanceMeters": 13.420422923135929,
+      "image": "near_cones_34-10.png",
+      "row": 0.6165257645881904,
+      "trueDistanceMeters": 14
+    },
+    {
+      "image": "far_cones_47-05.png",
+      "row": 0.61159420228427,
+      "col": 0.4477694746376813,
+      "trueDistanceMeters": 14,
+      "computedDistanceMeters": 14.354777303323278
+    },
+    {
+      "image": "far_cones_47-05.png",
+      "row": 0.6003019317528688,
+      "col": 0.4935914855072464,
+      "trueDistanceMeters": 16,
+      "computedDistanceMeters": 16.180780751237375
+    },
+    {
+      "image": "far_cones_47-05.png",
+      "row": 0.592995168467844,
+      "col": 0.546388134057971,
+      "trueDistanceMeters": 18,
+      "computedDistanceMeters": 17.558629090218233
+    },
+    {
+      "image": "far_cones_47-05.png",
+      "row": 0.5836352650862009,
+      "col": 0.5163609601449276,
+      "trueDistanceMeters": 20,
+      "computedDistanceMeters": 20.108903353334885
+    }
+  ]
+}

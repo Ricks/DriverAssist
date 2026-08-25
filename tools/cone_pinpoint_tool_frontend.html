@@ -113,7 +113,12 @@ Promise.all([
     opt.value = name; opt.textContent = name;
     imageSelect.appendChild(opt);
   }
-  if (images.length) loadImage(images[0]);
+  // Restore whichever image was last being marked, rather than always
+  // resetting to the first one -- a plain page refresh (or the server
+  // restarting) shouldn't throw away where you were mid-session.
+  const lastImage = localStorage.getItem('conePinpointLastImage');
+  const startImage = (lastImage && images.includes(lastImage)) ? lastImage : images[0];
+  if (startImage) { imageSelect.value = startImage; loadImage(startImage); }
   renderTable();
 });
 
@@ -121,6 +126,7 @@ imageSelect.addEventListener('change', () => loadImage(imageSelect.value));
 
 function loadImage(name) {
   currentImage = name;
+  localStorage.setItem('conePinpointLastImage', name);
   selectedPoint = null;
   img = new Image();
   img.onload = () => {
