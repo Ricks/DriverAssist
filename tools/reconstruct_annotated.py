@@ -60,6 +60,13 @@ from leading_vehicle import (
 from tracker import Track
 from tune_leading_vehicle import ground_truth_at
 
+# distance_fusion.py itself does `import reconstruct_annotated as recon`,
+# a circular import -- safe here only because distance_fusion.py touches
+# recon.* exclusively inside function bodies, never at its own module
+# level, so recon doesn't need to be fully initialized yet when Python
+# resolves this line.
+import distance_fusion as fusion
+
 # BGR (OpenCV convention) approximations of the on-device box colors — these
 # don't need to be pixel-identical to iOS's system colors, just visually
 # distinct per class, matching OverlayStyle.color(for:) in the app.
@@ -1530,6 +1537,15 @@ def main() -> None:
                             "observedRateAngular": det.get("observedRateAngular"),
                             "motionAngular": det.get("motionAngular"),
                             "smoothedMotionAngular": det.get("smoothedMotionAngular"),
+                            # Added alongside correctedDistanceMeters, not
+                            # replacing it -- real request 2026-08-26, so a
+                            # labeling pass can compare the existing binary
+                            # row/width switch against the fusion module
+                            # side by side on real footage, not just trust
+                            # one number. See distance_fusion.py's own
+                            # top-of-file doc comment for what's real vs.
+                            # still a gap in what this represents.
+                            **fusion.fuse_distance_meters(det, current_entry, aspect),
                         }
                         for det, track_id in zip(current_entry["detections"], current_track_ids)
                     ],

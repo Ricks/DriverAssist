@@ -54,6 +54,21 @@
         "5056"
       ],
       "port": 5056
+    },
+    {
+      "name": "super-tool-day-walk",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/Users/rickclark/DriverAssist/tools/super_tool.py",
+        "/Users/rickclark/DriverAssist/data/26_08_26_Day_Walk/recording-20260826-095332.MOV",
+        "--detections",
+        "/Users/rickclark/DriverAssist/logs/detections.jsonl",
+        "--debug-log",
+        "/Users/rickclark/DriverAssist/logs/overlay-debug.log",
+        "--port",
+        "5057"
+      ],
+      "port": 5057
     }
   ]
 }

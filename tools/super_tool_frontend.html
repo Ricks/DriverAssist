@@ -374,6 +374,29 @@ function distanceText(d) {
     : `${(d.correctedDistanceMeters * METERS_TO_YARDS).toFixed(1)} yds`;
 }
 
+// distance_fusion.py's fused_distance_meters, added 2026-08-26 ALONGSIDE
+// correctedDistanceMeters (the existing binary row/width switch), not
+// replacing it -- the whole point of wiring this in is a side-by-side
+// labeling pass, not a silent swap. UNRELIABLE (fused_distance_meters ===
+// null) gets a distinct word, not a '?' that could be misread as "missing
+// data" the way distanceText's own no-data case reads.
+function fusedDistanceText(d) {
+  if (d.fused_distance_meters === undefined) return null; // no --flow-debug-json fusion data at all
+  if (d.fused_distance_meters === null) return 'UNRELIABLE';
+  return useMetricDistance
+    ? `${d.fused_distance_meters.toFixed(1)} m`
+    : `${(d.fused_distance_meters * METERS_TO_YARDS).toFixed(1)} yds`;
+}
+
+// True when the two distances disagree enough to be worth flagging in the
+// compact box caption (not just in the detail panel) -- 15% relative,
+// picked to surface real divergences without flagging routine sub-percent
+// noise on every box in frame.
+function distancesDisagree(d) {
+  if (d.correctedDistanceMeters == null || d.fused_distance_meters == null) return false;
+  return Math.abs(d.fused_distance_meters - d.correctedDistanceMeters) / d.correctedDistanceMeters > 0.15;
+}
+
 // Black-on-white caption on a translucent backing, same as
 // draw_label_text in reconstruct_annotated.py.
 function drawCaption(text, x, y) {
@@ -441,17 +464,33 @@ function drawHud(f, w, h) {
 function updateDetail(d) {
   if (!d) { detailEl.style.display = 'none'; return; }
   const fmt = (v) => v ? `(${v[0].toFixed(4)}, ${v[1].toFixed(4)})` : 'null';
+  const fmtNum = (v, digits) => v == null ? 'null' : v.toFixed(digits);
   detailEl.style.display = 'block';
-  detailEl.textContent =
+  let text =
     `#${d.trackID} ${d.label}  conf=${(d.confidence * 100).toFixed(1)}%\n` +
-    `correctedDistanceMeters = ${d.correctedDistanceMeters == null ? 'null' : d.correctedDistanceMeters.toFixed(2)}` +
-    `   widthOverridden = ${d.widthOverridden}\n` +
+    `correctedDistanceMeters (existing switch) = ${fmtNum(d.correctedDistanceMeters, 2)}` +
+    `   widthOverridden = ${d.widthOverridden}\n`;
+  // distance_fusion.py's breakdown -- only present when a --flow-debug-json
+  // was loaded with the fusion fields (added 2026-08-26); the live-
+  // tracking fallback has none of this.
+  if (d.fused_distance_meters !== undefined) {
+    text +=
+      `fused_distance_meters (NEW)          = ${fmtNum(d.fused_distance_meters, 2)}` +
+      `   fused_sigma_meters = ${fmtNum(d.fused_sigma_meters, 2)}\n` +
+      `  row:   dist=${fmtNum(d.row_distance_meters, 2)}  sigma=${fmtNum(d.row_sigma_meters, 2)}` +
+      `  phi=${fmtNum(d.phi_degrees, 2)}deg  p_truncated=${d.p_truncated == null ? 'null' : d.p_truncated.toExponential(2)}\n` +
+      `  width: dist=${fmtNum(d.width_distance_meters, 2)}  sigma=${fmtNum(d.width_sigma_meters, 2)}\n` +
+      `  terms_used=${d.terms_used ? d.terms_used.join('+') : 'none'}` +
+      `  side_truncated=${d.side_truncated}\n`;
+  }
+  text +=
     `box = x=${d.x.toFixed(4)} y=${d.y.toFixed(4)} w=${d.w.toFixed(4)} h=${d.h.toFixed(4)}  aspect(w/h)=${(d.w / d.h).toFixed(3)}\n` +
     `flowAngular (cyan)          = ${fmt(d.flowAngular)}\n` +
     `prevFlowAngular (green)     = ${fmt(d.prevFlowAngular)}\n` +
     `observedRateAngular (blue)  = ${fmt(d.observedRateAngular)}\n` +
     `motionAngular (magenta, raw)     = ${fmt(d.motionAngular)}\n` +
     `smoothedMotionAngular (red, trust) = ${fmt(d.smoothedMotionAngular)}`;
+  detailEl.textContent = text;
 }
 
 function drawFlowDebug(f, w, h) {
@@ -476,13 +515,26 @@ function drawFlowDebug(f, w, h) {
     // "#id label dist" caption when distance data is available (a
     // --flow-debug-json was loaded); plain "#id label conf%" caption in
     // the live-tracking-fallback case, matching label_leading_vehicle's
-    // original box caption for that data shape.
-    const caption = hasFlowData
+    // original box caption for that data shape. Fused distance appended
+    // when present (added 2026-08-26) -- old value stays first/primary so
+    // this reads as an addition, not a replacement; only shown alongside
+    // when it MEANINGFULLY disagrees, so an ordinary frame full of boxes
+    // that already agree doesn't turn into visual noise.
+    const fusedText = fusedDistanceText(d);
+    const isUnreliable = fusedText === 'UNRELIABLE';
+    let caption = hasFlowData
       ? `#${d.trackID} ${d.label} ${distanceText(d)}`
       : `#${d.trackID} ${d.label} ${Math.round(d.confidence * 100)}%`;
+    if (fusedText !== null && (isUnreliable || distancesDisagree(d))) {
+      caption += ` | fused: ${fusedText}`;
+    }
     const x = d.x * w, y = d.y * h;
-    ctx.strokeStyle = isSelected ? '#ffffff' : (LABEL_COLORS[d.label] || '#888888');
-    ctx.lineWidth = isSelected ? 3 : 1.5;
+    // Distinct warning color when fusion has given up on this box entirely
+    // (fused_distance_meters === null) -- a real, visible signal rather
+    // than something buried in text a reviewer has to read every caption
+    // to notice.
+    ctx.strokeStyle = isUnreliable ? '#ff9900' : (isSelected ? '#ffffff' : (LABEL_COLORS[d.label] || '#888888'));
+    ctx.lineWidth = isSelected ? 3 : (isUnreliable ? 2.5 : 1.5);
     ctx.strokeRect(x, y, d.w * w, d.h * h);
     drawCaption(caption, x + 4, y + 18);
     if (isLeading) drawLeadingTint(d, w, h);

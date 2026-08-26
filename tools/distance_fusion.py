@@ -36,20 +36,21 @@ CALIBRATION STATUS, honestly, per term:
     (~unbiased, consistent with a noise model rather than a hidden bias).
   - Real per-class width variance (KITTI): REAL, already in
     reconstruct_annotated.py's OBJECT_ASPECT_PRIORS.
-  - SIGMA_EDGE_WIDTH_PX: **NOT independently measured** -- reuses
-    SIGMA_EDGE_ROW_PX as a stand-in (same underlying phenomenon, detector
-    edge precision, just a different edge) pending a real check (mining an
-    existing recording's stationary-parked-car frame-to-frame box-width
-    jitter, net of ego-approach speed, per the 2026-08-24 chat plan).
-  - Hood-truncation angular bins: STRUCTURED but NOT calibrated per-bin --
-    all 5 bins currently share the single existing global measurement
-    (mean=9.899deg, std=0.771deg, from the OLD mount's 107-sample study).
-    Kept as separate bins (not collapsed to one global constant) because
-    the mount has since moved and the *current* mount's per-column
-    curvature is unmeasured, not because it's known to matter -- ready to
-    take real per-bin values once the planned close-range column-sweep
-    capture happens. This is a genuine "structure ready, data pending"
-    state -- do not read the 5 identical bins as 5 real measurements.
+  - SIGMA_EDGE_WIDTH_PX: REAL, back-solved 2026-08-25 from 10 genuinely
+    stationary-car tracks mined across 4 already-recorded sessions -- see
+    find_stationary_car_width_jitter() below. 1.075px, reassuringly close
+    to (a bit smaller than) SIGMA_EDGE_ROW_PX's 2.28px, confirming rather
+    than overturning the "same underlying phenomenon, different edge"
+    assumption the old stand-in was built on.
+  - Hood-truncation angular bins: REAL, 2026-08-26, from the
+    26_08_26_Day_Walk garage session (717 samples, 8 walk passes, CURRENT
+    mount) -- 7 bins (not 5, see HOOD_TRUNCATION_COLUMN_BINS), each with
+    78-184 samples, storing alpha (pitch-independent) not phi. Confirmed
+    real, non-flat curvature (not just noise): alpha rises toward both
+    edges from a low near center, and per-bin std is much tighter than the
+    old pooled global figure once bearing is accounted for. Still a single
+    session/mount generation's worth of data -- see this constant's own
+    doc comment for the reasoning and what would justify revisiting it.
   - SIGMA_ROLL_FLATNESS_DEGREES / SIGMA_PITCH_FLATNESS_DEGREES: a
     LITERATURE-ANCHORED PRIOR, not a fitted value -- exactly one real
     measurement exists (26_08_25_Day_Cones: +1.78deg roll / +0.24deg
@@ -61,6 +62,27 @@ CALIBRATION STATUS, honestly, per term:
     traffic-occlusion noise, not usable as-is -- abandoned, not deleted,
     in case occlusion-aware filtering makes it viable later. Revisit
     these two constants first once real multi-location data exists.
+
+OVERALL STATUS, 2026-08-26: every numeric parameter above is now either
+REAL (measured against real data) or a clearly-labeled, literature-
+anchored PRIOR -- no more raw stand-ins masquerading as calibrated values.
+Two real gaps remain, and neither is closable from a desk-side data-mining
+pass the way SIGMA_EDGE_WIDTH_PX was:
+  1. Occlusion by another object -- no detection mechanism exists at all
+     (see WHAT THIS DOES NOT REPLACE above). Not hypothetical: the
+     abandoned flatness_uncertainty_calibration.py attempt ran straight
+     into it as the dominant confound in ordinary traffic, so this is a
+     confirmed, real gap, not just a documented one.
+  2. The flatness priors (SIGMA_ROLL_FLATNESS_DEGREES/
+     SIGMA_PITCH_FLATNESS_DEGREES) -- still exactly one real location's
+     worth of data, a defensible literature-anchored starting point, not
+     a calibrated distribution.
+Also worth being clear-eyed about: this module is still NOT wired into
+anything that produces a distance a driver, or even reconstruct_
+annotated.py's own displayed/exported distances, would actually see --
+everything above has been validated through ad-hoc test scripts against
+real cone-test and drive data, not through use. "Calibrated" and
+"deployed" are still two different claims.
 """
 
 import json
@@ -296,11 +318,97 @@ def _flatness_sigma_component(
 
 # --- σ_width(w, class): width-based distance uncertainty -------------------
 
-SIGMA_EDGE_WIDTH_PX = SIGMA_EDGE_ROW_PX
-"""NOT independently measured -- see this file's own top doc comment.
-Reuses the row-edge calibration as a same-order-of-magnitude stand-in for
-box-width edge noise (a different edge, same underlying detector precision
-phenomenon) until a real check exists."""
+SIGMA_EDGE_WIDTH_PX = 1.075
+"""REAL, back-solved 2026-08-25 -- see find_stationary_car_width_jitter()
+below, which reproduces this measurement. Mines already-recorded sessions
+for a genuinely parked car (ego stationary AND the target itself not
+moving -- see that function's own doc comment for why both conditions are
+needed) and measures frame-to-frame box-width jitter directly: with zero
+real motion on either side, any width change left is pure detector edge
+noise, the same phenomenon SIGMA_EDGE_ROW_PX measures for the bottom edge,
+just the left/right edges instead.
+
+10 clean tracks survived across 4 different sessions/days (26_08_20_Day_
+Small, 26_08_21_Day_Small, 26_08_24_Day_Distance, 26_08_25_Day_Cones),
+ranging 0.43-1.75px, mean 1.075px -- notably TIGHTER and more consistent
+than expected, and reassuringly close to (a bit smaller than)
+SIGMA_EDGE_ROW_PX's 2.28px, confirming the "same underlying phenomenon,
+different edge" assumption the old stand-in was built on rather than
+overturning it. Two additional candidate tracks were found and explicitly
+EXCLUDED, not just filtered by threshold: both showed genuine multi-second
+plateaus at two DIFFERENT stable widths (e.g. ~228px then a real step down
+to ~201px) rather than frame-level jitter -- a real small physical
+event (most likely a near-ID mixup between two close real objects), not
+detector noise, confirmed by inspecting their raw sequences directly
+before excluding them."""
+
+
+def find_stationary_car_width_jitter(
+    detections_path: Path, aspect: float = 1920 / 1080,
+    min_frames: int = 30, min_duration_s: float = 10.0, max_range_ratio: float = 0.85,
+) -> list:
+    """Reproduces the SIGMA_EDGE_WIDTH_PX measurement against one session's
+    detections.jsonl -- returns [(trackID, n_frames, duration_s, mean_width_px,
+    std_width_px), ...] for every car track that survives BOTH of two
+    conditions, each catching a different way a "stationary" track can
+    still be moving:
+
+    1. egoSpeedMps <= 0.15 at every entry used -- the ego vehicle itself
+       isn't driving. Necessary but NOT sufficient: real traffic keeps
+       passing a parked ego vehicle, and a passing car's box grows/shrinks
+       fast regardless of what the ego is doing.
+    2. The TARGET's own box width stays within max_range_ratio of its
+       min-to-max range across its ENTIRE tracked lifetime (not just a
+       locally-smooth-looking window) -- CONFIRMED NECESSARY 2026-08-25:
+       an earlier attempt using only a "no single frame-to-frame jump
+       bigger than 6%" heuristic let through cars in the middle of a fast,
+       continuous approach/departure (width growing ~118px -> 658px in
+       under 2 seconds, a real passing car, not a parked one) whenever
+       that approach happened to have a brief low-velocity plateau, since
+       consecutive SMALL steps can still add up to real bulk motion over
+       a longer window. Requiring the ratio check across the WHOLE track
+       life, not a local sub-window, is what actually filters these out.
+
+    Same class/edge/hood/oblique gating as flatness_uncertainty_
+    calibration.py's qualifying_points -- see that file's own doc comment
+    for why each gate exists."""
+    entries = [json.loads(line) for line in detections_path.read_text().splitlines() if line.strip()]
+    by_track: dict = {}
+    for entry in entries:
+        ego_speed = entry.get("egoSpeedMps")
+        if ego_speed is None or ego_speed > 0.15:
+            continue
+        for det in entry.get("detections", []):
+            if det.get("label") != "car" or det.get("confidence", 0.0) < 0.5:
+                continue
+            left, right = det["x"], det["x"] + det["w"]
+            if left <= recon.EDGE_TRUNCATION_MARGIN_NORMALIZED or right >= 1.0 - recon.EDGE_TRUNCATION_MARGIN_NORMALIZED:
+                continue
+            bottom_y, center_x = det["y"] + det["h"], det["x"] + det["w"] / 2
+            phi_deg = recon._row_based_phi_degrees(
+                bottom_y, center_x, aspect, entry.get("referencePitchDegrees", 0.0), entry.get("referenceRollDegrees", 0.0),
+            )
+            if phi_deg > recon.HOOD_CUTOFF_ANGLE_DEGREES - 2.0 or recon.is_oblique_view(det, entry, aspect):
+                continue
+            track_id = det.get("trackID")
+            if track_id is None:
+                continue
+            frame_width_px = 1920.0  # every session recorded so far is 16:9, regardless of exact pixel count
+            by_track.setdefault(track_id, []).append((entry["t"], det["w"] * frame_width_px))
+
+    results = []
+    for track_id, samples in by_track.items():
+        samples.sort()
+        if len(samples) < min_frames:
+            continue
+        duration = samples[-1][0] - samples[0][0]
+        if duration < min_duration_s:
+            continue
+        widths = [w for _, w in samples]
+        if min(widths) / max(widths) < max_range_ratio:
+            continue
+        results.append((track_id, len(samples), duration, statistics.mean(widths), statistics.pstdev(widths)))
+    return results
 
 
 def sigma_width_meters(
@@ -341,26 +449,77 @@ def sigma_width_meters(
 
 # --- P(truncated | phi, column): hood-truncation probability ---------------
 
-HOOD_TRUNCATION_COLUMN_BINS = 5
-"""Matches the original 107-sample study's own bin count (see
-HOOD_CUTOFF_ANGLE_DEGREES' doc comment in reconstruct_annotated.py) --
-kept as SEPARATE bins deliberately, even though all 5 currently share
-identical values, because the mount has since moved and the current
-mount's per-column curvature is genuinely unmeasured, not known-flat like
-the old one. See this file's own top doc comment."""
+HOOD_TRUNCATION_COLUMN_BINS = 7
+"""Standardized on 7 (not the original 107-sample study's 5) 2026-08-26,
+real request after the 26_08_26_Day_Walk garage session's 7-bin analysis
+came back with 78-184 samples per bin -- comfortably enough data to
+support the finer resolution, which matters here: the real curve isn't
+quite symmetric (far-left alpha 11.14deg vs far-right 10.74deg), and 5
+bins would have blurred that away. A future recalibration with thinner
+data could leave some of these 7 under-populated where 5 wouldn't be --
+hood_cutoff_calibration.py's analyze command already reports "(too few)"
+for any bin under 3 samples rather than a bogus number, so this degrades
+visibly rather than silently."""
+
+HOOD_TRUNCATION_BEARING_BIN_EDGES_DEGREES = [-32.9, -23.7, -14.4, -5.1, 4.1, 13.4, 22.6, 31.9]
+"""8 edges bounding HOOD_TRUNCATION_COLUMN_BINS's 7 bins, in BEARING degrees
+(horizontal viewing angle from the camera's principal axis -- see
+hood_cutoff_calibration.py's compute_alpha_phi_and_bearing), NOT normalized
+column -- bearing is what the 26_08_26_Day_Walk calibration actually binned
+by, and bearing/column aren't linearly related (bearing = atan(x)), so
+reusing equal-width column bins here would silently misalign against the
+real per-bin measurements below. These are exactly that session's own
+observed min/max bearing split into 7 equal-width bins, not a fixed,
+round-number grid -- a session covering a meaningfully different bearing
+range would need these re-derived, not just the stats below replaced."""
 
 HOOD_TRUNCATION_BIN_STATS = [
-    (recon.HOOD_CUTOFF_ANGLE_DEGREES, 0.771) for _ in range(HOOD_TRUNCATION_COLUMN_BINS)
+    (11.137, 0.468), (10.608, 0.351), (10.221, 0.437), (9.756, 0.302),
+    (9.797, 0.312), (9.981, 0.210), (10.740, 0.214),
 ]
-"""PLACEHOLDER -- all 5 bins currently reuse the single old-mount global
-measurement (mean=9.899deg, std=0.771deg, n=107). Replace element i with a
-real (mean, std) fit to column bin i once the planned close-range (3m),
-side-to-side column-sweep capture happens on the CURRENT mount. Reading
-these 5 identical entries as 5 real per-column measurements would be
-wrong -- they are one measurement, copied, marking a gap, not a finding."""
+"""REAL, 2026-08-26 -- (alpha_mean_degrees, alpha_std_degrees) per bearing
+bin, from 717 samples (8 walk passes, one real session on the CURRENT
+mount) via hood_cutoff_calibration.py extract+analyze. ALPHA, NOT PHI --
+see that file's own 2026-08-26 doc comment for why: alpha (angle below the
+camera's own optical axis) is fixed by the camera-to-hood relationship
+regardless of the car's momentary pitch, so these 7 numbers are meant to
+stay valid across future sessions recorded at DIFFERENT pitches, unlike a
+phi-style number which would silently drift with whatever pitch a given
+session happens to have. hood_truncation_probability converts back to a
+phi-style threshold at call time using that DETECTION's own
+reference_pitch_deg, not whatever pitch was active during calibration.
+
+Real curvature confirmed, not just noise: alpha rises toward both edges
+(11.14deg far left, 10.74deg far right) from a low near center
+(9.76-9.98deg) -- physically sensible (the wide dashboard/hood blocks the
+view sooner straight ahead; off to the sides you can see steeper-down
+before hitting an obstruction). Per-bin std (0.21-0.47deg) is also much
+tighter than the old pooled global figure (0.771deg, n=107, OLD mount) --
+most of that old spread was apparently real per-bearing curvature being
+averaged away, not measurement noise. Still a single session/mount
+generation's worth of data -- revisit if a future walk's samples disagree
+meaningfully with these."""
 
 
-def hood_truncation_probability(phi_deg: float, center_x: float) -> float:
+def _bearing_bin_index(center_x: float, aspect: float) -> int:
+    """Bearing (not raw column) is what HOOD_TRUNCATION_BIN_STATS is binned
+    by -- see that constant's own doc comment. Same formula as
+    hood_cutoff_calibration.py's compute_alpha_phi_and_bearing, minus the
+    alpha/phi parts this call site doesn't need. Bearings outside the
+    calibration session's own observed range clamp to the nearest edge bin
+    rather than extrapolating -- the curve's shape beyond what was actually
+    walked is unmeasured, not assumed flat."""
+    focal_col = recon.FLOW_FOCAL_LENGTH_ROW_NORMALIZED / aspect
+    x = (center_x - recon.FLOW_PRINCIPAL_COLUMN_NORMALIZED) / focal_col
+    bearing_deg = math.degrees(math.atan(x))
+    edges = HOOD_TRUNCATION_BEARING_BIN_EDGES_DEGREES
+    for i in range(HOOD_TRUNCATION_COLUMN_BINS):
+        if bearing_deg < edges[i + 1] or i == HOOD_TRUNCATION_COLUMN_BINS - 1:
+            return max(0, i)
+    return HOOD_TRUNCATION_COLUMN_BINS - 1
+
+
+def hood_truncation_probability(phi_deg: float, center_x: float, aspect: float, reference_pitch_deg: float) -> float:
     """Density-shaped APPROXIMATION of P(truncated | phi), not a true
     Bayesian posterior -- see the 2026-08-24 chat discussion for why: a
     real posterior would also need P(phi | genuinely NOT truncated), the
@@ -385,11 +544,17 @@ def hood_truncation_probability(phi_deg: float, center_x: float) -> float:
     exclude" check in reconstruct_annotated.py, which stays a separate,
     non-probabilistic backstop for genuinely impossible phi, not something
     this bump is meant to replace).
-    Uses the column bin's own (mean, std) -- see HOOD_TRUNCATION_BIN_STATS'
-    own doc comment for why these are currently identical across bins."""
-    bin_index = min(HOOD_TRUNCATION_COLUMN_BINS - 1, int(center_x * HOOD_TRUNCATION_COLUMN_BINS))
-    bin_index = max(0, bin_index)
-    mean_deg, std_deg = HOOD_TRUNCATION_BIN_STATS[bin_index]
+    Uses the bearing bin's own (alpha_mean, alpha_std) -- see
+    HOOD_TRUNCATION_BIN_STATS' own doc comment. alpha_mean is converted to
+    a phi-style threshold using THIS call's own reference_pitch_deg (the
+    detection's actual session pitch), not whatever pitch was active
+    during calibration -- that conversion is the entire reason
+    HOOD_TRUNCATION_BIN_STATS stores alpha instead of phi in the first
+    place: a session at a different pitch than 26_08_26_Day_Walk's 0.926deg
+    still gets a correctly-shifted threshold instead of a stale one."""
+    bin_index = _bearing_bin_index(center_x, aspect)
+    alpha_mean_deg, std_deg = HOOD_TRUNCATION_BIN_STATS[bin_index]
+    mean_deg = alpha_mean_deg + reference_pitch_deg
     if std_deg <= 0:
         return 1.0 if abs(phi_deg - mean_deg) < 1e-9 else 0.0
     z = (phi_deg - mean_deg) / std_deg
@@ -433,7 +598,7 @@ def fuse_distance_meters(det: dict, entry: dict, aspect: float) -> dict:
 
     row_dist = recon.row_based_distance_meters(bottom, center_x, aspect, pitch, roll)
     phi_deg = recon._row_based_phi_degrees(bottom, center_x, aspect, pitch, roll)
-    p_truncated = hood_truncation_probability(phi_deg, center_x)
+    p_truncated = hood_truncation_probability(phi_deg, center_x, aspect, pitch)
     # Separate, non-probabilistic backstop for phi values the truncation
     # BUMP alone would wrongly clear (it's centered on the mean, so a phi
     # well ABOVE the mean scores low on "looks like an ambiguous truncation
@@ -441,7 +606,12 @@ def fuse_distance_meters(det: dict, entry: dict, aspect: float) -> dict:
     # reporting some other row (frame edge, dashboard/HUD artifact) as the
     # box bottom entirely, not just an ordinary hood-clipped reading. Same
     # hard-exclude discipline as reconstruct_annotated.py's own case 2.
-    genuinely_impossible = phi_deg > recon.HOOD_CUTOFF_ANGLE_DEGREES + 2 * HOOD_TRUNCATION_BIN_STATS[0][1]
+    # Uses THIS detection's own bearing bin (not the old global scalar) so
+    # the backstop margin matches the same per-column curve the probability
+    # bump above does, converted to phi via this call's own reference pitch.
+    _bin_idx = _bearing_bin_index(center_x, aspect)
+    _alpha_mean_deg, _alpha_std_deg = HOOD_TRUNCATION_BIN_STATS[_bin_idx]
+    genuinely_impossible = phi_deg > (_alpha_mean_deg + pitch) + 2 * _alpha_std_deg
 
     row_sigma = None
     if row_dist is not None and not side_truncated and not genuinely_impossible:
