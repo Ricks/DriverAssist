@@ -436,3 +436,43 @@ rsync(32111): error: io_read_blocking
 rsync(32111): error: io_read_flush
 rsync(32111): error: rsync_sender
 rsync(32111): warning: child 32112 exited with status 1
+[2026-08-27 03:00:05] Starting sync: /Users/rickclark/DriverAssist/data/ -> /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/
+Transfer starting: 434 files
+rsync(19204): error: /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/: open: Operation not permitted
+rsync(19204): error: rsync_receiver
+rsync(19203): error: unexpected end of file
+rsync(19203): error: io_read_nonblocking
+rsync(19203): error: io_read_blocking
+rsync(19203): error: io_read_flush
+rsync(19203): error: rsync_sender
+rsync(19203): warning: child 19204 exited with status 1
+[2026-08-28 03:00:05] Starting sync: /Users/rickclark/DriverAssist/data/ -> /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/
+Transfer starting: 434 files
+rsync(71114): error: /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/: open: Operation not permitted
+rsync(71114): error: rsync_receiver
+rsync(71113): error: unexpected end of file
+rsync(71113): error: io_read_nonblocking
+rsync(71113): error: io_read_blocking
+rsync(71113): error: io_read_flush
+rsync(71113): error: rsync_sender
+rsync(71113): warning: child 71114 exited with status 1
+[2026-08-29 03:00:05] Starting sync: /Users/rickclark/DriverAssist/data/ -> /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/
+Transfer starting: 434 files
+rsync(28772): error: /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/: open: Operation not permitted
+rsync(28772): error: rsync_receiver
+rsync(28771): error: unexpected end of file
+rsync(28771): error: io_read_nonblocking
+rsync(28771): error: io_read_blocking
+rsync(28771): error: io_read_flush
+rsync(28771): error: rsync_sender
+rsync(28771): warning: child 28772 exited with status 1
+[2026-08-30 03:00:05] Starting sync: /Users/rickclark/DriverAssist/data/ -> /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/
+Transfer starting: 435 files
+rsync(86051): error: /Users/rickclark/Library/Mobile Documents/com~apple~CloudDocs/DriverAssistData/data/: open: Operation not permitted
+rsync(86051): error: rsync_receiver
+rsync(86050): error: unexpected end of file
+rsync(86050): error: io_read_nonblocking
+rsync(86050): error: io_read_blocking
+rsync(86050): error: io_read_flush
+rsync(86050): error: rsync_sender
+rsync(86050): warning: child 86051 exited with status 1

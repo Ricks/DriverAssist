@@ -10,16 +10,22 @@
     margin: 0; background: #14161a; color: #e6e6e6;
     font-family: -apple-system, "SF Mono", Menlo, monospace;
     display: flex; flex-direction: column; align-items: center; padding: 16px;
+    overflow-x: hidden;   /* let the loupe overhang the frame without a stray scrollbar */
   }
-  #stage { position: relative; max-width: 100%; }
-  #video { display: block; max-width: 100%; background: #000; }
+  #stage { position: relative; width: 100%; max-width: 1920px; }
+  #video { display: block; margin: 0 auto; max-width: 100%; max-height: calc(100vh - 210px); background: #000; }
   #overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
+  #loupe {
+    position: absolute; pointer-events: none; display: none; z-index: 5;
+    border-radius: 50%; border: 2px solid #8a5ac0;
+    box-shadow: 0 0 0 1px #000, 0 4px 18px rgba(0,0,0,0.65);
+  }
   #modes {
-    width: 100%; max-width: 1400px;
+    width: 100%; max-width: 1920px;
     display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 4px;
   }
   #controls {
-    width: 100%; max-width: 1400px; margin-top: 10px;
+    width: 100%; max-width: 1920px; margin-top: 10px;
     display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   }
   button, select, input[type=number] {
@@ -30,13 +36,13 @@
   button.active { background: #5a3a7a; border-color: #8a5ac0; }
   .modeBtn.active { background: #1f5a4a; border-color: #3ac08a; }
   #status {
-    width: 100%; max-width: 1400px; margin-top: 8px;
+    width: 100%; max-width: 1920px; margin-top: 8px;
     display: flex; gap: 20px; font-size: 13px; color: #9aa; flex-wrap: wrap;
   }
   #status b { color: #e6e6e6; }
   #hint { color: #e0b040; font-size: 13px; min-height: 16px; }
   #timeline {
-    width: 100%; max-width: 1400px; height: 28px; margin-top: 10px;
+    width: 100%; max-width: 1920px; height: 28px; margin-top: 10px;
     background: #23262d; position: relative; border-radius: 4px; cursor: pointer;
     border: 1px solid #3a3f4a;
   }
@@ -56,7 +62,7 @@
   #saveState { transition: color 0.3s; }
   .hint { color: #667; font-size: 12px; }
   #detail {
-    width: 100%; max-width: 1400px; margin-top: 10px; padding: 10px 12px;
+    width: 100%; max-width: 1920px; margin-top: 10px; padding: 10px 12px;
     background: #1b1e24; border: 1px solid #3a3f4a; border-radius: 6px;
     font-size: 13px; line-height: 1.6; display: none; white-space: pre;
   }
@@ -71,6 +77,7 @@
 <div id="stage">
   <video id="video" preload="auto"></video>
   <canvas id="overlay"></canvas>
+  <canvas id="loupe"></canvas>
 </div>
 
 <div id="controls">
@@ -91,6 +98,7 @@
   </select>
   <span class="hint">step size (s)</span>
   <input type="number" id="stepSize" value="0.067" step="0.001" min="0.001" style="width:70px">
+  <button id="loupeToggle" title="Magnifier &mdash; hover the video, scroll or +/- to zoom (z to toggle)">&#128269; loupe</button>
   <button id="unitsToggle" style="display:none">yds</button>
   <span class="hint" id="modeHint"></span>
 </div>
@@ -113,6 +121,17 @@
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
+const loupe = document.getElementById('loupe');
+const lctx = loupe.getContext('2d');
+const LOUPE_SIZE = 240;                       // on-screen diameter (css px)
+const LOUPE_DPR = window.devicePixelRatio || 1;
+loupe.width = LOUPE_SIZE * LOUPE_DPR;
+loupe.height = LOUPE_SIZE * LOUPE_DPR;
+loupe.style.width = loupe.style.height = LOUPE_SIZE + 'px';
+lctx.scale(LOUPE_DPR, LOUPE_DPR);
+let loupeActive = false;
+let loupeZoom = 3;
+let lastLoupeClient = null;                   // last {x,y} clientX/Y seen over the overlay
 const timeline = document.getElementById('timeline');
 const modesEl = document.getElementById('modes');
 const hintEl = document.getElementById('hint');
@@ -128,6 +147,9 @@ const RIDER_COLOR = '#33ff99';            // a combo's matched rider box(es)
 const BAD_COLOR = '#ff4444';              // false_positive highlight
 const HOOD_TRUNCATION_COLOR = '#ff9900';  // hood_truncation highlight
 const OTHER_TRUNCATION_COLOR = '#3399ff'; // other_truncation highlight
+const DISTANCE_ANOMALY_COLOR = '#ff6699'; // distance_anomaly highlight
+const TRUNCATION_TYPES = ['none', 'hood', 'other'];
+const ANOMALY_TYPES = ['unset', 'too_far', 'too_close'];
 
 // --- Mode registry ---------------------------------------------------
 // 'flow_debug': read-only. Draws the five per-track flow-arrow vectors
@@ -161,6 +183,8 @@ const MODES = {
     hint: 'click a box the instant OUR hood/dashboard starts clipping its bottom edge &middot; click the highlighted box to trim start/end or add a note' },
   other_truncation: { kind: 'single', label: 'Other Truncation', highlightColor: OTHER_TRUNCATION_COLOR,
     hint: 'click a box the instant anything else (another object, frame edge) starts clipping it &middot; click the highlighted box to trim start/end or add a note' },
+  distance_anomaly: { kind: 'distance_anomaly', label: 'Distance Anomaly', highlightColor: DISTANCE_ANOMALY_COLOR,
+    hint: 'click a box the instant its shown distance goes wrong &middot; click the highlighted box for its panel: trim start/end, far/close, truncation, actual distance, note' },
   cyclist: { kind: 'combo', label: 'Cyclist', vehicleLabel: 'bicycle', riderLabel: 'person', maxRiders: 1,
     hint: 'click a bicycle to start/select a pairing, then click its rider &middot; click a rider again to unpair &middot; click the selected vehicle box again to trim/add a note' },
   motorcyclist: { kind: 'combo', label: 'Motorcyclist', vehicleLabel: 'motorcycle', riderLabel: 'person', maxRiders: 2,
@@ -170,7 +194,7 @@ const MODES = {
   equestrian: { kind: 'combo', label: 'Equestrian', vehicleLabel: 'horse', riderLabel: 'person', maxRiders: 1,
     hint: 'click a horse to start/select a pairing, then click its rider &middot; click the selected vehicle box again to trim/add a note' },
 };
-const MODE_ORDER = ['flow_debug', 'followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
+const MODE_ORDER = ['flow_debug', 'followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'distance_anomaly', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
 const GROUND_TRUTH_MODES = MODE_ORDER.filter(m => m !== 'flow_debug');
 let activeMode = 'flow_debug';
 
@@ -283,6 +307,7 @@ video.addEventListener('loadedmetadata', () => {
   renderTimeline();
 });
 window.addEventListener('resize', resizeCanvas);
+new ResizeObserver(resizeCanvas).observe(video);
 
 function resizeCanvas() {
   const r = video.getBoundingClientRect();
@@ -563,7 +588,7 @@ function draw() {
   if (cfg.kind === 'flow_debug') {
     drawFlowDebug(f, w, h);
     updateStatus(f);
-  } else if (cfg.kind === 'single') {
+  } else if (cfg.kind === 'single' || cfg.kind === 'distance_anomaly') {
     const active = activeSingleAt(activeMode, video.currentTime);
     for (const d of f.detections) {
       const isActive = active && d.trackID === active.trackID;
@@ -599,6 +624,7 @@ function draw() {
     updateStatus(f, active);
   }
   renderPlayhead();
+  if (loupeActive) updateLoupe();
 }
 
 function drawBox(d, w, h, color, lineWidth, filled) {
@@ -622,7 +648,10 @@ function updateStatus(f, active) {
   if (cfg.kind === 'flow_debug') return;
   let label = 'none';
   if (active) {
-    if (cfg.kind === 'single') {
+    if (cfg.kind === 'distance_anomaly') {
+      const trueDist = active.true_distance_meters == null ? '?' : `${active.true_distance_meters}m`;
+      label = `#${active.trackID} (${active.anomaly_type}, true:${trueDist}, trunc:${active.truncation_type})`;
+    } else if (cfg.kind === 'single') {
       label = '#' + active.trackID;
     } else {
       const riders = active.riderTrackIDs.length ? active.riderTrackIDs.map(id => '#' + id).join(', ') : 'none yet';
@@ -716,7 +745,7 @@ overlay.addEventListener('click', (e) => {
   if (!best) return;
   const t = video.currentTime;
 
-  if (cfg.kind === 'single') {
+  if (cfg.kind === 'single' || cfg.kind === 'distance_anomaly') {
     const arr = store[activeMode];
     const active = activeSingleAt(activeMode, t);
     if (active && active.trackID === best.trackID) {
@@ -725,9 +754,16 @@ overlay.addEventListener('click', (e) => {
       showTrimMenu(e.clientX, e.clientY, arr, active, t);
     } else {
       // Clicked a different box: implicitly end any open assignment now,
-      // start a new one.
+      // start a new one. distance_anomaly's three extra fields start out
+      // unset/none -- same "set later via the trim menu" pattern as note.
       if (active && active.end_t === null) active.end_t = t;
-      arr.push({ start_t: t, end_t: null, trackID: best.trackID });
+      const seg = { start_t: t, end_t: null, trackID: best.trackID };
+      if (cfg.kind === 'distance_anomaly') {
+        seg.anomaly_type = 'unset';
+        seg.true_distance_meters = null;
+        seg.truncation_type = 'none';
+      }
+      arr.push(seg);
       scheduleSave(); draw(); renderTimeline();
     }
     return;
@@ -768,55 +804,115 @@ overlay.addEventListener('click', (e) => {
 // leaving something inverted/empty. Generic over which array/item it
 // operates on so both single and combo modes share it.
 let trimMenuEl = null;
+let trimMenuDismiss = null;
 
+// The label panel that opens when you click an already-highlighted box.
+// Everything is inline (buttons + real <input>s) -- window.prompt/confirm
+// are NOT available here: super_tool runs inside the desktop app's
+// embedded webview, where prompt() throws "not supported". Cycle fields
+// (far/close, trunc) mutate in place and leave the panel open so you can
+// step a frame and adjust again; trim start/end finish the interaction
+// and close it. Dismiss with "done", Escape, an outside click, or by
+// clicking another box.
 function showTrimMenu(clientX, clientY, arr, item, t) {
   hideTrimMenu();
+  const isAnomaly = MODES[activeMode].kind === 'distance_anomaly';
   trimMenuEl = document.createElement('div');
   trimMenuEl.style.cssText = `position:fixed; left:${clientX}px; top:${clientY}px; ` +
-    `background:#23262d; border:1px solid #8a5ac0; border-radius:6px; padding:6px; ` +
-    `z-index:1000; display:flex; gap:6px; font:13px monospace;`;
+    `background:#23262d; border:1px solid #8a5ac0; border-radius:6px; padding:8px; ` +
+    `z-index:1000; display:flex; flex-direction:column; gap:6px; font:13px monospace; ` +
+    `box-shadow:0 6px 20px rgba(0,0,0,0.5);`;
 
+  const BTN = 'background:#2d323b; color:#e6e6e6; border:1px solid #3a3f4a; border-radius:4px; padding:5px 8px; cursor:pointer; font:inherit;';
+  const FIELD = 'background:#1b1e24; color:#e6e6e6; border:1px solid #3a3f4a; border-radius:4px; padding:4px 6px; font:inherit;';
+
+  // action button: runs fn, then closes the panel
   const mkBtn = (label, fn) => {
     const b = document.createElement('button');
-    b.textContent = label;
-    b.style.cssText = 'background:#2d323b; color:#e6e6e6; border:1px solid #3a3f4a; border-radius:4px; padding:5px 8px; cursor:pointer; font:inherit;';
+    b.textContent = label; b.style.cssText = BTN;
     b.onclick = () => { fn(); hideTrimMenu(); };
     return b;
   };
+  // cycle button: steps a closed-set field, repaints its own label, panel stays open
+  const mkCycle = (prefix, get, step) => {
+    const b = document.createElement('button');
+    b.style.cssText = BTN;
+    const paint = () => { b.textContent = `${prefix}: ${get()} ↻`; };
+    paint();
+    b.onclick = () => { step(); paint(); scheduleSave(); draw(); renderTimeline(); };
+    return b;
+  };
+  // labelled field: commits live, blank -> null, panel stays open
+  const mkField = (label, get, set, opts = {}) => {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; justify-content:space-between;';
+    row.appendChild(document.createTextNode(label));
+    const inp = document.createElement('input');
+    inp.type = opts.number ? 'number' : 'text';
+    if (opts.number) inp.step = 'any';
+    if (opts.placeholder) inp.placeholder = opts.placeholder;
+    inp.style.cssText = FIELD + `width:${opts.width || 90}px;`;
+    const v = get();
+    inp.value = v == null ? '' : v;
+    inp.oninput = () => {
+      if (opts.number) {
+        const n = parseFloat(inp.value);
+        set(inp.value.trim() === '' || !Number.isFinite(n) ? null : n);
+      } else {
+        set(inp.value.trim() || null);
+      }
+      scheduleSave(); draw(); renderTimeline();
+    };
+    row.appendChild(inp);
+    return row;
+  };
 
-  trimMenuEl.appendChild(mkBtn('◀ trim start', () => {
-    if (item.end_t !== null && t >= item.end_t) {
-      store[activeMode] = arr.filter(a => a !== item);
-    } else {
-      item.start_t = t;
-    }
+  // trim start / end -- these finish the interaction, so they close
+  const trimRow = document.createElement('div');
+  trimRow.style.cssText = 'display:flex; gap:6px;';
+  trimRow.appendChild(mkBtn('◀ trim start', () => {
+    if (item.end_t !== null && t >= item.end_t) store[activeMode] = arr.filter(a => a !== item);
+    else item.start_t = t;
     scheduleSave(); draw(); renderTimeline();
   }));
-  trimMenuEl.appendChild(mkBtn('trim end ▶', () => {
-    if (t <= item.start_t) {
-      store[activeMode] = arr.filter(a => a !== item);
-    } else {
-      item.end_t = t;
-    }
+  trimRow.appendChild(mkBtn('trim end ▶', () => {
+    if (t <= item.start_t) store[activeMode] = arr.filter(a => a !== item);
+    else item.end_t = t;
     scheduleSave(); draw(); renderTimeline();
   }));
-  trimMenuEl.appendChild(mkBtn(item.note ? 'edit note' : '+ note', () => {
-    // window.prompt, not an inline input -- this is a rare, deliberate
-    // action (unlike trim, which happens constantly while stepping
-    // through footage) so a blocking dialog is the right tradeoff for the
-    // one extra line of code it saves. Empty/whitespace-only text clears
-    // the note (stored as null, not ''), so a noted segment can go back
-    // to un-noted rather than being stuck with a stray empty string.
-    const text = window.prompt('Note for this label:', item.note || '');
-    if (text === null) return; // cancelled -- leave the existing note untouched
-    item.note = text.trim() || null;
-    scheduleSave(); draw(); renderTimeline();
-  }));
+  trimMenuEl.appendChild(trimRow);
+
+  if (isAnomaly) {
+    trimMenuEl.appendChild(mkCycle('far/close', () => item.anomaly_type, () => {
+      item.anomaly_type = ANOMALY_TYPES[(ANOMALY_TYPES.indexOf(item.anomaly_type) + 1) % ANOMALY_TYPES.length];
+    }));
+    trimMenuEl.appendChild(mkCycle('trunc', () => item.truncation_type, () => {
+      item.truncation_type = TRUNCATION_TYPES[(TRUNCATION_TYPES.indexOf(item.truncation_type) + 1) % TRUNCATION_TYPES.length];
+    }));
+    trimMenuEl.appendChild(mkField('actual dist (m)', () => item.true_distance_meters, v => item.true_distance_meters = v, { number: true }));
+  }
+
+  trimMenuEl.appendChild(mkField('note', () => item.note, v => item.note = v, { placeholder: '(optional)', width: 200 }));
+
+  const doneRow = document.createElement('div');
+  doneRow.style.cssText = 'display:flex; justify-content:flex-end;';
+  doneRow.appendChild(mkBtn('done', () => {}));
+  trimMenuEl.appendChild(doneRow);
 
   document.body.appendChild(trimMenuEl);
+
+  // keep the panel inside the viewport
+  const r = trimMenuEl.getBoundingClientRect();
+  if (r.bottom > window.innerHeight - 8) trimMenuEl.style.top = Math.max(8, window.innerHeight - r.height - 8) + 'px';
+  if (r.right > window.innerWidth - 8) trimMenuEl.style.left = Math.max(8, window.innerWidth - r.width - 8) + 'px';
+
+  // outside-click dismiss (deferred so the opening click doesn't trip it)
+  trimMenuDismiss = (ev) => { if (trimMenuEl && !trimMenuEl.contains(ev.target)) hideTrimMenu(); };
+  setTimeout(() => document.addEventListener('mousedown', trimMenuDismiss), 0);
 }
 
 function hideTrimMenu() {
+  if (trimMenuDismiss) { document.removeEventListener('mousedown', trimMenuDismiss); trimMenuDismiss = null; }
   if (trimMenuEl) { trimMenuEl.remove(); trimMenuEl = null; }
 }
 
@@ -845,10 +941,11 @@ function renderTimeline() {
     el.className = 'seg' + (a.note ? ' noted' : '');
     el.style.left = (a.start_t / duration * 100) + '%';
     el.style.width = Math.max(0.15, (end - a.start_t) / duration * 100) + '%';
-    const tag = cfg.kind === 'single'
+    const tag = (cfg.kind === 'single' || cfg.kind === 'distance_anomaly')
       ? `#${a.trackID}`
       : `vehicle #${a.vehicleTrackID} riders:${a.riderTrackIDs.map(id => '#' + id).join(',') || 'none'}`;
     el.title = `${tag}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}` +
+      (cfg.kind === 'distance_anomaly' ? `\n${a.anomaly_type}, true:${a.true_distance_meters == null ? '?' : a.true_distance_meters + 'm'}, trunc:${a.truncation_type}` : '') +
       (a.note ? `\nnote: ${a.note}` : '');
     timeline.appendChild(el);
   }
@@ -955,13 +1052,99 @@ function stopReverse() {
   reverseBtn.classList.remove('active');
 }
 
+// --- Magnifier / loupe ----------------------------------------------------
+// Cursor-following circular magnifier for pixel-precise box checking on
+// small/distant vehicles. Composites the raw <video> frame with the
+// <canvas id="overlay"> bitmap (so drawn boxes/labels/flow arrows enlarge
+// too) into a clipped circle offset from the cursor. Toggle via the button
+// or 'z'; scroll-wheel (or +/-) over the video changes zoom. Purely a
+// display aid -- it has pointer-events:none and never intercepts the
+// click-to-label handler underneath it.
+function updateLoupe() {
+  if (!loupeActive || !lastLoupeClient) return;
+  const r = video.getBoundingClientRect();
+  if (!r.width || !video.videoWidth) { loupe.style.display = 'none'; return; }
+  const mx = lastLoupeClient.x - r.left, my = lastLoupeClient.y - r.top;
+  // Only bail when the cursor is genuinely off the video (the overlay
+  // mouseleave handler covers that too). Staying alive a hair past the
+  // edge lets the circle overhang the frame border, so edge/truncation
+  // work right at the boundary doesn't blank the loupe out.
+  if (mx < -2 || my < -2 || mx > r.width + 2 || my > r.height + 2) { loupe.style.display = 'none'; return; }
+
+  const srcW = LOUPE_SIZE / loupeZoom, srcH = LOUPE_SIZE / loupeZoom;
+  const sx = mx - srcW / 2, sy = my - srcH / 2;                    // source window, display px
+  const kx = video.videoWidth / r.width, ky = video.videoHeight / r.height;  // display px -> intrinsic px
+
+  lctx.save();
+  lctx.clearRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
+  lctx.beginPath();
+  lctx.arc(LOUPE_SIZE / 2, LOUPE_SIZE / 2, LOUPE_SIZE / 2 - 1, 0, Math.PI * 2);
+  lctx.clip();
+  lctx.fillStyle = '#000';
+  lctx.fillRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
+  // <video> drawImage source is intrinsic px; the overlay canvas backing
+  // store is sized in display px (see resizeCanvas), so it samples directly.
+  try { lctx.drawImage(video, sx * kx, sy * ky, srcW * kx, srcH * ky, 0, 0, LOUPE_SIZE, LOUPE_SIZE); } catch (_) {}
+  try { lctx.drawImage(overlay, sx, sy, srcW, srcH, 0, 0, LOUPE_SIZE, LOUPE_SIZE); } catch (_) {}
+  lctx.restore();
+
+  lctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  lctx.lineWidth = 1;
+  lctx.beginPath();
+  lctx.moveTo(LOUPE_SIZE / 2 - 7, LOUPE_SIZE / 2); lctx.lineTo(LOUPE_SIZE / 2 + 7, LOUPE_SIZE / 2);
+  lctx.moveTo(LOUPE_SIZE / 2, LOUPE_SIZE / 2 - 7); lctx.lineTo(LOUPE_SIZE / 2, LOUPE_SIZE / 2 + 7);
+  lctx.stroke();
+  lctx.fillStyle = 'rgba(0,0,0,0.55)';
+  lctx.fillRect(LOUPE_SIZE - 48, LOUPE_SIZE - 34, 40, 15);
+  lctx.fillStyle = '#fff';
+  lctx.font = '11px monospace';
+  lctx.fillText(loupeZoom.toFixed(1) + 'x', LOUPE_SIZE - 45, LOUPE_SIZE - 23);
+
+  // Centre the loupe on the cursor so it magnifies exactly the point it
+  // covers (crosshair == cursor). It's allowed to overhang the frame edge
+  // -- the out-of-frame part just shows the black fill -- and it never gets
+  // shoved back inside or hidden for touching the border.
+  loupe.style.left = (video.offsetLeft + mx - LOUPE_SIZE / 2) + 'px';
+  loupe.style.top = (video.offsetTop + my - LOUPE_SIZE / 2) + 'px';
+  loupe.style.display = 'block';
+}
+
+function setLoupe(on) {
+  loupeActive = on;
+  document.getElementById('loupeToggle').classList.toggle('active', on);
+  if (!on) { loupe.style.display = 'none'; return; }
+  flashHint('Loupe on -- hover the video, scroll or +/- to zoom, z to toggle');
+  updateLoupe();
+}
+function bumpLoupeZoom(factor) {
+  loupeZoom = Math.max(2, Math.min(12, loupeZoom * factor));
+  updateLoupe();
+}
+
+document.getElementById('loupeToggle').addEventListener('click', () => setLoupe(!loupeActive));
+overlay.addEventListener('mousemove', (e) => {
+  lastLoupeClient = { x: e.clientX, y: e.clientY };
+  if (loupeActive) updateLoupe();
+});
+overlay.addEventListener('mouseleave', () => { if (loupeActive) loupe.style.display = 'none'; });
+overlay.addEventListener('wheel', (e) => {
+  if (!loupeActive) return;
+  e.preventDefault();
+  bumpLoupeZoom(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
+  const inInput = e.target.tagName === 'INPUT';
   if (e.code === 'Escape') {
+    if (inInput) { e.target.blur(); hideTrimMenu(); return; }
     if (MODES[activeMode].kind === 'flow_debug') { selectedTrackID = null; draw(); }
     else hideTrimMenu();
     return;
   }
+  if (inInput) return;
+  if (e.code === 'KeyZ') { e.preventDefault(); setLoupe(!loupeActive); return; }
+  if (loupeActive && (e.code === 'Equal' || e.code === 'NumpadAdd')) { e.preventDefault(); bumpLoupeZoom(1.15); return; }
+  if (loupeActive && (e.code === 'Minus' || e.code === 'NumpadSubtract')) { e.preventDefault(); bumpLoupeZoom(1 / 1.15); return; }
   if (e.code === 'Space') { e.preventDefault(); playPauseBtn.click(); }
   else if (e.code === 'ArrowRight') { e.preventDefault(); document.getElementById('stepFwd').click(); }
   else if (e.code === 'ArrowLeft') { e.preventDefault(); document.getElementById('stepBack').click(); }

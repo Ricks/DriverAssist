@@ -13,10 +13,12 @@ Part-1 on-device-track-ID work landed):
     (followed_vehicle, false_positive, hood_truncation, other_truncation,
     cyclist, motorcyclist, skateboarder, equestrian)
 
-A planned (not yet built, as of 2026-08-25) distance-anomaly labeling mode
-(too far/too close + magnitude + truncation type) slots in later as one
-more entry in the frontend's MODES registry -- same chassis, no further
-merge needed.
+A distance-anomaly labeling mode (too far/too close + actual ground-truth
+distance + truncation type, added 2026-08-29) slots in as one more entry
+in the frontend's MODES registry -- same chassis as the other
+'single'-shaped modes, just with three extra fields captured via its trim
+menu. (An earlier "off by (m)" error-magnitude field was dropped
+2026-08-29 in favour of recording the actual distance directly.)
 
 Merged because both halves already shared the exact same chassis (video
 serving with HTTP Range support so scrubbing a multi-GB file works, a
@@ -74,7 +76,7 @@ FRONTEND_PATH = Path(__file__).parent / "super_tool_frontend.html"
 # (a viewing mode, not a labeling one) and deliberately excluded here.
 GROUND_TRUTH_MODES = {
     "followed_vehicle", "false_positive", "hood_truncation", "other_truncation",
-    "cyclist", "motorcyclist", "skateboarder", "equestrian",
+    "distance_anomaly", "cyclist", "motorcyclist", "skateboarder", "equestrian",
 }
 
 
