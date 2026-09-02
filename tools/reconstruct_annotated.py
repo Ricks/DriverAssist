@@ -1526,6 +1526,15 @@ def main() -> None:
                         if thermal_entry_for_json is not None else None
                     ),
                     "lockedLeadingTrackID": current_locked_id if args.highlight_leading else None,
+                    # The session's stored calibration reference attitude
+                    # (constant for a whole recording -- captured once when
+                    # the Level screen was last run). Needed by tools that
+                    # recompute row_based_distance_meters for an arbitrary
+                    # point (super_tool.py's Distance Calibration mode), so
+                    # they feed it the EXACT inputs this pipeline used
+                    # rather than a hand-typed guess.
+                    "referencePitchDegrees": current_entry.get("referencePitchDegrees", 0.0),
+                    "referenceRollDegrees": current_entry.get("referenceRollDegrees", 0.0),
                     "detections": [
                         {
                             "trackID": track_id, "label": det["label"], "confidence": det["confidence"],

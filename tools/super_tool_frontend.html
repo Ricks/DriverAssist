@@ -9,12 +9,49 @@
   body {
     margin: 0; background: #14161a; color: #e6e6e6;
     font-family: -apple-system, "SF Mono", Menlo, monospace;
-    display: flex; flex-direction: column; align-items: center; padding: 16px;
+    display: flex; flex-direction: row; align-items: stretch;
+    min-height: 100vh;
+  }
+  /* left rail: the sessions you've pulled up; click to switch (view state
+     per session is kept in the browser so toggling never loses your place) */
+  #sessionBar {
+    flex: 0 0 216px; width: 216px; display: flex; flex-direction: column;
+    background: #181a1f; border-right: 1px solid #2a2f38; height: 100vh; position: sticky; top: 0;
+  }
+  #sessionBarHead {
+    display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+    border-bottom: 1px solid #2a2f38; font-size: 12px; color: #9aa;
+  }
+  #sessionBarHead .grow { flex: 1; }
+  #sessionBarHead button {
+    width: 26px; height: 24px; padding: 0; font-size: 15px; line-height: 1;
+    background: #23262d; color: #e6e6e6; border: 1px solid #3a3f4a; border-radius: 4px; cursor: pointer;
+  }
+  #sessionBarHead button:hover:not(:disabled) { background: #2d323b; }
+  #sessionBarHead button:disabled { color: #555; cursor: default; }
+  #sessionList { flex: 1; overflow-y: auto; }
+  .sessRow {
+    padding: 8px 10px; font-size: 12px; line-height: 1.35; cursor: pointer;
+    border-bottom: 1px solid #23262d; color: #cfcfcf; word-break: break-word;
+  }
+  .sessRow:hover { background: #20232a; }
+  .sessRow.active { background: #1f5a4a; color: #fff; }
+  .sessRow .sub { display: block; color: #8a94a0; font-size: 10.5px; margin-top: 1px; }
+  .sessRow.active .sub { color: #bfe6d6; }
+  #sessionListEmpty { padding: 12px 10px; font-size: 11px; color: #667; }
+  #main {
+    flex: 1; min-width: 0; padding: 16px;
+    display: flex; flex-direction: column; align-items: center;
     overflow-x: hidden;   /* let the loupe overhang the frame without a stray scrollbar */
   }
-  #stage { position: relative; width: 100%; max-width: 1920px; }
-  #video { display: block; margin: 0 auto; max-width: 100%; max-height: calc(100vh - 210px); background: #000; }
+  #stage { position: relative; width: 100%; max-width: 1920px; overflow: hidden; }
+  #stageInner { transform-origin: 0 0; }   /* Distance Calibration zoom/pan; identity in every other mode */
+  /* Leave enough headroom below the video for every control row (mode
+     tabs, controls, status, hint, timeline, DC frame-marker strip) so the
+     whole page fits without a vertical scroll. */
+  #video { display: block; margin: 0 auto; max-width: 100%; max-height: calc(100vh - 265px); background: #000; }
   #overlay { position: absolute; top: 0; left: 0; cursor: crosshair; }
+  #calLabelLayer { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 6; }
   #loupe {
     position: absolute; pointer-events: none; display: none; z-index: 5;
     border-radius: 50%; border: 2px solid #8a5ac0;
@@ -56,6 +93,40 @@
   }
   .seg:hover { opacity: 1; outline: 1px solid #fff; }
   .seg.noted { box-shadow: inset 0 0 0 1px #ffe066; }
+  .mark {
+    position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1.5px;
+    background: #d2691e; border-radius: 1px; cursor: pointer;
+  }
+  .mark:hover { outline: 1px solid #fff; }
+  .mark.noted { box-shadow: 0 0 0 1px #ffe066; }
+  .calmark {
+    position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1.5px;
+    background: #ff3b30; border-radius: 1px; cursor: pointer;
+  }
+  .calmark:hover { outline: 1px solid #fff; }
+  /* distance_calibration: upward triangles under the scrub bar, one per
+     frame that has reference points -- click to jump to that frame. */
+  #calFrameMarkers {
+    width: 100%; max-width: 1920px; position: relative; height: 9px; margin-top: 2px;
+  }
+  #calFrameMarkers .calframe {
+    position: absolute; top: 0; width: 0; height: 0; margin-left: -5px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-bottom: 9px solid currentColor;   /* points up; colour set inline from the picker */
+    cursor: pointer;
+  }
+  #calFrameMarkers .calframe:hover { filter: brightness(1.5); }
+  /* distance_calibration: marker-colour picker as a row of colour boxes;
+     the selected one gets a contrasting (black/white) ring. */
+  #calColorSwatches { display: inline-flex; gap: 4px; align-items: center; vertical-align: middle; }
+  #calColorSwatches .calswatch {
+    width: 18px; height: 18px; padding: 0; border-radius: 3px;
+    border: 1px solid #555; cursor: pointer; box-sizing: border-box;
+  }
+  #calColorSwatches .calswatch.sel {
+    outline: 2px solid var(--ring, #fff); outline-offset: 1px;
+    border-color: var(--ring, #fff);
+  }
   .playhead {
     position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; pointer-events: none;
   }
@@ -72,12 +143,29 @@
 </head>
 <body>
 
+<aside id="sessionBar">
+  <div id="sessionBarHead">
+    <span class="grow">sessions</span>
+    <button id="sessAdd" title="Add a folder or a .MOV (native chooser)">+</button>
+    <button id="sessRemove" title="Remove the selected session from this list" disabled>&minus;</button>
+  </div>
+  <div id="sessionList"></div>
+</aside>
+
+<div id="main">
+
 <div id="modes"></div>
 
 <div id="stage">
-  <video id="video" preload="auto"></video>
-  <canvas id="overlay"></canvas>
-  <canvas id="loupe"></canvas>
+  <div id="stageInner">
+    <video id="video" preload="auto"></video>
+    <canvas id="overlay"></canvas>
+    <canvas id="loupe"></canvas>
+  </div>
+  <!-- DC dot captions render here: a screen-space layer OUTSIDE #stageInner,
+       so the zoom transform (and the overlay's 4K backing-store cap) never
+       touch it -- text stays pixel-sharp and identical at every zoom. -->
+  <canvas id="calLabelLayer" style="display:none"></canvas>
 </div>
 
 <div id="controls">
@@ -100,6 +188,15 @@
   <input type="number" id="stepSize" value="0.067" step="0.001" min="0.001" style="width:70px">
   <button id="loupeToggle" title="Magnifier &mdash; hover the video, scroll or +/- to zoom (z to toggle)">&#128269; loupe</button>
   <button id="unitsToggle" style="display:none">yds</button>
+  <button id="calBoxesToggle" style="display:none">boxes: on</button>
+  <span id="calZoomCtl" style="display:none">
+    <button id="calZoomOut">&minus;</button>
+    <span id="calZoomLabel" style="display:inline-block; width:44px; text-align:center;">100%</span>
+    <button id="calZoomIn">+</button>
+    <button id="calZoomReset">1:1</button>
+    <button id="calHandToggle" title="Hand tool -- drag to reposition the zoomed view (h)">&#9995; pan</button>
+  </span>
+  <span id="calColorSwatches" title="Reference marker colour (dot, ring, crosshair)" style="display:none"></span>
   <span class="hint" id="modeHint"></span>
 </div>
 
@@ -114,8 +211,11 @@
 <div id="hint"></div>
 
 <div id="timeline"><div id="timelineFill"></div></div>
+<div id="calFrameMarkers" style="display:none"></div>
 
 <pre id="detail"></pre>
+
+</div><!-- #main -->
 
 <script>
 const video = document.getElementById('video');
@@ -123,6 +223,8 @@ const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
 const loupe = document.getElementById('loupe');
 const lctx = loupe.getContext('2d');
+const calLabelLayer = document.getElementById('calLabelLayer');
+const lblCtx = calLabelLayer.getContext('2d');
 const LOUPE_SIZE = 240;                       // on-screen diameter (css px)
 const LOUPE_DPR = window.devicePixelRatio || 1;
 loupe.width = LOUPE_SIZE * LOUPE_DPR;
@@ -147,9 +249,67 @@ const RIDER_COLOR = '#33ff99';            // a combo's matched rider box(es)
 const BAD_COLOR = '#ff4444';              // false_positive highlight
 const HOOD_TRUNCATION_COLOR = '#ff9900';  // hood_truncation highlight
 const OTHER_TRUNCATION_COLOR = '#3399ff'; // other_truncation highlight
-const DISTANCE_ANOMALY_COLOR = '#ff6699'; // distance_anomaly highlight
+const DISTANCE_ANOMALY_COLOR = '#d2691e'; // distance_anomaly highlight (orangey-brown)
+const DISTANCE_CALIBRATION_COLOR = '#ff3b30'; // distance_calibration reference marker -- default colour (red)
+
+// --- Persisted UI settings ------------------------------------------------
+// localStorage is only a fast synchronous first-paint cache; the server
+// (/api/settings, a small user-global JSON file) is the source of truth,
+// because this webview drops localStorage between sessions -- which is why
+// a pure-localStorage version kept "forgetting" the units toggle. Writes
+// go to both; on load the server value wins.
+function lsGet(k, dflt) { try { const v = localStorage.getItem(k); return v == null ? dflt : v; } catch (_) { return dflt; } }
+function lsSet(k, v) { try { localStorage.setItem(k, String(v)); } catch (_) {} }
+function settingSave(obj) {
+  for (const [k, v] of Object.entries(obj)) lsSet('superTool.' + k, v);
+  fetch('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(obj),
+  }).catch(() => {});
+}
+// Reconcile the synchronously-loaded localStorage cache with the server
+// copy (authoritative). Called once, early in the load sequence -- before
+// switchMode() does the first render.
+function applyServerSettings(s) {
+  if (!s || typeof s !== 'object') return;
+  if (typeof s.useMetricDistance === 'boolean') {
+    useMetricDistance = s.useMetricDistance;
+    lsSet('superTool.useMetricDistance', useMetricDistance);
+    const btn = document.getElementById('unitsToggle');
+    if (btn) btn.textContent = useMetricDistance ? 'm' : 'yds';
+  }
+  if (CAL_MARKER_COLORS.includes(s.calMarkerColor)) {
+    calMarkerColor = s.calMarkerColor;
+    lsSet('superTool.calMarkerColor', calMarkerColor);
+    if (typeof renderCalSwatches === 'function') renderCalSwatches();
+  }
+  if (Number.isFinite(s.calZoom)) { calZoom = Math.max(1, Math.min(16, s.calZoom)); lsSet('superTool.calZoom', calZoom); }
+  if (Number.isFinite(s.calPanX)) { calPanX = s.calPanX; lsSet('superTool.calPanX', calPanX); }
+  if (Number.isFinite(s.calPanY)) { calPanY = s.calPanY; lsSet('superTool.calPanY', calPanY); }
+}
+
+// User-chosen colour for the distance_calibration marker -- dot, ring and
+// crosshair are all drawn in this one colour. Chosen from a fixed palette,
+// persisted across reloads.
+const CAL_MARKER_COLORS = ['black', 'white', 'cyan', 'magenta', 'yellow', 'red', 'green', 'blue', 'orange'];
+const CAL_COLOR_RGB = {
+  black: [0, 0, 0], white: [255, 255, 255], cyan: [0, 255, 255], magenta: [255, 0, 255],
+  yellow: [255, 255, 0], red: [255, 0, 0], green: [0, 128, 0], blue: [0, 0, 255], orange: [255, 165, 0],
+};
+// Ring colour for the selected swatch: black on a light colour, white on a
+// dark one (relative luminance, sRGB coefficients).
+function ringForColor(name) {
+  const [r, g, b] = CAL_COLOR_RGB[name] || [255, 0, 0];
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.5 ? '#000' : '#fff';
+}
+let calMarkerColor = lsGet('superTool.calMarkerColor', 'red');
+if (!CAL_MARKER_COLORS.includes(calMarkerColor)) calMarkerColor = 'red';
 const TRUNCATION_TYPES = ['none', 'hood', 'other'];
-const ANOMALY_TYPES = ['unset', 'too_far', 'too_close'];
+// Which frame/box edge(s) the 'other' truncation clips -- recorded because
+// the side determines which distance term is corrupted: bottom -> row-based,
+// left/right -> width-based, top -> the obliqueness aspect check. 'hood'
+// already implies bottom, so sides only apply to 'other'.
+const TRUNCATION_SIDES = ['left', 'right', 'top', 'bottom'];
 
 // --- Mode registry ---------------------------------------------------
 // 'flow_debug': read-only. Draws the five per-track flow-arrow vectors
@@ -183,8 +343,10 @@ const MODES = {
     hint: 'click a box the instant OUR hood/dashboard starts clipping its bottom edge &middot; click the highlighted box to trim start/end or add a note' },
   other_truncation: { kind: 'single', label: 'Other Truncation', highlightColor: OTHER_TRUNCATION_COLOR,
     hint: 'click a box the instant anything else (another object, frame edge) starts clipping it &middot; click the highlighted box to trim start/end or add a note' },
+  distance_calibration: { kind: 'distance_calibration', label: 'Distance Calibration', highlightColor: DISTANCE_CALIBRATION_COLOR,
+    hint: 'click anywhere to drop a reference dot and enter its tape-measured distance &middot; click a dot to select it, then arrow keys nudge 0.5px (Shift 5px) &middot; each dot shows tape "actual" vs the row-based "calc" &middot; &plus;/&minus;/1:1 or &#8984;-scroll to zoom, hand tool (h) or plain scroll to pan &middot; "boxes" toggles the detection boxes' },
   distance_anomaly: { kind: 'distance_anomaly', label: 'Distance Anomaly', highlightColor: DISTANCE_ANOMALY_COLOR,
-    hint: 'click a box the instant its shown distance goes wrong &middot; click the highlighted box for its panel: trim start/end, far/close, truncation, actual distance, note' },
+    hint: 'click a box the instant its shown distance looks wrong to log a one-frame anomaly &middot; click a logged (highlighted) box on that frame to set true distance (tape or eyeball), truncation (+ edges, when "other"), a note, or delete it &middot; pick a representative set, not every bad frame' },
   cyclist: { kind: 'combo', label: 'Cyclist', vehicleLabel: 'bicycle', riderLabel: 'person', maxRiders: 1,
     hint: 'click a bicycle to start/select a pairing, then click its rider &middot; click a rider again to unpair &middot; click the selected vehicle box again to trim/add a note' },
   motorcyclist: { kind: 'combo', label: 'Motorcyclist', vehicleLabel: 'motorcycle', riderLabel: 'person', maxRiders: 2,
@@ -194,7 +356,7 @@ const MODES = {
   equestrian: { kind: 'combo', label: 'Equestrian', vehicleLabel: 'horse', riderLabel: 'person', maxRiders: 1,
     hint: 'click a horse to start/select a pairing, then click its rider &middot; click the selected vehicle box again to trim/add a note' },
 };
-const MODE_ORDER = ['flow_debug', 'followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'distance_anomaly', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
+const MODE_ORDER = ['flow_debug', 'followed_vehicle', 'false_positive', 'hood_truncation', 'other_truncation', 'distance_calibration', 'distance_anomaly', 'cyclist', 'motorcyclist', 'skateboarder', 'equestrian'];
 const GROUND_TRUTH_MODES = MODE_ORDER.filter(m => m !== 'flow_debug');
 let activeMode = 'flow_debug';
 
@@ -235,8 +397,30 @@ function baseCenterNormalized(d) {
 }
 const METERS_TO_YARDS = 1.0936133;
 const MPS_TO_MPH = 2.2369363;
-let useMetricDistance = false;
+let useMetricDistance = lsGet('superTool.useMetricDistance', 'false') === 'true';
 let selectedTrackID = null;
+let selectedCalPoint = null;   // distance_calibration: the clicked reference dot (for arrow-key nudging + popup)
+let calPopupPoint = null;      // distance_calibration: the dot whose entry popup is currently open (its actual/calc stay hidden until "done")
+let calPopupXY = null;         // where that popup was opened, so a unit toggle can re-render it in the new unit
+let showCalBoxes = true;       // distance_calibration: whether detection boxes are drawn
+// distance_calibration zoom/pan -- CSS transform on #stageInner (video +
+// overlay together, so they stay aligned); identity (calZoom 1) in every
+// other mode. The overlay's backing store stays at natural display size
+// (resizeCanvas divides by calZoom), so point x/y and all geometry stay in
+// unscaled image space -- only the rendered result is magnified.
+// Zoom level and pan offset persist across DC visits AND page reloads --
+// leaving DC for another tool and coming back restores the exact view.
+let calZoom  = parseFloat(lsGet('superTool.calZoom', '1')) || 1;
+let calPanX  = parseFloat(lsGet('superTool.calPanX', '0')) || 0;
+let calPanY  = parseFloat(lsGet('superTool.calPanY', '0')) || 0;
+let calPanDrag = null;         // {startX, startY, panX0, panY0, moved} while dragging to pan
+let calHandTool = false;       // hand tool: drag repositions the zoomed view, clicks don't place dots
+let suppressNextCalClick = false;  // set on mouseup after a pan drag so the trailing click doesn't drop a dot
+let overlayBsScale = 1;        // overlay backing-store px per on-screen px (< 1 only when the 4K cap bites at high zoom)
+// The one just-clicked reference dot that has NOT yet been moved or given a
+// distance -- the only point Esc will undo. Cleared once the dot is nudged
+// or a distance is entered (then it's a real point, kept through everything).
+let calFreshPoint = null;
 
 // How far past the last (or before the first) real detection entry
 // video.currentTime may drift before frameAt's "nearest" lookup is treated
@@ -256,6 +440,13 @@ for (const m of MODE_ORDER) {
   modesEl.appendChild(b);
 }
 function switchMode(m) {
+  if (MODES[activeMode] && m !== activeMode) {
+    // leaving a mode: drop any bare-clicked-never-touched point
+    if (MODES[activeMode].kind === 'distance_anomaly') pristineAnomalyPurge(selectedTrackID);
+    // NB: leaving DC does NOT discard points or reset the zoom -- both are
+    // DC state we deliberately remember across visits.
+    if (MODES[activeMode].kind === 'distance_calibration') hideTrimMenu();
+  }
   activeMode = m;
   for (const b of modesEl.querySelectorAll('.modeBtn')) {
     b.classList.toggle('active', b.dataset.mode === m);
@@ -263,12 +454,36 @@ function switchMode(m) {
   const cfg = MODES[m];
   document.getElementById('modeHint').innerHTML = '| ' + cfg.hint + ' &middot; keys: &larr;/&rarr; step, space play/pause, esc close menu/clear';
   const isFlowDebug = cfg.kind === 'flow_debug';
-  document.getElementById('unitsToggle').style.display = isFlowDebug ? '' : 'none';
+  document.getElementById('unitsToggle').style.display = '';  // every mode shows box distances now
   document.getElementById('legend').style.display = isFlowDebug ? '' : 'none';
   document.getElementById('activeLine').style.display = isFlowDebug ? 'none' : '';
-  document.querySelector('#status span:nth-child(4)').style.display = isFlowDebug ? 'none' : ''; // "segments:"
+  const countSpan = document.querySelector('#status span:nth-child(4)'); // "segments:" / "anomalies:"
+  countSpan.style.display = isFlowDebug ? 'none' : '';
+  countSpan.firstChild.textContent =
+    cfg.kind === 'distance_anomaly' ? 'anomalies: '
+    : cfg.kind === 'distance_calibration' ? 'points: '
+    : 'segments: ';
   document.getElementById('saveState').style.display = isFlowDebug ? 'none' : '';
-  if (isFlowDebug) selectedTrackID = null;
+  document.getElementById('calBoxesToggle').style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
+  document.getElementById('calZoomCtl').style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
+  document.getElementById('calColorSwatches').style.display = (cfg.kind === 'distance_calibration') ? 'inline-flex' : 'none';
+  document.getElementById('calHandToggle').style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
+  calLabelLayer.style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
+  if (cfg.kind === 'distance_calibration') {
+    // re-apply the remembered zoom/pan (clamped to the current stage size)
+    clampCalPan();
+    applyCalZoom();          // sets the stage transform + resizes the overlay
+    setCalHandTool(calHandTool);
+  } else {
+    // any other mode shares the same stage -- lift the DC transform so it
+    // renders un-zoomed (the calZoom/calPan values themselves are kept)
+    stageInner.style.transform = '';
+    overlay.style.cursor = '';
+    resizeCanvas();
+  }
+  selectedTrackID = null;      // flow_debug and distance_anomaly both use it as the "clicked box"
+  selectedCalPoint = null;
+  updateDetail(null);          // clear any stale detail panel from the previous mode
   draw();
   renderTimeline();
 }
@@ -284,22 +499,172 @@ let saveTimer = null;
 let reverseTimer = null;
 let hintTimer = null;
 
-video.src = '/video';
+// --- Sessions (left rail) ------------------------------------------------
+// The server holds a registry of the recordings you've pulled up; this rail
+// switches the ACTIVE one in place. Per-session view state (time, mode,
+// zoom/pan, selection) is snapshotted in the browser on the way out and
+// restored on the way back, so toggling never loses your place.
+let sessions = [];            // [{id,label,video,hasFlow}]
+let activeSessionId = null;
+const sessionStates = {};     // id -> {t, mode, calZoom, ...}
 
-Promise.all([
-  fetch('/api/frames').then(r => r.json()),
-  ...GROUND_TRUTH_MODES.map(m => fetch(`/api/ground_truth/${m}`).then(r => r.json())),
-]).then(([frameData, ...gts]) => {
-  frames = frameData.frames;
+function snapshotSessionState() {
+  if (!activeSessionId) return;
+  sessionStates[activeSessionId] = {
+    t: video.currentTime || 0,
+    mode: activeMode,
+    calZoom, calPanX, calPanY, calHandTool, showCalBoxes,
+    selTrack: selectedTrackID,
+    selCalIdx: selectedCalPoint ? store.distance_calibration.indexOf(selectedCalPoint) : -1,
+    rate: video.playbackRate,
+  };
+}
+function restoreSessionState(id) {
+  const s = sessionStates[id] || {};
+  calZoom = Number.isFinite(s.calZoom) ? s.calZoom : 1;
+  calPanX = Number.isFinite(s.calPanX) ? s.calPanX : 0;
+  calPanY = Number.isFinite(s.calPanY) ? s.calPanY : 0;
+  calHandTool = !!s.calHandTool;
+  showCalBoxes = (s.showCalBoxes === undefined) ? true : s.showCalBoxes;
+  document.getElementById('calBoxesToggle').textContent = showCalBoxes ? 'boxes: on' : 'boxes: off';
+  switchMode(s.mode || 'flow_debug');      // applies zoom/hand for DC, clears the transform otherwise
+  selectedTrackID = (s.selTrack != null) ? s.selTrack : null;
+  selectedCalPoint = (s.selCalIdx >= 0) ? (store.distance_calibration[s.selCalIdx] || null) : null;
+  if (Number.isFinite(s.rate)) { video.playbackRate = s.rate; }
+  const target = s.t || 0;
+  const applyT = () => {
+    try { video.currentTime = Math.max(0, Math.min((video.duration || target) - 0.001, target)); } catch (_) {}
+    draw(); renderTimeline(); updateStatus();
+  };
+  if (video.readyState >= 1) applyT();
+  else video.addEventListener('loadedmetadata', applyT, { once: true });
+}
+
+function sessionSubLabel(s) {
+  return s.hasFlow ? '' : 'no flow-debug';
+}
+function renderSessionList() {
+  const el = document.getElementById('sessionList');
+  el.innerHTML = '';
+  if (!sessions.length) {
+    const d = document.createElement('div');
+    d.id = 'sessionListEmpty';
+    d.textContent = 'No sessions. Click + to add a folder or a .MOV.';
+    el.appendChild(d);
+  }
+  for (const s of sessions) {
+    const row = document.createElement('div');
+    row.className = 'sessRow' + (s.id === activeSessionId ? ' active' : '');
+    row.title = s.video;
+    row.appendChild(document.createTextNode(s.label));
+    const sub = sessionSubLabel(s);
+    if (sub) { const e = document.createElement('span'); e.className = 'sub'; e.textContent = sub; row.appendChild(e); }
+    row.addEventListener('click', () => activateSession(s.id));
+    el.appendChild(row);
+  }
+  document.getElementById('sessRemove').disabled = sessions.length === 0;
+}
+
+async function loadActiveData({ newVideo = false } = {}) {
+  if (newVideo) {
+    const gotMeta = new Promise(res => {
+      const h = () => { video.removeEventListener('loadedmetadata', h); res(); };
+      video.addEventListener('loadedmetadata', h);
+      setTimeout(res, 8000);   // don't hang forever if the stream errors
+    });
+    video.src = '/video?s=' + encodeURIComponent(activeSessionId || '');
+    video.load();
+    await gotMeta;
+  }
+  const [frameData, settings, ...gts] = await Promise.all([
+    fetch('/api/frames', { cache: 'no-store' }).then(r => r.json()),
+    fetch('/api/settings', { cache: 'no-store' }).then(r => r.json()).catch(() => ({})),
+    ...GROUND_TRUTH_MODES.map(m => fetch(`/api/ground_truth/${m}`).then(r => r.json())),
+  ]);
+  frames = frameData.frames || [];
   videoResolution = frameData.videoResolution;
   videoFps = frameData.videoFps;
   hasFlowData = frameData.hasFlowData;
-  GROUND_TRUTH_MODES.forEach((m, i) => { store[m] = gts[i]; });
-  if (!hasFlowData) flashHint('No --flow-debug-json loaded for this session -- Flow Debug mode shows plain boxes only.');
+  applyServerSettings(settings);   // server wins over the localStorage first-paint cache
+  for (const m of GROUND_TRUTH_MODES) store[m] = [];
+  GROUND_TRUTH_MODES.forEach((m, i) => { store[m] = gts[i] || []; });
+  // distance_anomaly used to be a range model; fold any legacy {start_t,end_t}
+  // entries down to a single-frame point. Best-effort only.
+  store.distance_anomaly = store.distance_anomaly.map(a => {
+    if (a.t != null || a.start_t == null) return a;
+    const { start_t, end_t, ...rest } = a;
+    const fr = frameAt(start_t);
+    return { ...rest, t: fr ? fr.t : start_t };
+  });
+  // distance_calibration: re-run the row-based "calc" against the CURRENT formula.
+  for (const p of store.distance_calibration) recomputeCalPoint(p);
+  if (!hasFlowData) flashHint('No flow-debug JSON for this session -- Flow Debug shows plain boxes only.');
+  duration = video.duration || 0;
+}
+
+async function activateSession(id) {
+  if (!id || id === activeSessionId) return;
+  snapshotSessionState();
+  hideTrimMenu();
+  const r = await fetch('/api/sessions/activate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }),
+  }).then(x => x.json()).catch(() => ({ error: 'request failed' }));
+  if (r.error) { flashHint('could not switch session: ' + r.error); return; }
+  activeSessionId = id;
+  renderSessionList();
+  await loadActiveData({ newVideo: true });
+  restoreSessionState(id);
+}
+
+document.getElementById('sessAdd').addEventListener('click', async () => {
+  const btn = document.getElementById('sessAdd');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/sessions/pick_and_add', { method: 'POST' }).then(x => x.json());
+    if (r.error) { flashHint('add failed: ' + r.error); return; }
+    if (r.cancelled) return;
+    sessions = r.sessions || sessions;
+    renderSessionList();
+    if (r.added && r.added.length) await activateSession(r.added[0].id);
+    else flashHint('that recording is already in the list');
+  } finally {
+    btn.disabled = false;   // '+' is always enabled
+  }
+});
+
+document.getElementById('sessRemove').addEventListener('click', async () => {
+  if (!activeSessionId || !sessions.length) return;
+  const removingId = activeSessionId;
+  const r = await fetch('/api/sessions/remove', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: removingId }),
+  }).then(x => x.json()).catch(() => null);
+  if (!r) { flashHint('remove failed'); return; }
+  delete sessionStates[removingId];
+  sessions = r.sessions || [];
+  if (r.active) {
+    activeSessionId = null;          // force activateSession to run
+    await activateSession(r.active);
+  } else {
+    activeSessionId = null;
+    frames = []; for (const m of GROUND_TRUTH_MODES) store[m] = [];
+    video.removeAttribute('src'); video.load();
+    renderSessionList(); draw(); renderTimeline(); updateStatus();
+  }
+});
+
+(async function initSessions() {
+  const r = await fetch('/api/sessions', { cache: 'no-store' })
+    .then(x => x.json()).catch(() => ({ sessions: [], active: null }));
+  sessions = r.sessions || [];
+  activeSessionId = r.active || (sessions[0] && sessions[0].id) || null;
+  renderSessionList();
+  if (!activeSessionId) { flashHint('No sessions yet -- click + in the left rail to add one.'); return; }
+  video.src = '/video?s=' + encodeURIComponent(activeSessionId);
+  await loadActiveData();
   switchMode(activeMode);
   updateStatus();
   renderTimeline();
-});
+})();
 
 video.addEventListener('loadedmetadata', () => {
   duration = video.duration;
@@ -310,15 +675,93 @@ window.addEventListener('resize', resizeCanvas);
 new ResizeObserver(resizeCanvas).observe(video);
 
 function resizeCanvas() {
+  // video.getBoundingClientRect() is POST-#stageInner-transform, i.e. the
+  // real on-screen size (natural * calZoom). The overlay's CSS box must
+  // match the video's LAYOUT box (pre-transform), so divide calZoom back
+  // out for style.width/height -- the shared transform then magnifies
+  // overlay and video together, keeping them aligned. The backing store,
+  // though, is sized to the full ZOOMED resolution so overlay drawing
+  // (boxes, captions, the calibration crosshair) stays crisp when zoomed
+  // in for pixel-precise work rather than being upscaled and blurry.
+  // calZoom is only actually applied to the stage while DC mode is active;
+  // in any other mode the transform is cleared, so treat zoom as 1 there
+  // even though the DC value is remembered.
+  const z = (MODES[activeMode] && MODES[activeMode].kind === 'distance_calibration') ? (calZoom || 1) : 1;
   const r = video.getBoundingClientRect();
-  overlay.style.width = r.width + 'px';
-  overlay.style.height = r.height + 'px';
-  overlay.width = r.width;
-  overlay.height = r.height;
+  overlay.style.width = Math.round(r.width / z) + 'px';
+  overlay.style.height = Math.round(r.height / z) + 'px';
+  // Backing store follows the zoomed on-screen size for crispness, but
+  // capped -- past ~4K there's no visible gain and the canvas memory
+  // (w*h*4 bytes) balloons at high zoom.
+  const bsScale = Math.min(1, 4096 / Math.max(r.width, r.height, 1));
+  overlayBsScale = bsScale;
+  overlay.width = Math.max(1, Math.round(r.width * bsScale));
+  overlay.height = Math.max(1, Math.round(r.height * bsScale));
   overlay.style.top = video.offsetTop + 'px';
   overlay.style.left = video.offsetLeft + 'px';
+
+  // Screen-space label layer: covers #stage at 1:1 (× devicePixelRatio),
+  // never scaled or capped, so DC dot captions are always pixel-sharp.
+  const sb = document.getElementById('stage').getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  calLabelLayer.style.width = Math.round(sb.width) + 'px';
+  calLabelLayer.style.height = Math.round(sb.height) + 'px';
+  calLabelLayer.width = Math.max(1, Math.round(sb.width * dpr));
+  calLabelLayer.height = Math.max(1, Math.round(sb.height * dpr));
+  lblCtx.setTransform(dpr, 0, 0, dpr, 0, 0);   // draw in CSS px
+
   draw();
 }
+
+const stageInner = document.getElementById('stageInner');
+function persistCalZoom() {
+  settingSave({ calZoom, calPanX, calPanY });
+}
+let calPersistTimer = null;
+function persistCalZoomSoon() {   // coalesce a burst of wheel/drag events into one save
+  clearTimeout(calPersistTimer);
+  calPersistTimer = setTimeout(persistCalZoom, 500);
+}
+function applyCalZoom() {
+  stageInner.style.transform =
+    (calZoom === 1 && !calPanX && !calPanY) ? '' : `translate(${calPanX}px, ${calPanY}px) scale(${calZoom})`;
+  document.getElementById('calZoomLabel').textContent = Math.round(calZoom * 100) + '%';
+  resizeCanvas();   // ResizeObserver doesn't fire on transform changes
+}
+// Hand tool: while active the drag repositions the zoomed view and clicks
+// do NOT place/select dots (cursor shows a grab hand).
+function setCalHandTool(on) {
+  calHandTool = on;
+  document.getElementById('calHandToggle').classList.toggle('active', on);
+  if (MODES[activeMode] && MODES[activeMode].kind === 'distance_calibration') {
+    overlay.style.cursor = on ? 'grab' : '';
+  }
+}
+// Zoom keeping the image point under (clientX, clientY) fixed on screen.
+function calZoomAt(clientX, clientY, factor) {
+  const prev = calZoom;
+  calZoom = Math.max(1, Math.min(16, calZoom * factor));
+  if (calZoom === prev) return;
+  const sr = document.getElementById('stage').getBoundingClientRect(); // #stage is not transformed
+  const cx = clientX - sr.left, cy = clientY - sr.top;
+  // image-local point (unscaled) currently under the cursor
+  const lx = (cx - calPanX) / prev, ly = (cy - calPanY) / prev;
+  calPanX = cx - lx * calZoom;
+  calPanY = cy - ly * calZoom;
+  clampCalPan();
+  applyCalZoom();
+  persistCalZoomSoon();
+}
+// Keep at least a sliver of the image on screen when panned.
+function clampCalPan() {
+  if (calZoom === 1) { calPanX = calPanY = 0; return; }
+  const sr = document.getElementById('stage').getBoundingClientRect();
+  const contentW = sr.width * calZoom, contentH = sr.height * calZoom;
+  const margin = 40;
+  calPanX = Math.min(margin, Math.max(sr.width - contentW - margin, calPanX));
+  calPanY = Math.min(margin, Math.max(sr.height - contentH - margin, calPanY));
+}
+function resetCalZoom() { calZoom = 1; calPanX = calPanY = 0; applyCalZoom(); persistCalZoom(); }
 
 // --- Binary search for the last frame with t <= currentTime ---
 function frameAt(t) {
@@ -353,6 +796,177 @@ function activeComboAt(mode, t) {
     }
   }
   return best;
+}
+// The canonical frames[] t NEAREST to an arbitrary time -- frameAt() floors,
+// but video.currentTime / seeks land a hair either side of the grid, so the
+// floor can point at the wrong neighbour. Used to pin distance_anomaly
+// points to a frame stably.
+function snapToFrameT(t) {
+  const fr = frameAt(t);
+  if (!fr) return null;
+  const k = frames.indexOf(fr);
+  const next = frames[Math.min(k + 1, frames.length - 1)];
+  return (Math.abs(t - fr.t) <= Math.abs(next.t - t)) ? fr.t : next.t;
+}
+// distance_anomaly is a POINT model, not a range: every annotation is pinned
+// to one frame (its t is a canonical frames[] value). These are the ones on
+// the frame the playhead is currently on (can be several, one per track).
+function anomaliesAtFrame(rawT) {
+  if (rawT == null || !frames.length) return [];
+  const ft = snapToFrameT(rawT);
+  return store.distance_anomaly.filter(a => a.t === ft);
+}
+// An annotation with no actual information -- a bare click never followed
+// up. Note: picking a true-distance TYPE (tape/eyeball) without entering a
+// number does NOT count as info -- only a real distance value, a real
+// truncation, or a note makes the entry "real" and safe from auto-purge.
+function pristineAnomaly(a) {
+  return a.tape_distance_meters == null
+    && a.eyeball_distance_meters == null
+    && (a.truncation_type == null || a.truncation_type === 'none')
+    && (!a.truncation_sides || a.truncation_sides.length === 0)
+    && !a.note;
+}
+// Drop any pristine annotation(s) for a track, so a box that was only
+// clicked (selected) and then clicked away from goes fully back to its
+// virgin, unselected state -- no stored annotation, normal box colour, and
+// the two-click-to-open-panel flow restored.
+function pristineAnomalyPurge(trackID) {
+  if (trackID == null) return;
+  const arr = store.distance_anomaly;
+  const kept = arr.filter(a => !(a.trackID === trackID && pristineAnomaly(a)));
+  if (kept.length !== arr.length) {
+    store.distance_anomaly = kept;
+    postGroundTruth('distance_anomaly');
+    if (MODES[activeMode].kind === 'distance_anomaly') renderTimeline();
+  }
+}
+
+// --- distance_calibration: point model like distance_anomaly, but the
+// "calc" number comes from the server (/api/compute_distance ->
+// reconstruct_annotated.row_based_distance_meters), the one true row-based
+// formula. The point stores nothing computed of its own besides a cached
+// calc_distance_meters for display/offline use; every recompute goes
+// through the endpoint. ---
+function calPointsAtFrame(rawT) {
+  if (rawT == null || !frames.length) return [];
+  const ft = snapToFrameT(rawT);
+  return store.distance_calibration.filter(p => p.t === ft);
+}
+// Undo a just-created, never-touched reference dot (the Esc gesture). Only
+// calFreshPoint qualifies -- once a dot has been nudged or given a distance
+// it's a real point and survives Esc, mode switches, everything.
+function pristineCalPurge() {
+  const p = calFreshPoint;
+  calFreshPoint = null;
+  if (!p || p.tape_distance_meters != null) return;
+  const arr = store.distance_calibration;
+  const i = arr.indexOf(p);
+  if (i === -1) return;
+  arr.splice(i, 1);
+  if (selectedCalPoint === p) selectedCalPoint = null;
+  if (calPopupPoint === p) { calPopupPoint = null; calPopupXY = null; }
+  postGroundTruth('distance_calibration');
+  if (MODES[activeMode].kind === 'distance_calibration') { draw(); renderTimeline(); }
+}
+// Row-based "calc" for a point, via the server (single source of truth).
+// Fed the EXACT pitch/roll the pipeline used for that frame (added to the
+// flow-debug JSON by reconstruct_annotated.py); 0 only if a pre-regen JSON
+// is loaded, in which case a hint is flashed.
+function recomputeCalPoint(p) {
+  const fr = frameAt(p.t);
+  const pitch = fr && fr.referencePitchDegrees, roll = fr && fr.referenceRollDegrees;
+  if (pitch == null || roll == null) flashHint('this flow-debug JSON predates the pitch/roll fields -- calc uses 0/0; regenerate it');
+  fetch('/api/compute_distance', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      row: p.y, col: p.x, aspect: (video.videoWidth || 1920) / (video.videoHeight || 1080),
+      referencePitchDegrees: pitch == null ? 0 : pitch,
+      referenceRollDegrees: roll == null ? 0 : roll,
+    }),
+  }).then(r => r.json()).then(res => {
+    p.calc_distance_meters = res.distanceMeters;
+    // save distance_calibration explicitly -- scheduleSave() keys off
+    // activeMode, and this callback can land after a mode switch
+    postGroundTruth('distance_calibration');
+    if (MODES[activeMode].kind === 'distance_calibration') { draw(); renderTimeline(); }
+  }).catch(() => {});
+}
+function drawCalPoint(p, w, h, selected, showLabels) {
+  const armLen = 16;
+  const gap = 6;   // clear space around the dot -- arms don't touch it
+  ctx.save();
+  ctx.translate(p.x * w, p.y * h);
+
+  // Dot / ring / crosshairs are locked to the IMAGE: they scale with the
+  // zoom level (calZoom), so magnifying 4x for fine placement gives a 4x
+  // marker pinned to the same pixels -- not a fixed-size pointer floating
+  // over a growing image. overlayBsScale folds in the backing-store cap so
+  // the on-screen result is still exactly calZoom x the base size.
+  ctx.save();
+  const ms = calZoom * overlayBsScale;
+  if (ms !== 1) ctx.scale(ms, ms);
+  // Dot + crosshair are identical whether or not the point is selected --
+  // always thin. The ONLY selected/unselected differentiator is the ring:
+  // drawn for the selected point, absent otherwise. Colour is user-chosen
+  // (calMarkerColor) and shared by all three elements.
+  ctx.strokeStyle = calMarkerColor;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-armLen, 0); ctx.lineTo(-gap, 0);
+  ctx.moveTo(gap, 0);     ctx.lineTo(armLen, 0);
+  ctx.moveTo(0, -armLen); ctx.lineTo(0, -gap);
+  ctx.moveTo(0, gap);     ctx.lineTo(0, armLen);
+  ctx.stroke();
+  // 6px-diameter dot; canvas arc AAs the non-integer path
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, Math.PI * 2);
+  ctx.fillStyle = calMarkerColor;
+  ctx.fill();
+  if (selected) {
+    ctx.strokeStyle = calMarkerColor; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(0, 0, 12, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.restore();
+  // The "actual"/"calc" captions are NOT drawn here -- they go on the
+  // screen-space #calLabelLayer (see drawCalLabels) so they never inherit
+  // the zoom transform or the overlay's 4K backing-store cap, and stay
+  // pixel-sharp and identically sized at every zoom level.
+}
+
+// DC dot captions, drawn on the un-transformed screen-space layer. Each
+// dot's on-screen position is derived from calPan/calZoom directly, then
+// the caption is drawn at a fixed 13px so it looks the same at any zoom.
+function drawCalLabels() {
+  lblCtx.clearRect(0, 0, calLabelLayer.width, calLabelLayer.height);
+  if (!MODES[activeMode] || MODES[activeMode].kind !== 'distance_calibration') return;
+  const z = calZoom || 1;
+  const Wl = overlay.clientWidth || parseFloat(overlay.style.width) || overlay.width;
+  const Hl = overlay.clientHeight || parseFloat(overlay.style.height) || overlay.height;
+  const armLen = 16;
+  lblCtx.font = '13px monospace';
+  lblCtx.textBaseline = 'alphabetic';
+  for (const p of calPointsAtFrame(video.currentTime)) {
+    if (p === calPopupPoint) continue;   // hidden while its entry popup is open
+    // dot centre in #stage layout px, then apply the #stageInner transform
+    const sx = calPanX + (video.offsetLeft + p.x * Wl) * z;
+    const sy = calPanY + (video.offsetTop + p.y * Hl) * z;
+    const off = armLen * z + 4;          // clear of the (zoom-scaled) crosshair
+    calCaption(`actual ${p.tape_distance_meters == null ? '?' : distU(p.tape_distance_meters)}`, sx + off, sy - 6);
+    calCaption(`calc ${p.calc_distance_meters == null ? '…' : distU(p.calc_distance_meters)}`, sx + off, sy + 14);
+  }
+}
+// same black-on-translucent-white style as drawCaption, but on lblCtx
+function calCaption(text, x, y) {
+  const tw = lblCtx.measureText(text).width;
+  const pad = 3;
+  lblCtx.globalAlpha = 0.5;
+  lblCtx.fillStyle = '#ffffff';
+  lblCtx.fillRect(x - pad, y - 13 - pad, tw + pad * 2, 13 + pad + 4);
+  lblCtx.globalAlpha = 1;
+  lblCtx.fillStyle = '#000000';
+  lblCtx.fillText(text, x, y);
 }
 
 function drawArrow(x0, y0, x1, y1, color) {
@@ -390,6 +1004,14 @@ function smoothedSpeedMph(d) {
   return speedMps * MPS_TO_MPH;
 }
 
+// metres -> current display unit (yds/m) with the unit spelled out. DISPLAY
+// formatting only -- the row-based "calc" itself is the server-side
+// row_based_distance_meters, never anything computed here.
+function distU(m) {
+  if (m == null) return 'null';
+  return useMetricDistance ? `${m.toFixed(2)} m` : `${(m * METERS_TO_YARDS).toFixed(2)} yds`;
+}
+
 function distanceText(d) {
   if (d.correctedDistanceMeters === null || d.correctedDistanceMeters === undefined) {
     return useMetricDistance ? '? m' : '? yds';
@@ -420,6 +1042,24 @@ function fusedDistanceText(d) {
 function distancesDisagree(d) {
   if (d.correctedDistanceMeters == null || d.fused_distance_meters == null) return false;
   return Math.abs(d.fused_distance_meters - d.correctedDistanceMeters) / d.correctedDistanceMeters > 0.15;
+}
+
+// Best available distance estimate for a detection (metres), or null --
+// the fused value first, then the existing row/width switch value.
+function bestDistanceMeters(d) {
+  for (const v of [d.fused_distance_meters, d.correctedDistanceMeters]) {
+    if (typeof v === 'number' && isFinite(v)) return v;
+  }
+  return null;
+}
+// Detections ordered farthest-first so nearer boxes paint last and sit on
+// top in the canvas Z-order. Real distance estimate where we have one;
+// otherwise the box's bottom edge as a monocular proxy (lower on screen =
+// nearer), for the live-tracking fallback with no --flow-debug-json. The
+// clicked/selected box is still lifted above this ordering by its branch.
+function farToNear(dets) {
+  const farness = d => bestDistanceMeters(d) ?? (1 - (d.y + d.h)) * 100;
+  return dets.slice().sort((a, b) => farness(b) - farness(a));
 }
 
 // Black-on-white caption on a translucent backing, same as
@@ -493,18 +1133,18 @@ function updateDetail(d) {
   detailEl.style.display = 'block';
   let text =
     `#${d.trackID} ${d.label}  conf=${(d.confidence * 100).toFixed(1)}%\n` +
-    `correctedDistanceMeters (existing switch) = ${fmtNum(d.correctedDistanceMeters, 2)}` +
+    `corrected (existing switch) = ${distU(d.correctedDistanceMeters)}` +
     `   widthOverridden = ${d.widthOverridden}\n`;
   // distance_fusion.py's breakdown -- only present when a --flow-debug-json
   // was loaded with the fusion fields (added 2026-08-26); the live-
   // tracking fallback has none of this.
   if (d.fused_distance_meters !== undefined) {
     text +=
-      `fused_distance_meters (NEW)          = ${fmtNum(d.fused_distance_meters, 2)}` +
-      `   fused_sigma_meters = ${fmtNum(d.fused_sigma_meters, 2)}\n` +
-      `  row:   dist=${fmtNum(d.row_distance_meters, 2)}  sigma=${fmtNum(d.row_sigma_meters, 2)}` +
+      `fused (NEW)          = ${distU(d.fused_distance_meters)}` +
+      `   sigma = ${distU(d.fused_sigma_meters)}\n` +
+      `  row:   dist=${distU(d.row_distance_meters)}  sigma=${distU(d.row_sigma_meters)}` +
       `  phi=${fmtNum(d.phi_degrees, 2)}deg  p_truncated=${d.p_truncated == null ? 'null' : d.p_truncated.toExponential(2)}\n` +
-      `  width: dist=${fmtNum(d.width_distance_meters, 2)}  sigma=${fmtNum(d.width_sigma_meters, 2)}\n` +
+      `  width: dist=${distU(d.width_distance_meters)}  sigma=${distU(d.width_sigma_meters)}\n` +
       `  terms_used=${d.terms_used ? d.terms_used.join('+') : 'none'}` +
       `  side_truncated=${d.side_truncated}\n`;
   }
@@ -532,11 +1172,11 @@ function drawFlowDebug(f, w, h) {
     return;
   }
 
-  let selectedDet = null;
-  for (const d of f.detections) {
-    const isSelected = d.trackID !== null && d.trackID === selectedTrackID;
+  // Draw everything else first, then the selected box last, so clicking a
+  // box lifts its rectangle / caption / vectors to the front of the canvas
+  // Z-order instead of leaving them buried under an overlapping neighbour.
+  const drawOne = (d, isSelected) => {
     const isLeading = f.lockedLeadingTrackID != null && d.trackID === f.lockedLeadingTrackID;
-    if (isSelected) selectedDet = d;
     // "#id label dist" caption when distance data is available (a
     // --flow-debug-json was loaded); plain "#id label conf%" caption in
     // the live-tracking-fallback case, matching label_leading_vehicle's
@@ -573,13 +1213,21 @@ function drawFlowDebug(f, w, h) {
         if (mph !== null) drawCaption(`${mph.toFixed(1)} mph`, tip[0] + 6, tip[1] + 4);
       }
     }
+  };
+
+  let selectedDet = null;
+  for (const d of farToNear(f.detections)) {
+    if (d.trackID !== null && d.trackID === selectedTrackID) { selectedDet = d; continue; }
+    drawOne(d, false);
   }
+  if (selectedDet) drawOne(selectedDet, true);
   if (hasFlowData) drawHud(f, w, h);
   updateDetail(selectedDet);
 }
 
 function draw() {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
+  drawCalLabels();   // screen-space DC captions; self-clears / no-ops outside DC mode
   const f = frameAt(video.currentTime);
   const cfg = MODES[activeMode];
   if (!f) { updateStatus(f); renderPlayhead(); return; }
@@ -588,25 +1236,48 @@ function draw() {
   if (cfg.kind === 'flow_debug') {
     drawFlowDebug(f, w, h);
     updateStatus(f);
-  } else if (cfg.kind === 'single' || cfg.kind === 'distance_anomaly') {
-    const active = activeSingleAt(activeMode, video.currentTime);
-    for (const d of f.detections) {
-      const isActive = active && d.trackID === active.trackID;
-      const color = isActive ? cfg.highlightColor : (LABEL_COLORS[d.label] || '#ffffff');
-      drawBox(d, w, h, color, isActive ? 4 : 2, isActive);
+  } else if (cfg.kind === 'distance_anomaly') {
+    const anns = anomaliesAtFrame(video.currentTime);
+    const annByTrack = new Map(anns.map(a => [a.trackID, a]));
+    const marked = new Set(anns.map(a => a.trackID));
+    let selDet = null;
+    for (const d of farToNear(f.detections)) {
+      if (d.trackID === selectedTrackID) { selDet = d; continue; }        // drawn last, below
+      const extra = daTrueDistSuffix(annByTrack.get(d.trackID));           // " (tape: 10.3 m)" once entered
+      if (marked.has(d.trackID)) drawBox(d, w, h, cfg.highlightColor, 1.5, false, extra);  // logged here, not selected -- subtle marker
+      else drawBox(d, w, h, LABEL_COLORS[d.label] || '#ffffff', 2, false, extra);
     }
+    if (selDet) drawBox(selDet, w, h, cfg.highlightColor, 4, true, daTrueDistSuffix(annByTrack.get(selDet.trackID)));  // the one clicked box -- prominent, on top
+    updateStatus(f, anns);
+    updateDetail(f.detections.find(d => d.trackID === selectedTrackID) || null);
+  } else if (cfg.kind === 'distance_calibration') {
+    if (showCalBoxes) {
+      for (const d of farToNear(f.detections)) drawBox(d, w, h, LABEL_COLORS[d.label] || '#ffffff', 2, false);
+    }
+    // dots + their captions drawn last -> always highest in the Z-order
+    for (const p of calPointsAtFrame(video.currentTime)) drawCalPoint(p, w, h, p === selectedCalPoint, p !== calPopupPoint);
+    updateStatus(f, selectedCalPoint);
+    updateDetail(null);
+  } else if (cfg.kind === 'single') {
+    const active = activeSingleAt(activeMode, video.currentTime);
+    let activeDet = null;
+    for (const d of farToNear(f.detections)) {
+      if (active && d.trackID === active.trackID) { activeDet = d; continue; }
+      drawBox(d, w, h, LABEL_COLORS[d.label] || '#ffffff', 2, false);
+    }
+    // selected/labeled box drawn last -> on top of overlapping neighbours
+    if (activeDet) drawBox(activeDet, w, h, cfg.highlightColor, 4, true);
     updateStatus(f, active);
   } else {
     const active = activeComboAt(activeMode, video.currentTime);
     let vehicleBox = null;
     const riderBoxes = [];
-    for (const d of f.detections) {
+    for (const d of farToNear(f.detections)) {
       const isVehicle = active && d.label === cfg.vehicleLabel && d.trackID === active.vehicleTrackID;
       const isRider = active && d.label === cfg.riderLabel && active.riderTrackIDs.includes(d.trackID);
-      const color = isVehicle ? HIGHLIGHT_COLOR : (isRider ? RIDER_COLOR : (LABEL_COLORS[d.label] || '#ffffff'));
-      drawBox(d, w, h, color, (isVehicle || isRider) ? 4 : 2, isVehicle || isRider);
-      if (isVehicle) vehicleBox = d;
-      if (isRider) riderBoxes.push(d);
+      if (isVehicle) { vehicleBox = d; continue; }
+      if (isRider) { riderBoxes.push(d); continue; }
+      drawBox(d, w, h, LABEL_COLORS[d.label] || '#ffffff', 2, false);
     }
     // Connecting lines make the pairing legible in crowded frames (several
     // people/bikes at once) where color alone is ambiguous.
@@ -621,13 +1292,16 @@ function draw() {
       }
       ctx.setLineDash([]);
     }
+    // the paired vehicle + riders drawn last -> on top of neighbours and link lines
+    if (vehicleBox) drawBox(vehicleBox, w, h, HIGHLIGHT_COLOR, 4, true);
+    for (const r of riderBoxes) drawBox(r, w, h, RIDER_COLOR, 4, true);
     updateStatus(f, active);
   }
   renderPlayhead();
   if (loupeActive) updateLoupe();
 }
 
-function drawBox(d, w, h, color, lineWidth, filled) {
+function drawBox(d, w, h, color, lineWidth, filled, captionExtra) {
   const x = d.x * w, y = d.y * h, bw = d.w * w, bh = d.h * h;
   ctx.strokeStyle = color;
   ctx.lineWidth = lineWidth;
@@ -636,9 +1310,22 @@ function drawBox(d, w, h, color, lineWidth, filled) {
     ctx.fillStyle = color + '55';
     ctx.fillRect(x, y, bw, bh);
   }
-  ctx.fillStyle = color;
-  ctx.font = '13px monospace';
-  ctx.fillText(`#${d.trackID} ${d.label} ${Math.round(d.confidence * 100)}%`, x + 3, y > 14 ? y - 4 : y + bh + 14);
+  // distance (unit-toggle aware), black on translucent white -- same caption
+  // style as Flow Debug mode and reconstruct_annotated.py's draw_label_text.
+  // (Regressed to a coloured "conf%" in the 4236e93 flow_debug_viewer merge;
+  // the pre-merge drawBox already showed distanceText via drawCaption.)
+  // captionExtra: DA mode appends the entered true distance, e.g. " (tape: 10.3 m)".
+  drawCaption(`#${d.trackID} ${d.label} ${distanceText(d)}${captionExtra || ''}`, x + 4, y + 18);
+}
+// " (tape: 10.3 m)" / " (eyeball: 25.0 m)" for the DA box label once a real
+// true-distance value has been entered for this track on this frame.
+// Unit-toggle aware; empty when there's nothing to show.
+function daTrueDistSuffix(a) {
+  if (!a) return '';
+  const fmt = m => useMetricDistance ? `${m.toFixed(1)} m` : `${(m * METERS_TO_YARDS).toFixed(1)} yds`;
+  if (a.tape_distance_meters != null)    return ` (tape: ${fmt(a.tape_distance_meters)})`;
+  if (a.eyeball_distance_meters != null) return ` (eyeball: ${fmt(a.eyeball_distance_meters)})`;
+  return '';
 }
 
 function updateStatus(f, active) {
@@ -647,11 +1334,25 @@ function updateStatus(f, active) {
   const cfg = MODES[activeMode];
   if (cfg.kind === 'flow_debug') return;
   let label = 'none';
-  if (active) {
-    if (cfg.kind === 'distance_anomaly') {
-      const trueDist = active.true_distance_meters == null ? '?' : `${active.true_distance_meters}m`;
-      label = `#${active.trackID} (${active.anomaly_type}, true:${trueDist}, trunc:${active.truncation_type})`;
-    } else if (cfg.kind === 'single') {
+  if (cfg.kind === 'distance_anomaly') {
+    const anns = active || [];          // updateStatus is passed the array for this mode
+    if (anns.length === 1) {
+      const a = anns[0];
+      label = `#${a.trackID} (${anomalyTrueDistText(a)}, ${anomalyTruncText(a)})` + (a.note ? ` (note: ${a.note})` : '');
+    } else if (anns.length > 1) {
+      label = anns.map(a => '#' + a.trackID).join(', ') + ` — ${anns.length} anomalies on this frame`;
+    }
+  } else if (cfg.kind === 'distance_calibration') {
+    if (active) {   // the selected point
+      let err = '';
+      if (active.tape_distance_meters != null && active.calc_distance_meters != null) {
+        const pct = 100 * (active.calc_distance_meters - active.tape_distance_meters) / active.tape_distance_meters;
+        err = `  err ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+      }
+      label = `actual ${distU(active.tape_distance_meters)}  calc ${distU(active.calc_distance_meters)}${err}`;
+    }
+  } else if (active) {
+    if (cfg.kind === 'single') {
       label = '#' + active.trackID;
     } else {
       const riders = active.riderTrackIDs.length ? active.riderTrackIDs.map(id => '#' + id).join(', ') : 'none yet';
@@ -741,11 +1442,98 @@ overlay.addEventListener('click', (e) => {
   // next click entirely -- the real cause of "takes two clicks" reports.
   hideTrimMenu();
 
+  if (cfg.kind === 'distance_calibration') {
+    // a pan drag ends with a click event -- ignore that one so panning the
+    // zoomed image never leaves a stray dot behind
+    if (suppressNextCalClick) { suppressNextCalClick = false; return; }
+    // hand tool active -> this click is for panning, not placing dots
+    if (calHandTool) return;
+    // any point on the image is a valid reference mark -- detection boxes
+    // are irrelevant here, so this runs BEFORE hitTestBox.
+    if (!frames.length) return;
+    const rect = overlay.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    const ft = snapToFrameT(video.currentTime);
+    // near an existing dot on this frame -> select it (for arrow-nudge);
+    // clicking the already-selected dot reopens its distance popup. The
+    // threshold is in on-screen px and rect.width is post-zoom, so scale it
+    // by calZoom -- otherwise a 4x-magnified crosshair has the same tiny
+    // 10px hit target it had at 1x, and clicking the (visibly huge) marker
+    // misses and drops a spurious new dot instead of selecting it.
+    let near = null, nd = Infinity;
+    for (const p of store.distance_calibration) {
+      if (p.t !== ft) continue;
+      const d = Math.hypot(p.x * rect.width - px, p.y * rect.height - py);
+      if (d < nd) { nd = d; near = p; }
+    }
+    if (near && nd <= 10 * (calZoom || 1)) {
+      if (near === selectedCalPoint) {
+        showTrimMenu(e.clientX, e.clientY, store.distance_calibration, near, ft);
+        calPopupPoint = near; calPopupXY = { x: e.clientX, y: e.clientY };
+      } else {
+        selectedCalPoint = near;
+      }
+      draw();
+      return;
+    }
+    // empty space -> drop a new dot here and open its distance popup
+    pristineCalPurge();   // discard any earlier dot left uncommitted
+    const p = { x: px / rect.width, y: py / rect.height, t: ft, tape_distance_meters: null, calc_distance_meters: null };
+    store.distance_calibration.push(p);
+    selectedCalPoint = p;
+    calFreshPoint = p;    // Esc can still undo this one until it's moved/committed
+    scheduleSave(); renderTimeline();
+    recomputeCalPoint(p);
+    showTrimMenu(e.clientX, e.clientY, store.distance_calibration, p, ft);
+    calPopupPoint = p; calPopupXY = { x: e.clientX, y: e.clientY };
+    draw();
+    return;
+  }
+
   const { box: best } = hitTestBox(e);
-  if (!best) return;
+  if (!best) {
+    if (cfg.kind === 'distance_anomaly' && selectedTrackID !== null) {
+      pristineAnomalyPurge(selectedTrackID); selectedTrackID = null; draw();
+    }
+    return;
+  }
   const t = video.currentTime;
 
-  if (cfg.kind === 'single' || cfg.kind === 'distance_anomaly') {
+  if (cfg.kind === 'distance_anomaly') {
+    // POINT model: one annotation per (track, frame). FIRST click on a box
+    // just SELECTS it (highlight + data in #detail); it's still virgin --
+    // no annotation stored. SECOND click on the selected box opens the
+    // panel, creating the annotation for this frame if it doesn't exist.
+    // Clicking away (empty space / another box / Esc) deselects and drops a
+    // never-touched annotation, so the box is fully virgin again.
+    if (!frames.length) return;
+    const arr = store[activeMode];
+    if (best.trackID !== selectedTrackID) {
+      pristineAnomalyPurge(selectedTrackID);
+      selectedTrackID = best.trackID;
+      draw();
+      return;
+    }
+    const ft = snapToFrameT(video.currentTime);
+    let ann = arr.find(a => a.trackID === best.trackID && a.t === ft);
+    if (!ann) {
+      ann = {
+        t: ft, trackID: best.trackID,
+        true_distance_type: null,        // 'tape' | 'eyeball' | null -- only one may be set
+        tape_distance_meters: null,      // measured, metres
+        eyeball_distance_meters: null,   // judged by eye, metres
+        truncation_type: 'none',
+        truncation_sides: [],            // subset of TRUNCATION_SIDES, only for truncation_type === 'other'
+      };
+      arr.push(ann);
+      scheduleSave(); renderTimeline();
+    }
+    showTrimMenu(e.clientX, e.clientY, arr, ann, ft);
+    draw();
+    return;
+  }
+
+  if (cfg.kind === 'single') {
     const arr = store[activeMode];
     const active = activeSingleAt(activeMode, t);
     if (active && active.trackID === best.trackID) {
@@ -754,16 +1542,9 @@ overlay.addEventListener('click', (e) => {
       showTrimMenu(e.clientX, e.clientY, arr, active, t);
     } else {
       // Clicked a different box: implicitly end any open assignment now,
-      // start a new one. distance_anomaly's three extra fields start out
-      // unset/none -- same "set later via the trim menu" pattern as note.
+      // start a new one.
       if (active && active.end_t === null) active.end_t = t;
-      const seg = { start_t: t, end_t: null, trackID: best.trackID };
-      if (cfg.kind === 'distance_anomaly') {
-        seg.anomaly_type = 'unset';
-        seg.true_distance_meters = null;
-        seg.truncation_type = 'none';
-      }
-      arr.push(seg);
+      arr.push({ start_t: t, end_t: null, trackID: best.trackID });
       scheduleSave(); draw(); renderTimeline();
     }
     return;
@@ -806,17 +1587,39 @@ overlay.addEventListener('click', (e) => {
 let trimMenuEl = null;
 let trimMenuDismiss = null;
 
+// One-line "true distance" summary for a distance_anomaly annotation,
+// shared by the status line and the timeline tooltip. tape (measured) and eyeball
+// (judged by eye) are kept strictly separate so they can't be mistaken for
+// one another, but both are just a distance in metres.
+function anomalyTrueDistText(a) {
+  if (a.true_distance_type === 'tape' && a.tape_distance_meters != null) {
+    return `tape ${a.tape_distance_meters.toFixed(1)}m`;
+  }
+  if (a.true_distance_type === 'eyeball' && a.eyeball_distance_meters != null) {
+    return `eyeball ${a.eyeball_distance_meters.toFixed(1)}m`;
+  }
+  return 'true dist: ?';
+}
+// "trunc:<type>" for the status line / tooltip, with the clipped edges
+// appended for the 'other' case, e.g. "trunc:other[left,bottom]".
+function anomalyTruncText(a) {
+  const sides = (a.truncation_type === 'other' && Array.isArray(a.truncation_sides) && a.truncation_sides.length)
+    ? `[${a.truncation_sides.join(',')}]` : '';
+  return `trunc:${a.truncation_type}${sides}`;
+}
+
 // The label panel that opens when you click an already-highlighted box.
-// Everything is inline (buttons + real <input>s) -- window.prompt/confirm
-// are NOT available here: super_tool runs inside the desktop app's
-// embedded webview, where prompt() throws "not supported". Cycle fields
-// (far/close, trunc) mutate in place and leave the panel open so you can
-// step a frame and adjust again; trim start/end finish the interaction
+// Everything is inline (buttons + real <input>/<select>s) -- window.prompt
+// /confirm are NOT available here: super_tool runs inside the desktop
+// app's embedded webview, where prompt() throws "not supported". Fields
+// that don't close the panel (selects, number entry) leave it open so you
+// can step a frame and adjust again; trim start/end finish the interaction
 // and close it. Dismiss with "done", Escape, an outside click, or by
 // clicking another box.
 function showTrimMenu(clientX, clientY, arr, item, t) {
   hideTrimMenu();
   const isAnomaly = MODES[activeMode].kind === 'distance_anomaly';
+  const isCal = MODES[activeMode].kind === 'distance_calibration';
   trimMenuEl = document.createElement('div');
   trimMenuEl.style.cssText = `position:fixed; left:${clientX}px; top:${clientY}px; ` +
     `background:#23262d; border:1px solid #8a5ac0; border-radius:6px; padding:8px; ` +
@@ -833,14 +1636,50 @@ function showTrimMenu(clientX, clientY, arr, item, t) {
     b.onclick = () => { fn(); hideTrimMenu(); };
     return b;
   };
-  // cycle button: steps a closed-set field, repaints its own label, panel stays open
-  const mkCycle = (prefix, get, step) => {
-    const b = document.createElement('button');
-    b.style.cssText = BTN;
-    const paint = () => { b.textContent = `${prefix}: ${get()} ↻`; };
-    paint();
-    b.onclick = () => { step(); paint(); scheduleSave(); draw(); renderTimeline(); };
-    return b;
+  // labelled dropdown for a closed set; commits live, panel stays open.
+  // opts: [str,...] or [{label,value},...]; blank:'--' label prepends an
+  // empty option that maps to null.
+  const mkSelect = (label, opts, get, set, blank) => {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; justify-content:space-between;';
+    row.appendChild(document.createTextNode(label));
+    const sel = document.createElement('select');
+    sel.style.cssText = FIELD;
+    if (blank) { const o = document.createElement('option'); o.value = ''; o.textContent = blank; sel.appendChild(o); }
+    for (const it of opts) {
+      const o = document.createElement('option');
+      o.value = String(typeof it === 'object' ? it.value : it);
+      o.textContent = typeof it === 'object' ? it.label : it;
+      sel.appendChild(o);
+    }
+    const cur = get();
+    sel.value = cur == null ? '' : String(cur);
+    sel.onchange = () => { set(sel.value === '' ? null : sel.value); scheduleSave(); draw(); renderTimeline(); };
+    row.appendChild(sel);
+    return row;
+  };
+  // labelled checkbox group backed by an array; keeps canonical option order
+  const mkCheckboxRow = (labelText, options, get, set) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:10px; align-items:center; font-size:12px;';
+    row.appendChild(document.createTextNode(labelText));
+    for (const opt of options) {
+      const lab = document.createElement('label');
+      lab.style.cssText = 'display:flex; gap:3px; align-items:center; cursor:pointer;';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = (get() || []).includes(opt);
+      cb.onchange = () => {
+        const s = new Set(get() || []);
+        cb.checked ? s.add(opt) : s.delete(opt);
+        set(options.filter(o => s.has(o)));
+        scheduleSave(); draw(); renderTimeline();
+      };
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(opt));
+      row.appendChild(lab);
+    }
+    return row;
   };
   // labelled field: commits live, blank -> null, panel stays open
   const mkField = (label, get, set, opts = {}) => {
@@ -866,33 +1705,125 @@ function showTrimMenu(clientX, clientY, arr, item, t) {
     row.appendChild(inp);
     return row;
   };
+  // number entry in m or yd, kept as metres. Switching the unit restates
+  // the stored value; typing is always read in the current unit.
+  const mkMetersField = (labelText, getM, setM) => {
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; justify-content:space-between;';
+    row.appendChild(document.createTextNode(labelText));
+    let unit = 'm';
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.step = 'any'; inp.style.cssText = FIELD + 'width:80px;';
+    const show = () => {
+      const m = getM();
+      inp.value = m == null ? '' : +(unit === 'yd' ? m * METERS_TO_YARDS : m).toFixed(3);
+    };
+    inp.oninput = () => {
+      const n = parseFloat(inp.value);
+      setM((inp.value.trim() === '' || !Number.isFinite(n)) ? null : (unit === 'yd' ? n / METERS_TO_YARDS : n));
+      scheduleSave(); draw(); renderTimeline();
+    };
+    const unitSel = document.createElement('select');
+    unitSel.style.cssText = FIELD;
+    for (const u of ['m', 'yd']) { const o = document.createElement('option'); o.value = u; o.textContent = u; unitSel.appendChild(o); }
+    unitSel.onchange = () => { unit = unitSel.value; show(); };  // restate stored metres in the new unit
+    show();
+    row.appendChild(inp); row.appendChild(unitSel);
+    return row;
+  };
 
-  // trim start / end -- these finish the interaction, so they close
-  const trimRow = document.createElement('div');
-  trimRow.style.cssText = 'display:flex; gap:6px;';
-  trimRow.appendChild(mkBtn('◀ trim start', () => {
-    if (item.end_t !== null && t >= item.end_t) store[activeMode] = arr.filter(a => a !== item);
-    else item.start_t = t;
-    scheduleSave(); draw(); renderTimeline();
-  }));
-  trimRow.appendChild(mkBtn('trim end ▶', () => {
-    if (t <= item.start_t) store[activeMode] = arr.filter(a => a !== item);
-    else item.end_t = t;
-    scheduleSave(); draw(); renderTimeline();
-  }));
-  trimMenuEl.appendChild(trimRow);
+  const topRow = document.createElement('div');
+  topRow.style.cssText = 'display:flex; gap:6px;';
+  if (isAnomaly || isCal) {
+    // point model -- no start/end to trim, just remove it
+    topRow.appendChild(mkBtn('delete', () => {
+      store[activeMode] = arr.filter(a => a !== item);
+      if (isCal && selectedCalPoint === item) selectedCalPoint = null;
+      if (isCal && calFreshPoint === item) calFreshPoint = null;
+      scheduleSave(); draw(); renderTimeline();
+    }));
+  } else {
+    // trim start / end -- these finish the interaction, so they close
+    topRow.appendChild(mkBtn('◀ trim start', () => {
+      if (item.end_t !== null && t >= item.end_t) store[activeMode] = arr.filter(a => a !== item);
+      else item.start_t = t;
+      scheduleSave(); draw(); renderTimeline();
+    }));
+    topRow.appendChild(mkBtn('trim end ▶', () => {
+      if (t <= item.start_t) store[activeMode] = arr.filter(a => a !== item);
+      else item.end_t = t;
+      scheduleSave(); draw(); renderTimeline();
+    }));
+  }
+  trimMenuEl.appendChild(topRow);
 
-  if (isAnomaly) {
-    trimMenuEl.appendChild(mkCycle('far/close', () => item.anomaly_type, () => {
-      item.anomaly_type = ANOMALY_TYPES[(ANOMALY_TYPES.indexOf(item.anomaly_type) + 1) % ANOMALY_TYPES.length];
-    }));
-    trimMenuEl.appendChild(mkCycle('trunc', () => item.truncation_type, () => {
-      item.truncation_type = TRUNCATION_TYPES[(TRUNCATION_TYPES.indexOf(item.truncation_type) + 1) % TRUNCATION_TYPES.length];
-    }));
-    trimMenuEl.appendChild(mkField('actual dist (m)', () => item.true_distance_meters, v => item.true_distance_meters = v, { number: true }));
+  const rebuild = () => showTrimMenu(clientX, clientY, arr, item, t);
+
+  if (isCal) {
+    // one and only field: the actual (tape-measured) distance to the dot,
+    // entered in the CURRENT display unit (yds/m per the units toggle),
+    // stored as metres. No per-field unit picker.
+    const row = document.createElement('label');
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; justify-content:space-between;';
+    row.appendChild(document.createTextNode('actual'));
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.step = 'any'; inp.style.cssText = FIELD + 'width:90px;';
+    const m = item.tape_distance_meters;
+    inp.value = m == null ? '' : +(useMetricDistance ? m : m * METERS_TO_YARDS).toFixed(3);
+    inp.oninput = () => {
+      const n = parseFloat(inp.value);
+      item.tape_distance_meters = (inp.value.trim() === '' || !Number.isFinite(n))
+        ? null : (useMetricDistance ? n : n / METERS_TO_YARDS);
+      if (item.tape_distance_meters != null && calFreshPoint === item) calFreshPoint = null;  // committed -- Esc no longer undoes it
+      scheduleSave(); draw(); renderTimeline();
+    };
+    const unitEl = document.createElement('span');
+    unitEl.style.cssText = 'color:#9aa;';
+    unitEl.textContent = useMetricDistance ? 'm' : 'yds';
+    row.appendChild(inp); row.appendChild(unitEl);
+    trimMenuEl.appendChild(row);
   }
 
-  trimMenuEl.appendChild(mkField('note', () => item.note, v => item.note = v, { placeholder: '(optional)', width: 200 }));
+  if (isAnomaly) {
+    // --- true distance: exactly one of tape (measured) | eyeball (by eye) ---
+    const typeRow = document.createElement('div');
+    typeRow.style.cssText = 'display:flex; gap:6px; align-items:center;';
+    typeRow.appendChild(document.createTextNode('true dist:'));
+    for (const ty of ['tape', 'eyeball']) {
+      const b = document.createElement('button');
+      b.textContent = ty;
+      b.style.cssText = BTN + (item.true_distance_type === ty ? ' outline:2px solid #b98ae0;' : '');
+      b.onclick = () => {
+        item.true_distance_type = item.true_distance_type === ty ? null : ty;
+        // the two never coexist -- clear whichever kind isn't selected
+        if (item.true_distance_type !== 'tape') item.tape_distance_meters = null;
+        if (item.true_distance_type !== 'eyeball') item.eyeball_distance_meters = null;
+        scheduleSave(); draw(); renderTimeline(); rebuild();
+      };
+      typeRow.appendChild(b);
+    }
+    trimMenuEl.appendChild(typeRow);
+
+    if (item.true_distance_type === 'tape') {
+      trimMenuEl.appendChild(mkMetersField('tape', () => item.tape_distance_meters, v => item.tape_distance_meters = v));
+    } else if (item.true_distance_type === 'eyeball') {
+      trimMenuEl.appendChild(mkMetersField('eyeball', () => item.eyeball_distance_meters, v => item.eyeball_distance_meters = v));
+    }
+
+    trimMenuEl.appendChild(mkSelect('trunc', TRUNCATION_TYPES,
+      () => item.truncation_type, v => {
+        item.truncation_type = v || 'none';
+        if (item.truncation_type !== 'other') item.truncation_sides = [];
+        rebuild();  // show/hide the sides row
+      }));
+    if (item.truncation_type === 'other') {
+      if (!Array.isArray(item.truncation_sides)) item.truncation_sides = [];
+      trimMenuEl.appendChild(mkCheckboxRow('sides:', TRUNCATION_SIDES,
+        () => item.truncation_sides, v => { item.truncation_sides = v; }));
+    }
+  }
+
+  if (!isCal) trimMenuEl.appendChild(mkField('note', () => item.note, v => item.note = v, { placeholder: '(optional)', width: 200 }));
 
   const doneRow = document.createElement('div');
   doneRow.style.cssText = 'display:flex; justify-content:flex-end;';
@@ -900,6 +1831,10 @@ function showTrimMenu(clientX, clientY, arr, item, t) {
   trimMenuEl.appendChild(doneRow);
 
   document.body.appendChild(trimMenuEl);
+  if (isCal) {   // land the cursor in the distance field immediately -- no second click
+    const fld = trimMenuEl.querySelector('input[type=number]');
+    if (fld) { fld.focus(); fld.select(); }
+  }
 
   // keep the panel inside the viewport
   const r = trimMenuEl.getBoundingClientRect();
@@ -914,38 +1849,106 @@ function showTrimMenu(clientX, clientY, arr, item, t) {
 function hideTrimMenu() {
   if (trimMenuDismiss) { document.removeEventListener('mousedown', trimMenuDismiss); trimMenuDismiss = null; }
   if (trimMenuEl) { trimMenuEl.remove(); trimMenuEl = null; }
+  flushSave();   // "done" / Esc / outside-click / clicking another box all land here -- commit any pending edit now
+  if (calPopupPoint) {   // popup closed -> the dot's actual/calc become visible again
+    calPopupPoint = null; calPopupXY = null;
+    if (MODES[activeMode] && MODES[activeMode].kind === 'distance_calibration') draw();
+  }
 }
 
+let pendingSaveMode = null;
+function postGroundTruth(mode) {
+  return fetch(`/api/ground_truth/${mode}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(store[mode]),
+  }).then(() => { document.getElementById('saveState').textContent = 'saved'; });
+}
 function scheduleSave() {
-  const mode = activeMode;
+  pendingSaveMode = activeMode;
   document.getElementById('saveState').textContent = 'saving...';
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fetch(`/api/ground_truth/${mode}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(store[mode]),
-    }).then(() => { document.getElementById('saveState').textContent = 'saved'; });
-  }, 400);
+  saveTimer = setTimeout(() => { saveTimer = null; const m = pendingSaveMode; pendingSaveMode = null; postGroundTruth(m); }, 400);
+}
+// Fire a pending debounced save immediately (no-op if nothing is pending).
+function flushSave() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer); saveTimer = null;
+  const m = pendingSaveMode; pendingSaveMode = null;
+  if (m) postGroundTruth(m);
 }
 
 // --- Timeline strip (click-to-seek, drag-to-scrub, and segment markers
 // for labeling modes) ---
+// Upward triangles under the scrub bar: one per distinct frame that has
+// point entries, click to jump there. Shared by Distance Calibration and
+// Distance Anomaly -- each renders its own in its own highlight colour,
+// and only in its own mode.
+function renderFrameTriangles(items, color, noun, nounPlural) {
+  const strip = document.getElementById('calFrameMarkers');
+  const byFrame = new Map();
+  for (const it of items) {
+    if (it.t == null) continue;
+    byFrame.set(it.t, (byFrame.get(it.t) || 0) + 1);
+  }
+  for (const [t, n] of byFrame) {
+    const tri = document.createElement('div');
+    tri.className = 'calframe';
+    tri.style.left = (t / duration * 100) + '%';
+    tri.style.color = color;
+    tri.title = `frame @ ${t.toFixed(2)}s -- ${n} ${n === 1 ? noun : (nounPlural || noun + 's')}; click to jump`;
+    tri.addEventListener('click', () => seekTo(t));
+    strip.appendChild(tri);
+  }
+}
 function renderTimeline() {
-  timeline.querySelectorAll('.seg').forEach(el => el.remove());
-  if (!duration) return;
+  timeline.querySelectorAll('.seg, .mark, .calmark').forEach(el => el.remove());
   const cfg = MODES[activeMode];
-  if (cfg.kind === 'flow_debug') return; // read-only mode, no segments to show
+  const strip = document.getElementById('calFrameMarkers');
+  const hasStrip = cfg && (cfg.kind === 'distance_calibration' || cfg.kind === 'distance_anomaly');
+  strip.style.display = hasStrip ? '' : 'none';
+  strip.innerHTML = '';
+  if (!duration) return;
+  if (cfg.kind === 'flow_debug') return; // read-only mode, nothing to show
+
+  if (cfg.kind === 'distance_calibration') {
+    for (const p of store.distance_calibration) {
+      if (p.t == null) continue;
+      const el = document.createElement('div');
+      el.className = 'calmark';
+      el.style.left = (p.t / duration * 100) + '%';
+      el.style.background = calMarkerColor;   // follow the user-chosen marker colour
+      el.title = `${p.t.toFixed(2)}s  actual ${distU(p.tape_distance_meters)}  calc ${distU(p.calc_distance_meters)}`;
+      timeline.appendChild(el);
+    }
+    renderFrameTriangles(store.distance_calibration, calMarkerColor, 'point');
+    return;
+  }
+
+  if (cfg.kind === 'distance_anomaly') {
+    // point annotations -> thin ticks, not bars
+    for (const a of store[activeMode]) {
+      if (a.t == null) continue; // legacy range entry with no point t -- skip
+      const el = document.createElement('div');
+      el.className = 'mark' + (a.note ? ' noted' : '');
+      el.style.left = (a.t / duration * 100) + '%';
+      el.title = `#${a.trackID}  ${a.t.toFixed(2)}s\n${anomalyTrueDistText(a)}, ${anomalyTruncText(a)}` +
+        (a.note ? `\nnote: ${a.note}` : '');
+      timeline.appendChild(el);
+    }
+    renderFrameTriangles(store.distance_anomaly, DISTANCE_ANOMALY_COLOR, 'anomaly', 'anomalies');
+    return;
+  }
+
   for (const a of store[activeMode]) {
     const end = a.end_t === null ? duration : a.end_t;
     const el = document.createElement('div');
     el.className = 'seg' + (a.note ? ' noted' : '');
     el.style.left = (a.start_t / duration * 100) + '%';
     el.style.width = Math.max(0.15, (end - a.start_t) / duration * 100) + '%';
-    const tag = (cfg.kind === 'single' || cfg.kind === 'distance_anomaly')
+    const tag = (cfg.kind === 'single')
       ? `#${a.trackID}`
       : `vehicle #${a.vehicleTrackID} riders:${a.riderTrackIDs.map(id => '#' + id).join(',') || 'none'}`;
     el.title = `${tag}  ${a.start_t.toFixed(1)}s - ${a.end_t === null ? 'open' : a.end_t.toFixed(1) + 's'}` +
-      (cfg.kind === 'distance_anomaly' ? `\n${a.anomaly_type}, true:${a.true_distance_meters == null ? '?' : a.true_distance_meters + 'm'}, trunc:${a.truncation_type}` : '') +
       (a.note ? `\nnote: ${a.note}` : '');
     timeline.appendChild(el);
   }
@@ -1014,11 +2017,60 @@ document.getElementById('speed').addEventListener('change', (e) => {
 });
 
 const unitsToggleBtn = document.getElementById('unitsToggle');
+unitsToggleBtn.textContent = useMetricDistance ? 'm' : 'yds';   // reflect the persisted choice on load
 unitsToggleBtn.addEventListener('click', () => {
   useMetricDistance = !useMetricDistance;
+  settingSave({ useMetricDistance });
   unitsToggleBtn.textContent = useMetricDistance ? 'm' : 'yds';
   draw();
+  if (calPopupPoint && calPopupXY) {   // re-render the open "actual" field in the new unit
+    const p = calPopupPoint, xy = calPopupXY;
+    showTrimMenu(xy.x, xy.y, store.distance_calibration, p, p.t);
+    calPopupPoint = p; calPopupXY = xy;
+    draw();
+  }
 });
+
+// Marker-colour picker: a row of colour boxes; the current one carries a
+// contrasting ring.
+const calColorSwatches = document.getElementById('calColorSwatches');
+function renderCalSwatches() {
+  calColorSwatches.innerHTML = '';
+  for (const name of CAL_MARKER_COLORS) {
+    const b = document.createElement('button');
+    b.className = 'calswatch' + (name === calMarkerColor ? ' sel' : '');
+    b.style.background = name;
+    b.title = name;
+    if (name === calMarkerColor) b.style.setProperty('--ring', ringForColor(name));
+    b.addEventListener('click', () => {
+      calMarkerColor = name;
+      settingSave({ calMarkerColor: name });
+      renderCalSwatches();
+      draw();
+      renderTimeline();   // timeline ticks + frame triangles follow the marker colour
+    });
+    calColorSwatches.appendChild(b);
+  }
+}
+renderCalSwatches();
+
+const calBoxesToggleBtn = document.getElementById('calBoxesToggle');
+calBoxesToggleBtn.addEventListener('click', () => {
+  showCalBoxes = !showCalBoxes;
+  calBoxesToggleBtn.textContent = showCalBoxes ? 'boxes: on' : 'boxes: off';
+  draw();
+});
+
+// Distance Calibration zoom buttons -- keyboard/click equivalents of the
+// scroll-wheel gesture, anchored at the centre of the #stage viewport.
+function calZoomButton(factor) {
+  const sr = document.getElementById('stage').getBoundingClientRect();
+  calZoomAt(sr.left + sr.width / 2, sr.top + sr.height / 2, factor);
+}
+document.getElementById('calZoomIn').addEventListener('click', () => calZoomButton(1.5));
+document.getElementById('calZoomOut').addEventListener('click', () => calZoomButton(1 / 1.5));
+document.getElementById('calZoomReset').addEventListener('click', resetCalZoom);
+document.getElementById('calHandToggle').addEventListener('click', () => setCalHandTool(!calHandTool));
 
 const playPauseBtn = document.getElementById('playPause');
 playPauseBtn.addEventListener('click', () => {
@@ -1128,20 +2180,91 @@ overlay.addEventListener('mousemove', (e) => {
 });
 overlay.addEventListener('mouseleave', () => { if (loupeActive) loupe.style.display = 'none'; });
 overlay.addEventListener('wheel', (e) => {
+  if (MODES[activeMode].kind === 'distance_calibration') {
+    // Standard image-viewer wheel semantics, so an ordinary scroll near a
+    // dot can't silently zoom the view out (the reported bug):
+    //   ctrl/cmd + wheel (and the trackpad pinch gesture, which the OS
+    //     delivers as ctrl+wheel) -> zoom at the cursor
+    //   plain wheel while zoomed in           -> pan the view
+    //   plain wheel at 1x                     -> nothing (let the page be)
+    // Discrete zoom is also always available on the +/- / 1:1 buttons.
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      calZoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    } else if (calZoom > 1) {
+      e.preventDefault();
+      calPanX -= e.deltaX;
+      calPanY -= e.deltaY;
+      clampCalPan();
+      applyCalZoom();
+      persistCalZoomSoon();
+    }
+    return;
+  }
   if (!loupeActive) return;
   e.preventDefault();
   bumpLoupeZoom(e.deltaY < 0 ? 1.15 : 1 / 1.15);
 }, { passive: false });
 
+// distance_calibration: drag to reposition the zoomed view -- ONLY with the
+// hand tool active. Without it, a mousedown on the overlay is always a
+// dot click/select; a plain-drag pan "fallback" made ordinary clicks
+// unreliable (any few-px hand tremor between down and up was read as a pan
+// and swallowed the click, so selecting a dot appeared to do nothing / the
+// view drifted). A drag that actually moved swallows its trailing 'click'
+// so panning never drops a stray dot.
+overlay.addEventListener('mousedown', (e) => {
+  if (MODES[activeMode].kind !== 'distance_calibration' || !calHandTool || calZoom === 1 || e.button !== 0) return;
+  calPanDrag = { startX: e.clientX, startY: e.clientY, panX0: calPanX, panY0: calPanY, moved: false };
+  overlay.style.cursor = 'grabbing';
+});
+window.addEventListener('mousemove', (e) => {
+  if (!calPanDrag) return;
+  const dx = e.clientX - calPanDrag.startX, dy = e.clientY - calPanDrag.startY;
+  if (!calPanDrag.moved && Math.hypot(dx, dy) < 3) return;   // tolerate a jittery click
+  calPanDrag.moved = true;
+  calPanX = calPanDrag.panX0 + dx;
+  calPanY = calPanDrag.panY0 + dy;
+  clampCalPan();
+  applyCalZoom();
+});
+window.addEventListener('mouseup', () => {
+  if (calPanDrag && calPanDrag.moved) { suppressNextCalClick = true; persistCalZoom(); }
+  calPanDrag = null;
+  if (calHandTool && MODES[activeMode].kind === 'distance_calibration') overlay.style.cursor = 'grab';
+});
+
 document.addEventListener('keydown', (e) => {
-  const inInput = e.target.tagName === 'INPUT';
+  const inInput = e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT';
   if (e.code === 'Escape') {
     if (inInput) { e.target.blur(); hideTrimMenu(); return; }
-    if (MODES[activeMode].kind === 'flow_debug') { selectedTrackID = null; draw(); }
-    else hideTrimMenu();
+    hideTrimMenu();
+    const k = MODES[activeMode].kind;
+    if (k === 'distance_anomaly') { pristineAnomalyPurge(selectedTrackID); selectedTrackID = null; draw(); }
+    else if (k === 'distance_calibration') { pristineCalPurge(); selectedCalPoint = null; draw(); }
+    else if (k === 'flow_debug') { selectedTrackID = null; draw(); }
     return;
   }
   if (inInput) return;
+  // distance_calibration: arrow keys nudge the selected dot for sub-pixel
+  // placement (0.5 native px, Shift = 5 px), same as the old cone tool.
+  if (MODES[activeMode].kind === 'distance_calibration' && selectedCalPoint &&
+      ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.code)) {
+    e.preventDefault();
+    const step = e.shiftKey ? 5 : 0.5;
+    const nw = video.videoWidth || overlay.width, nh = video.videoHeight || overlay.height;
+    if (e.code === 'ArrowLeft')  selectedCalPoint.x -= step / nw;
+    if (e.code === 'ArrowRight') selectedCalPoint.x += step / nw;
+    if (e.code === 'ArrowUp')    selectedCalPoint.y -= step / nh;
+    if (e.code === 'ArrowDown')  selectedCalPoint.y += step / nh;
+    if (calFreshPoint === selectedCalPoint) calFreshPoint = null;  // deliberately moved -- keep it through Esc
+    scheduleSave(); recomputeCalPoint(selectedCalPoint); draw(); renderTimeline();
+    return;
+  }
+  // distance_calibration: 'h' toggles the hand (pan) tool
+  if (MODES[activeMode].kind === 'distance_calibration' && e.code === 'KeyH') {
+    e.preventDefault(); setCalHandTool(!calHandTool); return;
+  }
   if (e.code === 'KeyZ') { e.preventDefault(); setLoupe(!loupeActive); return; }
   if (loupeActive && (e.code === 'Equal' || e.code === 'NumpadAdd')) { e.preventDefault(); bumpLoupeZoom(1.15); return; }
   if (loupeActive && (e.code === 'Minus' || e.code === 'NumpadSubtract')) { e.preventDefault(); bumpLoupeZoom(1 / 1.15); return; }
