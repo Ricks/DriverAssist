@@ -1706,19 +1706,29 @@ struct InferenceView: View {
         }
     }
 
+    /// Live roll for the calibration-screen readouts, rounded, in AEROSPACE
+    /// convention (positive = right wing down) -- i.e. negated from the raw
+    /// `pitchSensor.rollDegrees` (whose sign is `atan2(gy, -gx)`; see
+    /// RollNudgeIndicator's own note). Display only: the raw sensor value,
+    /// the logged value, and RollNudgeIndicator's arrow-direction logic all
+    /// still use the native sign. Falls back to 0 when no reading exists yet.
     private var rollDegreesRounded: Int {
-        Int((pitchSensor.rollDegrees ?? 0).rounded())
+        Int((-(pitchSensor.rollDegrees ?? 0)).rounded())
     }
 
-    /// Live pitch minus `PitchSensor.defaultMountPitchDegrees`, rounded --
-    /// so the level screen can show "0" at the mount's known-good tilt
-    /// instead of the raw absolute pitch (which is never near 0, see
-    /// `defaultMountPitchDegrees`'s doc comment). Falls back to 0 (reads as
-    /// "on target") when no reading exists yet, same convention as
-    /// `rollDegreesRounded`.
+    /// Offset of live pitch from `PitchSensor.defaultMountPitchDegrees`
+    /// (the mount's known-good tilt), rounded, in AEROSPACE convention
+    /// (positive = nose up) -- so the level screen reads "0" on target and
+    /// "+2" when the nose needs to come down 2 degrees. `defaultMountPitchDegrees
+    /// - pitch` because the raw sensor's pitch is nose-DOWN-positive (see
+    /// that constant's doc comment); this negates it for display. Falls
+    /// back to 0 ("on target") when no reading exists yet, same as
+    /// `rollDegreesRounded`. Display only -- `isMountPitchOK` reads this
+    /// through `abs()` so the gate is unaffected, and PitchNudgeIndicator
+    /// reads `pitchSensor.pitchDegrees` directly, not this.
     private var pitchOffsetDegreesRounded: Int {
         guard let pitch = pitchSensor.pitchDegrees else { return 0 }
-        return Int((pitch - PitchSensor.defaultMountPitchDegrees).rounded())
+        return Int((PitchSensor.defaultMountPitchDegrees - pitch).rounded())
     }
 
     /// The three mount-status checks, split out so YawBand's border color,
@@ -2215,7 +2225,12 @@ struct InferenceView: View {
                 // see any change at all. Kept alongside the new reference-
                 // relative "Pitch: X°" readout above, not replaced by it --
                 // this is the raw sensor value that formula actually needs.
-                Text(pitchSensor.pitchDegrees.map { String(format: "absolute pitch: %.1f°", $0) } ?? "absolute pitch: --")
+                // Deliberately NOT in the aerospace convention the other
+                // readouts on this screen use: it's the hardware value as-is
+                // (nose-DOWN-positive), which is what the sign-check above
+                // and the distance formula both depend on -- hence the
+                // explicit "raw sensor" label to distinguish it.
+                Text(pitchSensor.pitchDegrees.map { String(format: "raw sensor pitch: %.1f°", $0) } ?? "raw sensor pitch: --")
                     .font(.system(size: 20, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.6))
                     .shadow(color: .black.opacity(0.7), radius: 4)
@@ -2556,8 +2571,12 @@ struct InferenceView: View {
         }
     }
 
+    /// Live absolute pitch for the Adjust-Pitch screen readout, rounded, in
+    /// AEROSPACE convention (positive = nose up) -- negated from the raw
+    /// `pitchSensor.pitchDegrees`, which is nose-DOWN-positive. Display only;
+    /// `finishPitchAdjustment` still logs the full-precision native reading.
     private var pitchDegreesRounded: Int {
-        Int((pitchSensor.pitchDegrees ?? 0).rounded())
+        Int((-(pitchSensor.pitchDegrees ?? 0)).rounded())
     }
 
     /// Camera feed still shows underneath (needed so the user can confirm
@@ -2604,7 +2623,10 @@ struct InferenceView: View {
                     Text("Pitch: \(pitchDegreesRounded)°")
                     Text("Roll: \(rollDegreesRounded)°")
                     if let initialCalibrationRoll {
-                        Text("Initial roll: \(Int(initialCalibrationRoll.rounded()))°")
+                        // Aerospace convention (positive = right wing down),
+                        // matching `rollDegreesRounded` above -- negated from
+                        // the stored native value.
+                        Text("Initial roll: \(Int((-initialCalibrationRoll).rounded()))°")
                             .font(.system(size: 18, weight: .medium))
                             .foregroundStyle(.white.opacity(0.7))
                     }

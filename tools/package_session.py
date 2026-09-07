@@ -27,22 +27,30 @@ For EACH raw recording found in the directory, this:
      than one recording, each gets its own `<video>-detections.jsonl`/
      `<video>-overlay-debug.log` instead, since a shared filename can't hold
      more than one session's slice.
-  2. Runs reconstruct_annotated.py against those local files, writing
-     <video>-annotated.mp4 into the same directory.
-  3. With --benchmark, also runs benchmark.py (slow -- loads the yolo26x
-     reference model and runs inference per logged frame), writing
-     <video>-benchmark.json/.png into the directory too.
-  4. Runs efficacy_score.py (slow -- loads the yolo26x reference model and
-     runs inference at a dense, near-every-frame interval across the whole
+  2. Runs reconstruct_annotated.py against those local files to write
+     <video>-flow-debug.json -- the ONLY thing (besides the raw .MOV, which
+     is already in the directory) that tools/super_tool.py needs to open
+     the session. This is the DEFAULT and only step past #1: it passes
+     reconstruct_annotated.py --no-render, so no annotated .mp4 / per-frame
+     encode.
+
+  --full also does steps 3-5 (the annotated video + both reference-model
+  passes):
+  3. reconstruct_annotated.py WITH --output, writing <video>-annotated.mp4
+     alongside the flow-debug JSON.
+  4. benchmark.py (slow -- loads the yolo26x reference model and runs
+     inference per logged frame), writing <video>-benchmark.json/.png.
+     Also available on its own via --benchmark (without --full).
+  5. efficacy_score.py (slow -- loads the yolo26x reference model and runs
+     inference at a dense, near-every-frame interval across the whole
      session, not just at each logged on-device frame), writing
-     <video>-efficacy-score.json and <video>-track-cache.pkl into the
-     directory. On by default, same as annotation -- pass --skip-efficacy
-     to opt out. The tracking-aware (idf1/mota/miss rate/P(warned-in-time))
-     counterpart to --benchmark's simpler per-frame precision/recall -- see
-     efficacy_score.py's own docstring for the two-gate framework this
-     produces. The cache is what a follow-up per-class analysis (e.g.
-     "what's the bicycle detection rate vs yolo26x") can load directly
-     instead of re-running the expensive dense pass.
+     <video>-efficacy-score.json and <video>-track-cache.pkl. Runs under
+     --full unless --skip-efficacy. The tracking-aware (idf1/mota/miss
+     rate/P(warned-in-time)) counterpart to --benchmark's simpler per-frame
+     precision/recall -- see efficacy_score.py's own docstring for the
+     two-gate framework this produces. The cache is what a follow-up
+     per-class analysis (e.g. "what's the bicycle detection rate vs
+     yolo26x") can load directly instead of re-running the dense pass.
 
 The shared logs pool is pulled from the device once per run (not once per
 video) -- all recordings in the directory are sliced out of that single
@@ -277,20 +285,35 @@ def process_video(video: Path, session_dir: Path, args, tools_dir: Path, shared_
         detections_path, debug_log_path = write_session_logs(video, detections_path, debug_log_path, args.logs_dir)
 
     annotated_path = session_dir / f"{video.stem}-annotated.mp4"
-    if args.skip_annotate:
-        print(f"--skip-annotate passed -- not generating {annotated_path.name}.")
-    elif annotated_path.exists() and annotated_path.stat().st_mtime >= debug_log_path.stat().st_mtime:
-        print(f"{annotated_path.name} already exists and is newer than its inputs -- skipping (delete it to force regeneration).")
-    else:
-        print("Generating annotated reconstruction...")
-        subprocess.run(
-            [sys.executable, str(tools_dir / "reconstruct_annotated.py"), str(video),
-             "--detections", str(detections_path), "--debug-log", str(debug_log_path),
-             "--output", str(annotated_path)],
-            check=True,
-        )
+    flow_debug_path = session_dir / f"{video.stem}-flow-debug.json"
+    recon = [sys.executable, str(tools_dir / "reconstruct_annotated.py"), str(video),
+             "--detections", str(detections_path), "--debug-log", str(debug_log_path)]
+    fd_fresh = flow_debug_path.exists() and flow_debug_path.stat().st_mtime >= debug_log_path.stat().st_mtime
 
-    if args.benchmark:
+    if not args.full or args.skip_annotate:
+        # DEFAULT: just the flow-debug JSON super_tool needs -- no .mp4.
+        # (--full --skip-annotate lands here too: video passes still run below.)
+        if fd_fresh:
+            print(f"{flow_debug_path.name} already exists and is newer than its inputs -- skipping "
+                  "(delete it to force regeneration).")
+        else:
+            why = "--skip-annotate" if args.full else "default; pass --full for .mp4 + benchmark + efficacy"
+            print(f"Generating flow-debug JSON ({why}; no annotated .mp4)...")
+            subprocess.run(recon + ["--flow-debug-json", str(flow_debug_path), "--no-render"], check=True)
+    else:
+        mp4_fresh = annotated_path.exists() and annotated_path.stat().st_mtime >= debug_log_path.stat().st_mtime
+        if mp4_fresh and fd_fresh:
+            print(f"{annotated_path.name} / {flow_debug_path.name} already exist and are newer than their "
+                  "inputs -- skipping (delete them to force regeneration).")
+        else:
+            print("Generating annotated reconstruction + flow-debug JSON...")
+            subprocess.run(recon + ["--output", str(annotated_path),
+                                    "--flow-debug-json", str(flow_debug_path)], check=True)
+
+    if not args.full and not args.benchmark:
+        return  # default: super_tool prep only -- no reference-model passes
+
+    if args.full or args.benchmark:
         benchmark_json = session_dir / f"{video.stem}-benchmark.json"
         benchmark_png = session_dir / f"{video.stem}-benchmark.png"
         if benchmark_json.exists() and benchmark_png.exists():
@@ -305,6 +328,8 @@ def process_video(video: Path, session_dir: Path, args, tools_dir: Path, shared_
                 cmd += ["--reference-model", str(args.reference_model)]
             subprocess.run(cmd, check=True)
 
+    if not args.full:
+        return  # efficacy pass is part of --full only (a bare --benchmark stops here)
     if args.skip_efficacy:
         print("--skip-efficacy passed -- not running efficacy_score.py's dense reference pass.")
     else:
@@ -333,14 +358,22 @@ def main() -> None:
         help=f"Shared logs directory to pull this session's slice from (default: {DEFAULT_LOGS_DIR})",
     )
     parser.add_argument(
-        "--benchmark", action="store_true",
-        help="Also run benchmark.py (slow -- runs the yolo26x reference model) into this directory",
+        "--full", action="store_true",
+        help="Also produce the annotated <video>-annotated.mp4 AND run both slow yolo26x reference passes "
+             "(benchmark.py + efficacy_score.py). Without this, package_session.py does ONLY what "
+             "tools/super_tool.py needs to open the session: pull + slice the logs, then write "
+             "<video>-flow-debug.json (the raw .MOV is already in the directory).",
     )
-    parser.add_argument("--reference-model", type=Path, default=None, help="Passed through to benchmark.py/efficacy_score.py if --benchmark is set / --skip-efficacy isn't")
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help="Run benchmark.py (slow -- yolo26x reference model, per logged frame) even without --full. "
+             "Implied by --full.",
+    )
+    parser.add_argument("--reference-model", type=Path, default=None,
+                        help="Passed through to benchmark.py / efficacy_score.py when those run")
     parser.add_argument(
         "--skip-efficacy", action="store_true",
-        help="Skip efficacy_score.py's dense yolo26x reference pass (slow -- runs at a near-every-frame "
-             "interval across the whole session) -- runs by default, same as annotation",
+        help="With --full, skip efficacy_score.py's dense reference pass (the other --full pieces still run)",
     )
     parser.add_argument(
         "--rebuild-efficacy-cache", action="store_true",
@@ -349,7 +382,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--skip-annotate", action="store_true",
-        help="Only extract each session's local detections.jsonl/overlay-debug.log -- skip generating the annotated reconstruction",
+        help="With --full, skip the annotated .mp4 (the flow-debug JSON + reference passes still run)",
     )
     parser.add_argument(
         "--skip-pull", action="store_true",
@@ -382,6 +415,8 @@ def main() -> None:
         process_video(video, session_dir, args, tools_dir, shared_names)
 
     print(f"\nSession{'s' if not shared_names else ''} packaged in {session_dir}")
+    if not args.full:
+        print("(super_tool prep only -- pass --full for the annotated .mp4 + benchmark + efficacy)")
 
 
 if __name__ == "__main__":

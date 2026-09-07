@@ -1218,6 +1218,13 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=None, help="Defaults to <video>-annotated.mp4")
     parser.add_argument(
+        "--no-render", action="store_true",
+        help="Skip the annotated .mp4 entirely (no VideoWriter, no per-frame encode, no overlay "
+             "drawing) -- only useful together with --flow-debug-json, which is all tools/super_tool.py "
+             "actually consumes. The frame-by-frame decode + per-entry tracking/flow/fusion pass is "
+             "unchanged; you just don't pay to draw and encode a video nothing reads.",
+    )
+    parser.add_argument(
         "--flow-arrows", dest="flow_arrows", action="store_true", default=False,
         help="Draw, per tracked object, every constituent of the motion-arrow computation (see "
              "compute_motion_arrow_angular's doc comment), all from its base center: a semi-transparent GREEN "
@@ -1294,6 +1301,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.no_render and not args.flow_debug_json:
+        sys.exit("--no-render only makes sense with --flow-debug-json (otherwise this would produce nothing).")
+    render = not args.no_render
+
     output = args.output or args.video.with_name(args.video.stem + "-annotated.mp4")
     if output.resolve() == args.video.resolve():
         sys.exit("Refusing to overwrite the source recording — pass a different --output.")
@@ -1339,9 +1350,11 @@ def main() -> None:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
-        sys.exit(f"Couldn't open {output} for writing")
+    writer = None
+    if render:
+        writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            sys.exit(f"Couldn't open {output} for writing")
 
     # Tracking runs inline with this same sequential decode, not as a separate
     # seek-based pre-pass -- a pre-pass that re-seeks the video once per
@@ -1561,7 +1574,7 @@ def main() -> None:
                 })
             next_idx += 1
 
-        if current_entry is not None:
+        if render and current_entry is not None:
             for det, track_id in zip(current_entry["detections"], current_track_ids):
                 draw_box(frame, det, track_id, corrected_distance_meters(det, current_entry, aspect))
                 if args.flow_arrows:
@@ -1605,7 +1618,8 @@ def main() -> None:
             thermal_entry = nearest_at_or_before(thermal, thermal_keys, frame_epoch)
             draw_hud(frame, current_entry, thermal_entry, frame_index=i)
 
-        writer.write(frame)
+        if writer is not None:
+            writer.write(frame)
         i += 1
         if i % max(1, int(fps) * 30) == 0:
             # Not shown as a fraction of frame_count: OpenCV's frame-count
@@ -1615,8 +1629,11 @@ def main() -> None:
             print(f"  {i} frames processed ({i / fps:.0f}s of video)", file=sys.stderr)
 
     cap.release()
-    writer.release()
-    print(f"Wrote {i} frames to {output}")
+    if writer is not None:
+        writer.release()
+        print(f"Wrote {i} frames to {output}")
+    else:
+        print(f"Decoded {i} frames (--no-render: no .mp4 written)")
     print(f"Original recording untouched: {args.video}")
     if args.flow_debug_json:
         args.flow_debug_json.write_text(json.dumps({

@@ -468,7 +468,7 @@ function switchMode(m) {
   document.getElementById('calZoomCtl').style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
   document.getElementById('calColorSwatches').style.display = (cfg.kind === 'distance_calibration') ? 'inline-flex' : 'none';
   document.getElementById('calHandToggle').style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
-  calLabelLayer.style.display = (cfg.kind === 'distance_calibration') ? '' : 'none';
+  calLabelLayer.style.display = '';   // screen-space layer: DC captions AND the param HUD (all modes)
   if (cfg.kind === 'distance_calibration') {
     // re-apply the remembered zoom/pan (clamped to the current stage size)
     clampCalPan();
@@ -935,11 +935,13 @@ function drawCalPoint(p, w, h, selected, showLabels) {
   // pixel-sharp and identically sized at every zoom level.
 }
 
-// DC dot captions, drawn on the un-transformed screen-space layer. Each
-// dot's on-screen position is derived from calPan/calZoom directly, then
-// the caption is drawn at a fixed 13px so it looks the same at any zoom.
-function drawCalLabels() {
+// Everything drawn on the un-transformed screen-space #calLabelLayer:
+//   - the param HUD (all modes, when flow data is loaded)
+//   - DC dot captions (DC mode only), positioned from calPan/calZoom so
+//     they stay a fixed 13px at any zoom.
+function drawCalLabels(f) {
   lblCtx.clearRect(0, 0, calLabelLayer.width, calLabelLayer.height);
+  if (f && hasFlowData) drawHudScreen(f);
   if (!MODES[activeMode] || MODES[activeMode].kind !== 'distance_calibration') return;
   const z = calZoom || 1;
   const Wl = overlay.clientWidth || parseFloat(overlay.style.width) || overlay.width;
@@ -1088,41 +1090,46 @@ function drawLeadingTint(d, w, h) {
   drawCaption('ALGORITHM', x + 4, y + bh + 18);
 }
 
-// Same fields/leading text as draw_hud's on-screen HUD in
-// reconstruct_annotated.py, itself mirroring the live on-device app's own
-// HUD labels. Only meaningful when a --flow-debug-json was loaded (its
-// per-frame entries carry thermal/resolution/model/etc.) -- the live
-// geometry-tracker fallback frames have none of these fields, so this
-// simply draws nothing extra in that mode.
-function drawHud(f, w, h) {
-  ctx.font = '16px monospace';
+// Param HUD (thermal / video res / detector res / model / low-light /
+// stabilization / frame#) -- same fields/text as draw_hud in
+// reconstruct_annotated.py, itself mirroring the live on-device app. Drawn
+// on the screen-space #calLabelLayer (NOT the zoomable overlay) so it shows
+// in EVERY mode, unclipped, at a constant size regardless of DC zoom.
+// Positioned to the corners of the video's on-screen box. Only meaningful
+// when a flow-debug JSON was loaded (fallback frames lack these fields).
+function drawHudScreen(f) {
+  const vx = video.offsetLeft || 0, vy = video.offsetTop || 0;
+  const vw = overlay.clientWidth || video.clientWidth || calLabelLayer.width;
+  const vh = overlay.clientHeight || video.clientHeight || calLabelLayer.height;
+  lblCtx.font = '15px monospace';
+  lblCtx.textBaseline = 'alphabetic';
+  const put = (text, x, y, color) => {
+    const tw = lblCtx.measureText(text).width;
+    lblCtx.globalAlpha = 0.4; lblCtx.fillStyle = '#000';
+    lblCtx.fillRect(x - 3, y - 14, tw + 6, 19);
+    lblCtx.globalAlpha = 1; lblCtx.fillStyle = color || '#cfcfcf';
+    lblCtx.fillText(text, x, y);
+  };
   if (f.thermal) {
     const stateText = f.thermal.state === 'nominal' ? 'OK' : f.thermal.state.toUpperCase();
-    let color = '#bfbfbf';
+    let color = '#cfcfcf';
     if (f.thermal.state === 'fair') color = '#ffd700';
-    else if (f.thermal.state === 'serious' || f.thermal.state === 'critical') color = '#ff0000';
-    ctx.fillStyle = color;
-    ctx.fillText(`thermal: ${stateText} ${f.thermal.percent}%`, 12, 26);
+    else if (f.thermal.state === 'serious' || f.thermal.state === 'critical') color = '#ff5555';
+    put(`thermal: ${stateText} ${f.thermal.percent}%`, vx + 12, vy + 24, color);
   }
   if (f.resolution) {
-    ctx.fillStyle = '#bfbfbf';
-    if (videoResolution) ctx.fillText(`video: ${videoResolution}`, 12, h - 56);
-    ctx.fillText(`res: ${f.resolution}`, 12, h - 34);
-    ctx.fillText(`model: ${f.model}`, 12, h - 12);
-
+    if (videoResolution) put(`video: ${videoResolution}`, vx + 12, vy + vh - 56);
+    put(`res: ${f.resolution}`, vx + 12, vy + vh - 34);
+    put(`model: ${f.model}`, vx + 12, vy + vh - 12);
     const lowState = f.lowLightEnabled ? 'on' : 'off';
     const lowText = f.autoLowLightEnabled ? `low-light: auto (${lowState})` : `low-light: ${lowState}`;
-    ctx.fillText(lowText, w - ctx.measureText(lowText).width - 12, h - 12);
-
+    put(lowText, vx + vw - lblCtx.measureText(lowText).width - 12, vy + vh - 12);
     const stabText = `stabilization: ${f.stabilizationEnabled ? 'on' : 'off'}`;
-    ctx.fillText(stabText, w - ctx.measureText(stabText).width - 12, 26);
+    put(stabText, vx + vw - lblCtx.measureText(stabText).width - 12, vy + 24);
   }
-
   if (videoFps) {
-    const frameIndex = Math.round(video.currentTime * videoFps);
-    const text = `frame ${frameIndex}`;
-    const tw = ctx.measureText(text).width;
-    drawCaption(text, w - tw - 12 - 3, 26 + 40);
+    const t = `frame ${Math.round(video.currentTime * videoFps)}`;
+    put(t, vx + vw - lblCtx.measureText(t).width - 12, vy + 48);
   }
 }
 
@@ -1221,15 +1228,14 @@ function drawFlowDebug(f, w, h) {
     drawOne(d, false);
   }
   if (selectedDet) drawOne(selectedDet, true);
-  if (hasFlowData) drawHud(f, w, h);
   updateDetail(selectedDet);
 }
 
 function draw() {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
-  drawCalLabels();   // screen-space DC captions; self-clears / no-ops outside DC mode
   const f = frameAt(video.currentTime);
   const cfg = MODES[activeMode];
+  drawCalLabels(f);   // screen-space: param HUD (all modes) + DC captions
   if (!f) { updateStatus(f); renderPlayhead(); return; }
   const w = overlay.width, h = overlay.height;
 
